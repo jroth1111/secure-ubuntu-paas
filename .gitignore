@@ -12,6 +12,9 @@ workspace/
 .code-state/
 .tmp_secrets/
 
+# Research notes — potentially sensitive context, not for distribution
+research/
+
 # OS/editor junk
 .DS_Store
 *.swp

@@ -1,7 +1,7 @@
 # Research-Based Improvements Analysis (Updated)
 
 **Updated:** 2026-03-04  
-**Source Research:** `research/`  
+**Source Research:** `research/` (local repo directory)  
 **Target Scripts:** `base/bootstrap.sh`, `base/validate.sh`
 
 ## Summary

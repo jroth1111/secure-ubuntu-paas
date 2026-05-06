@@ -33,8 +33,8 @@ This research is anchored to the live deployment state in this repository:
 
 Relevant local evidence:
 
-- [recovery_20260307_122130_private_tls_reconcile.log](logs/deploy_runs/recovery_20260307_122130_private_tls_reconcile.log)
-- [deploy_20260307_121600_resume_after_tls_fix.log](logs/deploy_runs/deploy_20260307_121600_resume_after_tls_fix.log)
+- `logs/deploy_runs/recovery_20260307_122130_private_tls_reconcile.log`
+- `logs/deploy_runs/deploy_20260307_121600_resume_after_tls_fix.log`
 
 ## Evaluation Criteria
 

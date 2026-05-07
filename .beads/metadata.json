@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "secure_ubuntu_paas",
+  "project_id": "77336bf0-8740-48a4-9786-810d98a40dde"
+}

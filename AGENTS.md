@@ -26,20 +26,28 @@ Work follows claim → execute → verify → close. Project-specific additions:
 
 An LLM can run this project safely only if it tracks this operator model:
 
-1. **Project goal**: provision and harden Ubuntu for Coolify, then configure DNS/tunnel routing safely.
+1. **Project goal**: provision and harden Ubuntu, then prepare it for one of two PaaS surfaces (Coolify or dFlow) selected with `--paas`.
 2. **Execution surfaces**: `deploy.sh` (operator laptop), `setup.sh` (server-local).
-3. **External systems**: VPS provider, Tailscale, Cloudflare API, Docker/Coolify.
+3. **External systems**: VPS provider, Tailscale, Docker, plus PaaS-specific systems:
+   - **Coolify** path: Cloudflare API, Coolify itself.
+   - **dFlow** path: the remote dFlow controller (operator-supplied or `app.dflow.sh`); Cloudflare is unused.
 4. **Prerequisites**: operator machine has Tailscale connected, SSH keypair, and required CLI tools.
-5. **Required inputs/secrets**: server IP, root auth (laptop flow), Tailscale auth key, domain, Cloudflare token(s).
-6. **Mode decision**: `tunnel` vs `standard` changes exposure, DNS, and verification behavior.
-7. **State machine**: phases `[0/5]..[5/5]` with hard gates (A-F); do not skip failed gates.
+5. **Required inputs/secrets** (PaaS-conditional):
+   - Common: server IP, root auth (laptop flow), Tailscale auth key, server timezone.
+   - Coolify only: domain, Cloudflare token(s).
+   - dFlow only: `--dflow-auth-mode`; if `ssh`, controller pubkey file (`--dflow-control-pubkey-file`) and recommended `--dflow-control-cidr`.
+6. **Mode decision**:
+   - Coolify: `tunnel` vs `standard` changes exposure, DNS, and verification behavior.
+   - dFlow: `auth-mode=ssh` vs `auth-mode=tailscale` decides which path the controller uses to attach. `--mode` is not consumed by dFlow.
+7. **State machine**: phases `[0/5]..[5/5]` with hard gates (A-F); do not skip failed gates. For `--paas dflow`, phases 3 and 4 are intentional no-ops (the dFlow controller installs Docker/Dokku/Beszel/Restic/Traefik on first attach); phase 5 runs the validator with dFlow-specific checks.
 8. **Machine contracts**:
    - `base/bootstrap.sh` emits `HARDEN_RESULT_TAILSCALE_IP=<ip>` on stdout.
-   - `base/validate.sh --json` emits `{pass,fail,info,checks}`.
-9. **Security invariants**: UFW default-deny, strict SSH posture, DOCKER-USER WAN drop semantics, fail2ban posture.
+   - `base/validate.sh --json` emits `{pass,fail,info,checks}` (PaaS-aware: branches on `PAAS=` from state).
+   - `PAAS` env var (default `coolify`) is propagated through `deploy.env` into `bootstrap.sh` and `validate.sh` via the bootstrap key allowlist.
+9. **Security invariants**: UFW default-deny, strict SSH posture, DOCKER-USER WAN drop semantics (Coolify only — dFlow defers Docker config to controller, but the substrate's UFW posture stands), fail2ban posture. dFlow adds: root SSH `Match Address` restricted to `--dflow-control-cidr` when set; Beszel TCP port (default 45876) allowed only on the Tailscale interface (not WAN).
 10. **Idempotency/resume**: reruns must be safe; `--ts-ip` resumes from phase 2; companion scripts re-sync in phase 2.
-11. **Destructive-op discipline**: deploying and Cloudflare mutations are high impact; state command + effect and require explicit confirmation.
-12. **Recovery discipline**: separate real misconfiguration from validation false positives before editing checks.
+11. **Destructive-op discipline**: deploying is high impact regardless of PaaS. Cloudflare mutations apply only to `--paas coolify`. State command + effect and require explicit confirmation.
+12. **Recovery discipline**: separate real misconfiguration from validation false positives before editing checks. For dFlow, INFO results from `dflow_dokku_check`/`dflow_beszel_check`/`dflow_backups_check` before the controller has attached are expected, not failures.
 13. **Success criteria**: final validation must report `"fail":0` and gate evidence must be captured in notes.
 14. **Change control**: shell scripts are frozen unless explicitly authorized (exception: confirmed Gate C false positive fix).
 
@@ -63,12 +71,21 @@ If any prerequisite fails, fix that first.
 
 ### Step 2: Collect Non-Secret Deployment Shape
 
-Collect:
+Always ask first:
 
-- domain (Cloudflare-managed)
-- server public IPv4
-- mode preference (default: tunnel)
-- app-domain mode (`apex` default, `vps` optional)
+- **PaaS choice** (`--paas`): `coolify` (default) or `dflow`.
+
+Then, branched by PaaS:
+
+| | Coolify | dFlow |
+|---|---|---|
+| Domain | Cloudflare-managed (required) | not used |
+| Server public IPv4 | required | required |
+| Coolify mode | `tunnel` (default) or `standard` | n/a |
+| App-domain mode | `apex` (default) or `vps` | n/a |
+| dFlow auth-mode | n/a | `ssh` (default) or `tailscale` |
+| dFlow control CIDR | n/a | recommended (IPv4 CIDR of controller) |
+| Beszel port | n/a | optional override (default `45876`) |
 
 ### Step 3: Collect Secrets and Required Credentials
 
@@ -76,20 +93,23 @@ Collect:
 
 - root password (or root password file path for automation) for `deploy.sh` fresh runs (not required for `--ts-ip` resume or `--preflight-only`)
 - Tailscale auth key (`tskey-auth-*`) unless resuming with `--ts-ip` or running `--preflight-only`
-- Cloudflare API token (or `--cf-api-token-file`)
-- Cloudflare tunnel token if split-token model is used (`--cf-tunnel-api-token-file`)
+- **Coolify only**: Cloudflare API token (or `--cf-api-token-file`); Cloudflare tunnel token if split-token model is used (`--cf-tunnel-api-token-file`)
+- **dFlow only, `auth-mode=ssh`**: dFlow controller's SSH public key file (`--dflow-control-pubkey-file`)
 
 ### Step 4: Confirm Defaults
 
 Unless user overrides:
 
-- admin user: `coolifyadmin`
+- PaaS: `coolify`
+- admin user: `coolifyadmin` (Coolify) or `dflowadmin` (dFlow)
 - pubkey file: `~/.ssh/id_ed25519.pub`
 - swap size: `2G`
-- deploy mode: `tunnel`
-- app domain mode: `apex`
+- deploy mode: `tunnel` (Coolify only)
+- app domain mode: `apex` (Coolify only)
 - tailscale direct WAN: disabled (`--no-tailscale-direct-wan`)
 - server timezone: operator must choose explicitly (no implicit recommendation)
+- dFlow auth-mode: `ssh`
+- dFlow Beszel port: `45876`
 
 ### Step 5: Confirm Command + Impact, Then Execute
 
@@ -118,28 +138,40 @@ Recommended defaults (when user is undecided):
 Minimal command templates:
 
 ```bash
-# deploy.sh fresh run
-/opt/homebrew/bin/bash deploy.sh --server-ip <ip> --domain <fqdn> --root-pass-file <path> \
+# Coolify: deploy.sh fresh run
+/opt/homebrew/bin/bash deploy.sh --paas coolify --server-ip <ip> --domain <fqdn> --root-pass-file <path> \
   --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> \
   --cf-api-token-file <path> --yes
 
-# deploy.sh resume from phase 2
-/opt/homebrew/bin/bash deploy.sh --server-ip <ip> --domain <fqdn> --ts-ip <100.x.x.x> \
+# Coolify: deploy.sh resume from phase 2
+/opt/homebrew/bin/bash deploy.sh --paas coolify --server-ip <ip> --domain <fqdn> --ts-ip <100.x.x.x> \
   --server-timezone <IANA> --cf-api-token-file <path> --yes
 
-# deploy.sh preflight-only
-/opt/homebrew/bin/bash deploy.sh --server-ip <ip> --domain <fqdn> --server-timezone <IANA> \
+# Coolify: deploy.sh preflight-only
+/opt/homebrew/bin/bash deploy.sh --paas coolify --server-ip <ip> --domain <fqdn> --server-timezone <IANA> \
   --cf-api-token-file <path> --preflight-only --yes
 
-# setup.sh server-local
-sudo /opt/homebrew/bin/bash setup.sh --server-ip <ip> --admin-user <name> --pubkey-file <path> \
+# Coolify: setup.sh server-local
+sudo /opt/homebrew/bin/bash setup.sh --paas coolify --server-ip <ip> --admin-user <name> --pubkey-file <path> \
   --domain <fqdn> --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> \
   --cf-api-token-file <path> --yes
 
-# setup.sh preflight-only
-sudo /opt/homebrew/bin/bash setup.sh --server-ip <ip> --admin-user <name> --pubkey-file <path> \
-  --domain <fqdn> --server-timezone <IANA> --cf-api-token-file <path> \
-  --preflight-only --yes
+# dFlow: deploy.sh fresh run, auth-mode=ssh
+/opt/homebrew/bin/bash deploy.sh --paas dflow --server-ip <ip> --root-pass-file <path> \
+  --admin-user dflowadmin --pubkey-file <path> \
+  --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> \
+  --dflow-auth-mode ssh --dflow-control-pubkey-file <path> --dflow-control-cidr <ipv4-cidr> --yes
+
+# dFlow: deploy.sh fresh run, auth-mode=tailscale
+/opt/homebrew/bin/bash deploy.sh --paas dflow --server-ip <ip> --root-pass-file <path> \
+  --admin-user dflowadmin --pubkey-file <path> \
+  --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> \
+  --dflow-auth-mode tailscale --yes
+
+# dFlow: setup.sh server-local
+sudo /opt/homebrew/bin/bash setup.sh --paas dflow --server-ip <ip> --admin-user <name> --pubkey-file <path> \
+  --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> \
+  --dflow-auth-mode ssh --dflow-control-pubkey-file <path> --dflow-control-cidr <ipv4-cidr> --yes
 ```
 
 Decision tree:
@@ -167,18 +199,21 @@ Pre-run checklist:
 
 ## 5. Deployment Phases and Gates
 
-- **[0/5] Pre-flight**: local tools, key validity, Cloudflare auth/capability checks.
-- **[1/5] Harden**: upload companion scripts + run `base/bootstrap.sh`; capture `HARDEN_RESULT_TAILSCALE_IP=<ip>`.
+- **[0/5] Pre-flight**: local tools, key validity. Coolify: Cloudflare auth/capability checks. dFlow: Cloudflare checks skipped.
+- **[1/5] Harden**: upload companion scripts + run `base/bootstrap.sh`; capture `HARDEN_RESULT_TAILSCALE_IP=<ip>`. Same for both PaaS.
 - **[2/5] Gates**:
   - Gate A: SSH admin over Tailscale works.
   - Gate B: admin identity check.
   - Gate C: `base/validate.sh --json --gate-c` reports 0 failures.
-- **[3/5] Docker+Coolify**:
-  - Gate D: DOCKER-USER hardening service/rules active.
-- **[4/5] Binding+DNS**: configure dashboard binding, Cloudflare DNS/tunnel depending on mode.
+- **[3/5] PaaS install**:
+  - Coolify: Docker + Coolify; Gate D = DOCKER-USER hardening service/rules active.
+  - dFlow: no-op (controller installs Docker/Dokku/plugins/Beszel/Restic on first attach); substrate readiness logged.
+- **[4/5] Routing**:
+  - Coolify: configure dashboard binding, Cloudflare DNS/tunnel depending on mode.
+  - dFlow: no-op (Traefik is owned by dFlow).
 - **[5/5] Final verify**:
-  - Gate E: dashboard/websocket reachable on Tailscale and blocked on public paths.
-  - Gate F: mode-specific external/private route assertions.
+  - Coolify: Gate E (dashboard/websocket reachable on Tailscale and blocked on public paths) + Gate F (mode-specific external/private route assertions).
+  - dFlow: Gate F runs `base/validate.sh --json` on the worker; dFlow-specific checks (`dflow_dokku_check`, `dflow_beszel_check`, `dflow_backups_check`, `dflow_predeploy_hook_check`, `dflow_ssh_path_check`) must not regress. INFO results from runtime checks pre-attach are expected.
   - Final `base/validate.sh --json` must report 0 failures.
 
 ---
@@ -189,10 +224,11 @@ Pre-run checklist:
 
 ```bash
 bash -n deploy.sh setup.sh \
-     lib/coolify-common.sh \
+     overlays/coolify/coolify-common.sh \
+     overlays/dflow/dflow-common.sh \
      base/validate.sh \
      base/bootstrap.sh \
-     configure_coolify_binding.sh
+     overlays/coolify/configure_coolify_binding.sh
 ```
 
 Must be clean. If syntax check fails on an unmodified file, stop and escalate.
@@ -217,10 +253,13 @@ change is the explicit, user-confirmed goal.
 
 | Contract | Defined in | Consumed by |
 |----------|-----------|-------------|
-| `base/validate.sh --json` schema: `{"pass":N,"fail":N,"info":N,"checks":[...]}` | `base/validate.sh` | `report_validation_result()` in `lib/coolify-common.sh` |
+| `base/validate.sh --json` schema: `{"pass":N,"fail":N,"info":N,"checks":[...]}` | `base/validate.sh` | `report_validation_result()` in `lib/common.sh` (shared by both overlays) |
 | `HARDEN_RESULT_TAILSCALE_IP=<ip>` sentinel (stdout) | `base/bootstrap.sh` | `deploy.sh` phase 1 capture via `tee` |
-| State file `/var/lib/server-hardening/state` (key=value) | `base/bootstrap.sh write_state()` | `base/validate.sh` (state-derived checks) |
-| Tunnel name `coolify-<domain-slug>-<sha256-12>` | `lib/coolify-common.sh coolify_tunnel_name()` / `cf_create_tunnel()` | same function on re-run (reuse configured tunnel when possible; otherwise reconcile by deterministic name) |
+| State file `/var/lib/server-hardening/state` (key=value) | `base/bootstrap.sh write_state()` | `base/validate.sh` (state-derived checks; `PAAS=` selects branch) |
+| `PAAS=` env var allowlisted in bootstrap env-file parsing | `base/bootstrap.sh env_file_key_supported` | `setup.sh phase1_harden` writes `deploy.env`; bootstrap reads it |
+| Tunnel name `coolify-<domain-slug>-<sha256-12>` | `overlays/coolify/coolify-common.sh coolify_tunnel_name()` / `cf_create_tunnel()` | same function on re-run (reuse configured tunnel when possible; otherwise reconcile by deterministic name) |
+| dFlow controller pubkey installed in `/root/.ssh/authorized_keys` with stable tag `dflow-control@managed` | `overlays/dflow/modules/ssh_access.sh` | dFlow controller (uses corresponding private key); `dflow_ssh_path_check` |
+| dFlow Beszel agent ingress: TCP `${DFLOW_BESZEL_PORT:-45876}` allowed only on `tailscale0` (UFW comment `dflow-hardening-beszel-tailscale`) | `overlays/dflow/modules/ufw.sh` | dFlow controller's Beszel hub (over tailnet); `dflow_beszel_check` |
 
 Changing these without updating all consumers is a breaking change.
 
@@ -263,10 +302,12 @@ These affect live infrastructure and are difficult/impossible to reverse:
 | Operation | Impact |
 |-----------|--------|
 | Running `deploy.sh` or `setup.sh` against a server | Irreversible system changes (UFW reset, SSH hardening) |
-| Deleting a Cloudflare Tunnel | Drops live traffic for all tunnel-routed apps immediately |
-| Deleting/modifying Cloudflare DNS records | Drops or misdirects live traffic |
+| Deleting a Cloudflare Tunnel *(Coolify only)* | Drops live traffic for all tunnel-routed apps immediately |
+| Deleting/modifying Cloudflare DNS records *(Coolify only)* | Drops or misdirects live traffic |
 | `ufw --force reset` on a live server | Removes all firewall rules; can lock out SSH |
 | Editing `/data/coolify` files or querying `coolify-db` | Risk of Coolify data corruption |
+| Detaching a worker from the dFlow controller, or `dokku apps:destroy` | Removes app data and config; uninstalls dFlow-managed services |
+| Modifying `/etc/ssh/sshd_config.d/16-dflow-root-match.conf` directly | Can lock out the dFlow controller; manage via overlay re-run |
 
 State exact command and effect before running. Wait for explicit user confirmation.
 
@@ -278,14 +319,18 @@ The shell scripts are frozen. **Do not edit any `.sh` file** without explicit in
 
 - `base/bootstrap.sh`
 - `base/validate.sh`
-- `configure_coolify_binding.sh`
 - `deploy.sh`
 - `setup.sh`
-- `lib/coolify-common.sh`
+- `overlays/coolify/coolify-common.sh`
+- `overlays/coolify/configure_coolify_binding.sh`
+- `overlays/coolify/modules/*.sh`, `overlays/coolify/checks/*.sh`
+- `overlays/dflow/dflow-common.sh`
+- `overlays/dflow/modules/*.sh`, `overlays/dflow/checks/*.sh`
+- `lib/*.sh`
 
 Files free to edit by default:
 
-- `AGENTS.md`
+- `AGENTS.md`, `README.md`, `HARDENING_PROCEDURE.md`
 
 **Exception — Gate C false positives**: If Gate C fails but server state is actually correct,
 the validator may be wrong.
@@ -331,3 +376,50 @@ If phase 1 completed (server has Tailscale IP), create task to resume from phase
 ### Escalation trigger
 
 If two consecutive recovery attempts make no progress, stop and request user decision.
+
+<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
+## Beads Issue Tracker
+
+This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+
+### Quick Reference
+
+```bash
+bd ready              # Find available work
+bd show <id>          # View issue details
+bd update <id> --claim  # Claim work
+bd close <id>         # Complete work
+```
+
+### Rules
+
+- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Run `bd prime` for detailed command reference and session close protocol
+- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+
+## Session Completion
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   bd dolt push
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds
+<!-- END BEADS INTEGRATION -->

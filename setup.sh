@@ -23,6 +23,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # shellcheck source=overlays/coolify/coolify-common.sh
 source "${SCRIPT_DIR}/overlays/coolify/coolify-common.sh"
+# shellcheck source=overlays/dflow/dflow-common.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/overlays/dflow/dflow-common.sh"
 # shellcheck source=lib/overlay-loader.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/overlay-loader.sh"
@@ -47,6 +50,11 @@ APP_DOMAIN_MODE="${APP_DOMAIN_MODE:-}"
 SWAP_SIZE="${SWAP_SIZE:-}"
 SERVER_TIMEZONE="${SERVER_TIMEZONE:-}"
 TAILSCALE_DIRECT_WAN="${TAILSCALE_DIRECT_WAN:-false}"
+DFLOW_AUTH_MODE="${DFLOW_AUTH_MODE:-ssh}"
+DFLOW_CONTROL_PUBKEY_FILE="${DFLOW_CONTROL_PUBKEY_FILE:-}"
+DFLOW_CONTROL_PUBKEY="${DFLOW_CONTROL_PUBKEY:-}"
+DFLOW_CONTROL_CIDR="${DFLOW_CONTROL_CIDR:-}"
+DFLOW_BESZEL_PORT="${DFLOW_BESZEL_PORT:-45876}"
 PRIVATE_TLS_CA="${PRIVATE_TLS_CA:-}"
 ZEROSSL_EAB_KID="${ZEROSSL_EAB_KID:-}"
 ZEROSSL_EAB_KID_FILE="${ZEROSSL_EAB_KID_FILE:-}"
@@ -88,7 +96,7 @@ pause_for_operator() {
 
 usage() {
   cat <<'EOF'
-setup.sh — Server-side orchestrator for secure Coolify deployment
+setup.sh — Server-side orchestrator for secure PaaS deployment
 
 Usage:
   sudo setup.sh [options]
@@ -96,15 +104,20 @@ Usage:
 Run this directly on the server. If all required flags are provided,
 runs non-interactively. If any are missing, prompts for them.
 
-Required:
+PaaS selection:
+  --paas <coolify|dflow>        Which PaaS to deploy (default: coolify)
+
+Required (all):
   --server-ip <ip>              Server public IPv4 address
   --admin-user <name>           Admin username
   --pubkey-file <path>          SSH public key file (on this server)
   --tailscale-auth-key <key>    Required unless --preflight-only
+
+Required (coolify only):
   --domain <fqdn>               Domain name for Coolify
   Cloudflare API token          Provide via CF_API_TOKEN, --cf-api-token-file, or prompt
 
-Optional:
+Optional (coolify):
   --cf-api-token-file <path>    File containing Cloudflare API token
   --cf-tunnel-api-token-file <path>
                                 File containing Cloudflare tunnel API token (optional; defaults to API token)
@@ -113,16 +126,24 @@ Optional:
   --cf-zone <zone>              Cloudflare zone (default: derived from domain)
   --cf-zone-id <id>             Cloudflare zone ID override (32-char hex)
   --cf-account-id <id>          Cloudflare account ID override (32-char hex)
-  --swap-size <size>            Swap size (default: 2G)
-  --server-timezone <IANA>      Server timezone (for example: Australia/Melbourne, UTC)
   --private-tls-ca <letsencrypt|zerossl>
                                 Private dashboard/websocket CA in tunnel mode (default: letsencrypt)
   --zerossl-eab-kid-file <path> File containing ZeroSSL EAB kid (required when --private-tls-ca zerossl)
   --zerossl-eab-hmac-file <path>
                                 File containing ZeroSSL EAB hmac (required when --private-tls-ca zerossl)
+
+Optional (all):
+  --swap-size <size>            Swap size (default: 2G)
+  --server-timezone <IANA>      Server timezone (for example: Australia/Melbourne, UTC)
   --tailscale-direct-wan        Allow WAN UDP 41641 for direct Tailscale paths (optional optimization)
   --no-tailscale-direct-wan     Keep WAN UDP 41641 closed (default; DERP fallback remains available)
-  --preflight-only              Run local/Cloudflare preflight checks only, then exit
+  --preflight-only              Run local preflight checks only, then exit
+  --dflow-auth-mode <ssh|tailscale>
+                                dFlow controller attach path (default: ssh)
+  --dflow-control-pubkey-file <path>
+                                dFlow controller public key for auth-mode=ssh
+  --dflow-control-cidr <cidr>   IPv4 CIDR allowed to root SSH for dFlow controller
+  --dflow-beszel-port <port>    Beszel agent TCP port (default: 45876)
   --yes                         Skip confirmation prompts (preflight-only; full setup still requires operator checks)
   -h, --help                    Show this help
 EOF
@@ -137,6 +158,7 @@ parse_args() {
       --admin-user)      ADMIN_USER="${2:?--admin-user requires a value}"; shift 2 ;;
       --pubkey-file)     PUBKEY_FILE="${2:?--pubkey-file requires a value}"; shift 2 ;;
       --tailscale-auth-key) TAILSCALE_AUTH_KEY="${2:?--tailscale-auth-key requires a value}"; shift 2 ;;
+      --paas)            PAAS="${2:?--paas requires a value}"; shift 2 ;;
       --mode)            DEPLOY_MODE="${2:?--mode requires a value}"; shift 2 ;;
       --domain)          DOMAIN="${2:?--domain requires a value}"; shift 2 ;;
       --cf-api-token)
@@ -158,6 +180,10 @@ parse_args() {
       --zerossl-eab-hmac-file) ZEROSSL_EAB_HMAC_FILE="${2:?--zerossl-eab-hmac-file requires a value}"; shift 2 ;;
       --tailscale-direct-wan) TAILSCALE_DIRECT_WAN="true"; shift ;;
       --no-tailscale-direct-wan) TAILSCALE_DIRECT_WAN="false"; shift ;;
+      --dflow-auth-mode) DFLOW_AUTH_MODE="${2:?--dflow-auth-mode requires a value}"; shift 2 ;;
+      --dflow-control-pubkey-file) DFLOW_CONTROL_PUBKEY_FILE="${2:?--dflow-control-pubkey-file requires a value}"; shift 2 ;;
+      --dflow-control-cidr) DFLOW_CONTROL_CIDR="${2:?--dflow-control-cidr requires a value}"; shift 2 ;;
+      --dflow-beszel-port) DFLOW_BESZEL_PORT="${2:?--dflow-beszel-port requires a value}"; shift 2 ;;
       --preflight-only)  PREFLIGHT_ONLY="true"; shift ;;
       --yes)             AUTO_YES="true"; shift ;;
       -h|--help)         usage; exit 0 ;;
@@ -172,14 +198,31 @@ collect_inputs() {
   if is_true "${PREFLIGHT_ONLY}" && [[ -z "${TAILSCALE_AUTH_KEY}" ]]; then
     TAILSCALE_AUTH_KEY="(not-needed)"
   fi
-  collect_common_inputs
+  case "${PAAS}" in
+    dflow)
+      collect_dflow_setup_inputs
+      ;;
+    coolify)
+      collect_common_inputs
+      ;;
+    *)
+      die "Unsupported PAAS: ${PAAS} (expected coolify or dflow)"
+      ;;
+  esac
 }
 
 # ── Input validation ───────────────────────────────────────────────────────
 
 validate_inputs() {
-  finalize_cloudflare_tokens
-  finalize_private_tls_ca_inputs
+  case "${PAAS}" in
+    coolify|dflow) ;;
+    *) die "Unsupported PAAS: ${PAAS} (expected coolify or dflow)" ;;
+  esac
+
+  if [[ "${PAAS}" == "coolify" ]]; then
+    finalize_cloudflare_tokens
+    finalize_private_tls_ca_inputs
+  fi
 
   if is_true "${AUTO_YES}" && ! is_true "${PREFLIGHT_ONLY}"; then
     die "setup.sh --yes is only supported with --preflight-only. Full setup requires operator confirmations from a laptop; use deploy.sh or run setup.sh interactively."
@@ -202,24 +245,6 @@ validate_inputs() {
       || die "Tailscale auth key must start with 'tskey-auth-' (got: ${TAILSCALE_AUTH_KEY:0:12}...)"
   fi
 
-  [[ "${DEPLOY_MODE}" == "standard" || "${DEPLOY_MODE}" == "tunnel" ]] \
-    || die "Mode must be 'standard' or 'tunnel' (got: ${DEPLOY_MODE})"
-  [[ "${PRIVATE_TLS_CA}" == "letsencrypt" || "${PRIVATE_TLS_CA}" == "zerossl" ]] \
-    || die "Private TLS CA must be 'letsencrypt' or 'zerossl' (got: ${PRIVATE_TLS_CA})"
-  if [[ "${DEPLOY_MODE}" == "tunnel" && "${PRIVATE_TLS_CA}" == "zerossl" ]]; then
-    [[ -n "${ZEROSSL_EAB_KID}" ]] || die "ZeroSSL EAB kid is required when --private-tls-ca zerossl."
-    [[ -n "${ZEROSSL_EAB_HMAC}" ]] || die "ZeroSSL EAB hmac is required when --private-tls-ca zerossl."
-  fi
-
-  [[ "${APP_DOMAIN_MODE}" == "vps" || "${APP_DOMAIN_MODE}" == "apex" ]] \
-    || die "App domain mode must be 'vps' or 'apex' (got: ${APP_DOMAIN_MODE})"
-
-  [[ "${DOMAIN}" =~ ${FQDN_RE} ]]         || die "Invalid domain: ${DOMAIN}"
-  [[ -n "${CF_API_TOKEN}" ]]               || die "Cloudflare API token is required."
-  [[ -z "${CF_ZONE_ID}" || "${CF_ZONE_ID}" =~ ${CF_ID_RE} ]] \
-    || die "Invalid --cf-zone-id: ${CF_ZONE_ID} (expected 32-char hex)"
-  [[ -z "${CF_ACCOUNT_ID}" || "${CF_ACCOUNT_ID}" =~ ${CF_ID_RE} ]] \
-    || die "Invalid --cf-account-id: ${CF_ACCOUNT_ID} (expected 32-char hex)"
   [[ "${SWAP_SIZE}" =~ ${SWAP_RE} ]]       || die "Invalid swap size: ${SWAP_SIZE} (expected e.g. 2G, 512M)"
   [[ "${SERVER_TIMEZONE}" =~ ${TIMEZONE_RE} ]] \
     || die "Invalid server timezone: ${SERVER_TIMEZONE} (expected IANA name like Australia/Melbourne or UTC)"
@@ -228,11 +253,61 @@ validate_inputs() {
     *) die "TAILSCALE_DIRECT_WAN must be true/false (got: ${TAILSCALE_DIRECT_WAN})" ;;
   esac
 
+  if [[ "${PAAS}" == "coolify" ]]; then
+    [[ "${DEPLOY_MODE}" == "standard" || "${DEPLOY_MODE}" == "tunnel" ]] \
+      || die "Mode must be 'standard' or 'tunnel' (got: ${DEPLOY_MODE})"
+    [[ "${PRIVATE_TLS_CA}" == "letsencrypt" || "${PRIVATE_TLS_CA}" == "zerossl" ]] \
+      || die "Private TLS CA must be 'letsencrypt' or 'zerossl' (got: ${PRIVATE_TLS_CA})"
+    if [[ "${DEPLOY_MODE}" == "tunnel" && "${PRIVATE_TLS_CA}" == "zerossl" ]]; then
+      [[ -n "${ZEROSSL_EAB_KID}" ]] || die "ZeroSSL EAB kid is required when --private-tls-ca zerossl."
+      [[ -n "${ZEROSSL_EAB_HMAC}" ]] || die "ZeroSSL EAB hmac is required when --private-tls-ca zerossl."
+    fi
+
+    [[ "${APP_DOMAIN_MODE}" == "vps" || "${APP_DOMAIN_MODE}" == "apex" ]] \
+      || die "App domain mode must be 'vps' or 'apex' (got: ${APP_DOMAIN_MODE})"
+
+    [[ "${DOMAIN}" =~ ${FQDN_RE} ]]         || die "Invalid domain: ${DOMAIN}"
+    [[ -n "${CF_API_TOKEN}" ]]               || die "Cloudflare API token is required."
+    [[ -z "${CF_ZONE_ID}" || "${CF_ZONE_ID}" =~ ${CF_ID_RE} ]] \
+      || die "Invalid --cf-zone-id: ${CF_ZONE_ID} (expected 32-char hex)"
+    [[ -z "${CF_ACCOUNT_ID}" || "${CF_ACCOUNT_ID}" =~ ${CF_ID_RE} ]] \
+      || die "Invalid --cf-account-id: ${CF_ACCOUNT_ID} (expected 32-char hex)"
+  fi
+
+  if [[ "${PAAS}" == "dflow" ]]; then
+    finalize_dflow_inputs
+  fi
+
+
   # Verify scripts are present in current directory
-  local scripts=(base/bootstrap.sh base/validate.sh overlays/coolify/configure_coolify_binding.sh)
+  local scripts=(base/bootstrap.sh base/validate.sh)
+  if [[ "${PAAS}" == "coolify" ]]; then
+    scripts+=(overlays/coolify/configure_coolify_binding.sh)
+  fi
   for script in "${scripts[@]}"; do
     [[ -f "${SCRIPT_DIR}/${script}" ]] || die "Required script not found: ${SCRIPT_DIR}/${script}"
   done
+
+  if [[ "${PAAS}" == "dflow" ]]; then
+    local dflow_required=(
+      overlays/dflow/dflow-common.sh
+      overlays/dflow/modules/ufw.sh
+      overlays/dflow/modules/ssh_access.sh
+      overlays/dflow/modules/ssh_match_dropin.sh
+      overlays/dflow/modules/tailscale_ssh.sh
+      overlays/dflow/modules/predeploy_hook.sh
+      overlays/dflow/data/dokku-predeploy-resource-check.sh
+      overlays/dflow/checks/dflow_substrate_check.sh
+      overlays/dflow/checks/dflow_dokku_check.sh
+      overlays/dflow/checks/dflow_beszel_check.sh
+      overlays/dflow/checks/dflow_backups_check.sh
+      overlays/dflow/checks/dflow_predeploy_hook_check.sh
+      overlays/dflow/checks/dflow_ssh_path_check.sh
+    )
+    for f in "${dflow_required[@]}"; do
+      [[ -f "${SCRIPT_DIR}/${f}" ]] || die "Required dFlow file not found: ${SCRIPT_DIR}/${f}"
+    done
+  fi
 
   local lib_files=(lib/tailscale.sh)
   for libfile in "${lib_files[@]}"; do
@@ -286,15 +361,19 @@ preflight() {
   ssh-keygen -l -f "${PUBKEY_FILE}" >/dev/null 2>&1 || die "Invalid SSH public key file: ${PUBKEY_FILE}"
   pass "SSH public key valid: ${PUBKEY_FILE}"
 
-  # Verify Cloudflare token
-  cf_verify_token
-  cf_get_zone_id
-  cf_verify_dns_write_token
-  cf_get_account_id  # always fetch — needed for tunnel (default mode)
-  cf_verify_tunnel_token
-  resolve_app_domain
-  cf_verify_private_tls_ca_caa
-  pass "Cloudflare API verified (zone: ${CF_ZONE_ID})"
+  if [[ "${PAAS}" == "coolify" ]]; then
+    # Verify Cloudflare token
+    cf_verify_token
+    cf_get_zone_id
+    cf_verify_dns_write_token
+    cf_get_account_id  # always fetch — needed for tunnel (default mode)
+    cf_verify_tunnel_token
+    resolve_app_domain
+    cf_verify_private_tls_ca_caa
+    pass "Cloudflare API verified (zone: ${CF_ZONE_ID})"
+  else
+    pass "dFlow: Cloudflare preflight skipped (controller manages routing)"
+  fi
 }
 
 # ── Phase 1: Harden ────────────────────────────────────────────────────────
@@ -320,6 +399,11 @@ phase1_harden() {
     printf 'TAILSCALE_AUTH_KEY="%s"\n' "${TAILSCALE_AUTH_KEY//\"/\\\"}"
     printf 'TAILSCALE_DIRECT_WAN="%s"\n' "${TAILSCALE_DIRECT_WAN//\"/\\\"}"
     printf 'BIND_DASHBOARD_TO_TAILSCALE="false"\n'
+    printf 'PAAS="%s"\n' "${PAAS//\"/\\\"}"
+    printf 'DFLOW_AUTH_MODE="%s"\n' "${DFLOW_AUTH_MODE//\"/\\\"}"
+    printf 'DFLOW_CONTROL_PUBKEY="%s"\n' "${DFLOW_CONTROL_PUBKEY//\"/\\\"}"
+    printf 'DFLOW_CONTROL_CIDR="%s"\n' "${DFLOW_CONTROL_CIDR//\"/\\\"}"
+    printf 'DFLOW_BESZEL_PORT="%s"\n' "${DFLOW_BESZEL_PORT//\"/\\\"}"
   } > "${deploy_env_file}"
   chmod 600 "${deploy_env_file}"
   pass "Environment file written"
@@ -437,15 +521,27 @@ phase2_gates() {
 
 paas_phase3_dispatch() {
   overlay_topo_sort "${PAAS}"
-  coolify_phase3_docker_coolify_shared "$@"
+  case "${PAAS}" in
+    dflow)   dflow_phase3_install_shared "$@" ;;
+    coolify) coolify_phase3_docker_coolify_shared "$@" ;;
+    *)       die "Unsupported PAAS: ${PAAS}" ;;
+  esac
 }
 
 paas_phase4_dispatch() {
-  coolify_phase4_binding_dns_shared "$@"
+  case "${PAAS}" in
+    dflow)   dflow_phase4_routing_shared "$@" ;;
+    coolify) coolify_phase4_binding_dns_shared "$@" ;;
+    *)       die "Unsupported PAAS: ${PAAS}" ;;
+  esac
 }
 
 paas_phase5_dispatch() {
-  coolify_phase5_verify_shared "$@"
+  case "${PAAS}" in
+    dflow)   dflow_phase5_verify_shared "${1:-}" ;;
+    coolify) coolify_phase5_verify_shared "$@" ;;
+    *)       die "Unsupported PAAS: ${PAAS}" ;;
+  esac
 }
 
 phase3_docker_coolify() {
@@ -584,19 +680,24 @@ main() {
   # Show summary before proceeding
   printf '\n'
   log "Deployment configuration:"
+  log "  PaaS:      ${PAAS}"
   log "  Server:    ${SERVER_IP}"
   log "  Admin:     ${ADMIN_USER}"
   log "  Pubkey:    ${PUBKEY_FILE}"
-  log "  Mode:      ${DEPLOY_MODE}"
-  log "  Domain:    ${DOMAIN}"
-  log "  App scope: ${APP_DOMAIN_MODE}"
   log "  Swap:      ${SWAP_SIZE}"
   log "  Timezone:  ${SERVER_TIMEZONE}"
   log "  Local TZ:  $(local_tz_offset) (logs use UTC)"
-  [[ "${DEPLOY_MODE}" == "tunnel" ]] && log "  Private TLS CA: ${PRIVATE_TLS_CA}"
-  print_private_tls_ca_notice
+  if [[ "${PAAS}" == "coolify" ]]; then
+    log "  Mode:      ${DEPLOY_MODE}"
+    log "  Domain:    ${DOMAIN}"
+    log "  App scope: ${APP_DOMAIN_MODE}"
+    [[ "${DEPLOY_MODE}" == "tunnel" ]] && log "  Private TLS CA: ${PRIVATE_TLS_CA}"
+    print_private_tls_ca_notice
+    [[ "${CF_TUNNEL_API_TOKEN}" != "${CF_API_TOKEN}" ]] && log "  CF tunnel token: custom"
+  else
+    log "  Controller: dFlow (Tailscale SSH)"
+  fi
   is_true "${PREFLIGHT_ONLY}" && log "  Mode:      preflight-only (no server changes)"
-  [[ "${CF_TUNNEL_API_TOKEN}" != "${CF_API_TOKEN}" ]] && log "  CF tunnel token: custom"
   confirm "Proceed with deployment?"
 
   preflight
@@ -606,8 +707,16 @@ main() {
   fi
   phase1_harden
   phase2_gates
-  phase3_docker_coolify
-  phase4_binding_dns
+  case "${PAAS}" in
+    dflow)
+      paas_phase3_dispatch
+      paas_phase4_dispatch
+      ;;
+    coolify)
+      phase3_docker_coolify
+      phase4_binding_dns
+      ;;
+  esac
   phase5_verify
 }
 

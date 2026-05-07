@@ -14,6 +14,7 @@ workspace/
 
 # Research notes — potentially sensitive context, not for distribution
 research/
+audit-*/
 
 # OS/editor junk
 .DS_Store

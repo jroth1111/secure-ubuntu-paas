@@ -48,6 +48,21 @@ source "${SCRIPT_DIR}/../overlays/coolify/modules/binding.sh"
 # shellcheck source=../overlays/coolify/modules/binding_watchdog.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../overlays/coolify/modules/binding_watchdog.sh"
+# shellcheck source=../overlays/dflow/modules/ufw.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../overlays/dflow/modules/ufw.sh"
+# shellcheck source=../overlays/dflow/modules/ssh_access.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../overlays/dflow/modules/ssh_access.sh"
+# shellcheck source=../overlays/dflow/modules/ssh_match_dropin.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../overlays/dflow/modules/ssh_match_dropin.sh"
+# shellcheck source=../overlays/dflow/modules/tailscale_ssh.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../overlays/dflow/modules/tailscale_ssh.sh"
+# shellcheck source=../overlays/dflow/modules/predeploy_hook.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../overlays/dflow/modules/predeploy_hook.sh"
 
 # shellcheck source=./modules/os_detect.sh
 # shellcheck disable=SC1091
@@ -64,6 +79,9 @@ source "${SCRIPT_DIR}/modules/services.sh"
 # shellcheck source=./modules/kernel_sysctl.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/modules/kernel_sysctl.sh"
+# shellcheck source=./modules/system_limits.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/modules/system_limits.sh"
 # shellcheck source=./modules/fail2ban.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/modules/fail2ban.sh"
@@ -154,6 +172,11 @@ BIND_DASHBOARD_TO_TAILSCALE="${BIND_DASHBOARD_TO_TAILSCALE:-false}"
 INSTALL_TAILSCALE="${INSTALL_TAILSCALE:-false}"
 TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"
 TAILSCALE_DIRECT_WAN="${TAILSCALE_DIRECT_WAN:-false}"
+PAAS="${PAAS:-coolify}"
+DFLOW_AUTH_MODE="${DFLOW_AUTH_MODE:-ssh}"
+DFLOW_CONTROL_PUBKEY="${DFLOW_CONTROL_PUBKEY:-}"
+DFLOW_CONTROL_CIDR="${DFLOW_CONTROL_CIDR:-}"
+DFLOW_BESZEL_PORT="${DFLOW_BESZEL_PORT:-45876}"
 STRICT_DOCKER_SSH_CIDRS="${STRICT_DOCKER_SSH_CIDRS:-true}"
 INSECURE_ENV="${INSECURE_ENV:-false}"
 DOCKER_NPROC_HARD="${DOCKER_NPROC_HARD:-8192}"
@@ -308,7 +331,7 @@ unescape_backslash_sequences() {
 
 env_file_key_supported() {
   case "$1" in
-    ADMIN_USER|ADMIN_PUBKEY|DOMAIN|TAILSCALE_CIDR|SSH_PORT|WAN_IFACE|ENABLE_AUTO_REBOOT|AUTO_REBOOT_TIME|UPDATE_PROFILE|JOURNAL_RETENTION|JOURNAL_MAX_USE|TUNNEL_MODE|SWAP_SIZE|TIMEZONE|DRY_RUN|FORCE|UPGRADE_MAIL|BIND_DASHBOARD_TO_TAILSCALE|INSTALL_TAILSCALE|TAILSCALE_AUTH_KEY|TAILSCALE_DIRECT_WAN|STRICT_DOCKER_SSH_CIDRS|INSECURE_ENV|DOCKER_NPROC_HARD|DOCKER_NPROC_SOFT|ALLOWED_PRIVILEGED_CONTAINERS)
+    ADMIN_USER|ADMIN_PUBKEY|DOMAIN|TAILSCALE_CIDR|SSH_PORT|WAN_IFACE|ENABLE_AUTO_REBOOT|AUTO_REBOOT_TIME|UPDATE_PROFILE|JOURNAL_RETENTION|JOURNAL_MAX_USE|TUNNEL_MODE|SWAP_SIZE|TIMEZONE|DRY_RUN|FORCE|UPGRADE_MAIL|BIND_DASHBOARD_TO_TAILSCALE|INSTALL_TAILSCALE|TAILSCALE_AUTH_KEY|TAILSCALE_DIRECT_WAN|STRICT_DOCKER_SSH_CIDRS|INSECURE_ENV|DOCKER_NPROC_HARD|DOCKER_NPROC_SOFT|ALLOWED_PRIVILEGED_CONTAINERS|PAAS|DFLOW_AUTH_MODE|DFLOW_CONTROL_PUBKEY|DFLOW_CONTROL_CIDR|DFLOW_BESZEL_PORT)
       return 0
       ;;
     *)
@@ -321,7 +344,7 @@ set_env_file_value() {
   local key="$1"
   local value="$2"
   case "${key}" in
-    ADMIN_USER|ADMIN_PUBKEY|DOMAIN|TAILSCALE_CIDR|SSH_PORT|WAN_IFACE|ENABLE_AUTO_REBOOT|AUTO_REBOOT_TIME|UPDATE_PROFILE|JOURNAL_RETENTION|JOURNAL_MAX_USE|TUNNEL_MODE|SWAP_SIZE|TIMEZONE|DRY_RUN|FORCE|UPGRADE_MAIL|BIND_DASHBOARD_TO_TAILSCALE|INSTALL_TAILSCALE|TAILSCALE_AUTH_KEY|TAILSCALE_DIRECT_WAN|STRICT_DOCKER_SSH_CIDRS|INSECURE_ENV|DOCKER_NPROC_HARD|DOCKER_NPROC_SOFT|ALLOWED_PRIVILEGED_CONTAINERS)
+    ADMIN_USER|ADMIN_PUBKEY|DOMAIN|TAILSCALE_CIDR|SSH_PORT|WAN_IFACE|ENABLE_AUTO_REBOOT|AUTO_REBOOT_TIME|UPDATE_PROFILE|JOURNAL_RETENTION|JOURNAL_MAX_USE|TUNNEL_MODE|SWAP_SIZE|TIMEZONE|DRY_RUN|FORCE|UPGRADE_MAIL|BIND_DASHBOARD_TO_TAILSCALE|INSTALL_TAILSCALE|TAILSCALE_AUTH_KEY|TAILSCALE_DIRECT_WAN|STRICT_DOCKER_SSH_CIDRS|INSECURE_ENV|DOCKER_NPROC_HARD|DOCKER_NPROC_SOFT|ALLOWED_PRIVILEGED_CONTAINERS|PAAS|DFLOW_AUTH_MODE|DFLOW_CONTROL_PUBKEY|DFLOW_CONTROL_CIDR|DFLOW_BESZEL_PORT)
       printf -v "${key}" '%s' "${value}"
       ;;
     *)
@@ -816,6 +839,7 @@ main() {
 
   log "Applying sysctl kernel hardening."
   configure_sysctl
+  configure_system_limits
 
   log "Applying Docker daemon log rotation."
   configure_docker_daemon
@@ -855,6 +879,16 @@ main() {
     configure_coolify_binding
     log "Installing Coolify binding watchdog."
     configure_coolify_binding_watchdog
+  fi
+
+  # dFlow overlay: hardens the worker for dFlow controller attach.
+  if [[ "${PAAS}" == "dflow" ]]; then
+    log "Applying dFlow overlay."
+    configure_dflow_tailscale_ssh
+    configure_dflow_ssh_access
+    configure_dflow_ssh_match_dropin
+    configure_dflow_ufw
+    configure_dflow_predeploy_hook
   fi
 
   write_state

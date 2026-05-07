@@ -133,6 +133,24 @@ source "${SCRIPT_DIR}/../overlays/coolify/checks/coolify_instance_settings_check
 # shellcheck source=../overlays/coolify/checks/validate_timer_check.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../overlays/coolify/checks/validate_timer_check.sh"
+# shellcheck source=../overlays/dflow/checks/dflow_substrate_check.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../overlays/dflow/checks/dflow_substrate_check.sh"
+# shellcheck source=../overlays/dflow/checks/dflow_dokku_check.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../overlays/dflow/checks/dflow_dokku_check.sh"
+# shellcheck source=../overlays/dflow/checks/dflow_beszel_check.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../overlays/dflow/checks/dflow_beszel_check.sh"
+# shellcheck source=../overlays/dflow/checks/dflow_backups_check.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../overlays/dflow/checks/dflow_backups_check.sh"
+# shellcheck source=../overlays/dflow/checks/dflow_predeploy_hook_check.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../overlays/dflow/checks/dflow_predeploy_hook_check.sh"
+# shellcheck source=../overlays/dflow/checks/dflow_ssh_path_check.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../overlays/dflow/checks/dflow_ssh_path_check.sh"
 
 
 
@@ -164,6 +182,7 @@ DOCKER_PRESENT="false"
 DOCKER_RULES_APPLIED="false"
 CONFIGURED_TIMEZONE=""
 COOLIFY_ENV_FILE="/data/coolify/source/.env"
+PAAS="coolify"
 DOCKER_SSH_CIDR_SYNC_SCRIPT="/usr/local/sbin/docker-ssh-cidr-sync.sh"
 DOCKER_SSH_CIDR_SYNC_SERVICE="docker-ssh-cidr-sync.service"
 DOCKER_SSH_CIDR_SYNC_TIMER="docker-ssh-cidr-sync.timer"
@@ -291,16 +310,32 @@ main() {
   networkd_wait_online_check
   private_domain_hosts_check
   tailscale_check
-  coolify_binding_check
-  if [[ "${GATE_C_MODE}" == "true" ]]; then
-    record "INFO" "gate-c: coolify runtime checks" "skipped in --gate-c mode"
-    record "INFO" "gate-c: cloudflared checks" "skipped in --gate-c mode"
-  else
-    coolify_ssh_check
-    coolify_container_check
-    coolify_instance_settings_check
-    cloudflared_check
-  fi
+  case "${PAAS}" in
+    dflow)
+      dflow_substrate_check
+      if [[ "${GATE_C_MODE}" == "true" ]]; then
+        record "INFO" "gate-c: dflow runtime checks" "skipped in --gate-c mode"
+      else
+        dflow_dokku_check
+        dflow_beszel_check
+        dflow_backups_check
+        dflow_predeploy_hook_check
+        dflow_ssh_path_check
+      fi
+      ;;
+    coolify|*)
+      coolify_binding_check
+      if [[ "${GATE_C_MODE}" == "true" ]]; then
+        record "INFO" "gate-c: coolify runtime checks" "skipped in --gate-c mode"
+        record "INFO" "gate-c: cloudflared checks" "skipped in --gate-c mode"
+      else
+        coolify_ssh_check
+        coolify_container_check
+        coolify_instance_settings_check
+        cloudflared_check
+      fi
+      ;;
+  esac
   validate_timer_check
   listening_ports_info
 

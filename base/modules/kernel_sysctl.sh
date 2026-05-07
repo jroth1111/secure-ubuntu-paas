@@ -38,8 +38,16 @@ net.ipv4.ping_group_range = 0 2147483647
 net.ipv4.conf.all.rp_filter = 2
 net.ipv4.conf.default.rp_filter = 2
 # SYN flood hardening
-net.ipv4.tcp_max_syn_backlog = 2048
+net.ipv4.tcp_max_syn_backlog = 4096
 net.ipv4.tcp_synack_retries = 2
+# Higher accept-queue depth so backends survive bursty connection storms.
+net.core.somaxconn = 4096
+# Network buffers: stock 256 KiB caps BBR throughput; raise to 16 MiB.
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 131072 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.core.netdev_max_backlog = 16384
 fs.protected_hardlinks = 1
 fs.protected_symlinks = 1
 fs.suid_dumpable = 0

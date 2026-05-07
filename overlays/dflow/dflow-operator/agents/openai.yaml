@@ -1,0 +1,4 @@
+interface:
+  display_name: "dFlow Operator"
+  short_description: "Operate dFlow from an agent"
+  default_prompt: "Use dFlow to inspect, configure, deploy, or troubleshoot applications, services, environments, worker nodes, databases, templates, and the hardened worker substrate."

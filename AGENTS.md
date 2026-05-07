@@ -293,6 +293,22 @@ bash -n exits 0; Gate C passed on resume with --ts-ip 100.x.x.x (0 failures)
 
 Append raw gate output to task notes for deployment tasks. Trace each code change back to a task.
 
+### Live Server Audit Hygiene
+
+- Treat live host audits as secret-sensitive. Do **not** capture raw `dokku config:show`,
+  `docker inspect`, `env`, `printenv`, or app environment output into repo artifacts unless the
+  command redacts values before writing. Prefer key-presence checks and fingerprints.
+- dFlow secondary tailnet diagnostics must derive the local socket from
+  `systemctl cat tailscaled-dfi.service`; current managed hosts use `/run/tailscale-dfi.sock`, not
+  `/run/tailscale-dfi/tailscaled.sock`.
+- If `/root/base/validate.sh` is missing or stale on a server, do not claim Gate C or Gate F from
+  ad-hoc inspection. Resync companion scripts through the normal `deploy.sh --paas <paas> --ts-ip`
+  resume path, or record a rollback-backed manual companion upload before running validation.
+- Netdata is not part of the dFlow worker contract. If found active on a dFlow worker, verify whether
+  the operator intentionally installed it; otherwise disable or bind it to loopback before closing a
+  security/performance audit, and record `systemctl enable --now netdata` as the rollback when only
+  disabling the service.
+
 ---
 
 ## 9. Destructive Operations — Confirm Before Executing

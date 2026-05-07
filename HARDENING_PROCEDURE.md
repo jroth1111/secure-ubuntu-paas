@@ -1,9 +1,18 @@
-# Ubuntu 24.04.4 Hardening Procedure for Coolify VPS
+# Ubuntu 24.04.4 Hardening Procedure (Coolify or dFlow worker)
 
-This procedure targets a dedicated Coolify host on Ubuntu `24.04.4 LTS` with:
+This procedure targets a dedicated PaaS worker on Ubuntu `24.04.4 LTS`. The base hardening is the
+same regardless of which PaaS runs on top (`--paas coolify` or `--paas dflow`); the differences
+are in which overlay loads on top of it. The base controls below give you:
 - SSH restricted to `tailscale0`
 - Public web ingress on `80/443` (or no inbound web when using `--tunnel-mode`)
 - Automatic security updates with scheduled reboots
+
+**PaaS overlays applied on top:**
+- **Coolify** (`overlays/coolify`): dashboard binding, Coolify install, Cloudflare DNS/tunnel.
+- **dFlow** (`overlays/dflow`): controller SSH path (key + `Match Address` drop-in *or* Tailscale
+  SSH), Beszel UFW rule on `tailscale0`, pre-deploy resource hook stub, and validator checks for
+  Dokku 0.35.x / Beszel agent / Restic backups (these emit INFO until the dFlow controller has
+  attached and installed its components).
 
 The script `base/bootstrap.sh` (v1.2.4) applies 15 baseline controls in this order. (Note: These are logical control groups; the script's `main()` implements them via 31 function calls.)
 1. Preflight checks and readiness verification (OS/root/session safety/interface detection/package prerequisites)
@@ -136,6 +145,12 @@ sudo ./base/validate.sh --json   # Machine-readable JSON
 ```
 
 It reads `/var/lib/server-hardening/state` to determine tunnel mode, admin user, etc. Exits 0 if all checks pass, 1 if any fail. Safe to run from cron or during incident response.
+
+For live audits, keep artifacts secret-safe: do not capture raw app environment output from
+`dokku config:show`, `docker inspect`, `env`, or `printenv`. Use validator JSON, key-presence
+checks, public-key fingerprints, listener state, and sanitized service reports instead. If
+`/root/base/validate.sh` is absent on a resumed host, resync companions through the normal
+`deploy.sh --ts-ip` path before treating gate output as authoritative.
 
 ### Manual checks
 

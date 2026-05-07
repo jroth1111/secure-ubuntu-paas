@@ -43,6 +43,10 @@ allowed_privileged_containers=${ALLOWED_PRIVILEGED_CONTAINERS}
 tailscale_direct_wan=${TAILSCALE_DIRECT_WAN}
 bind_dashboard_to_tailscale=${BIND_DASHBOARD_TO_TAILSCALE}
 install_tailscale=${INSTALL_TAILSCALE}
+paas=${PAAS}
+dflow_auth_mode=${DFLOW_AUTH_MODE:-ssh}
+dflow_control_cidr=${DFLOW_CONTROL_CIDR:-}
+dflow_beszel_port=${DFLOW_BESZEL_PORT:-45876}
 EOF
 
   if is_true "${BIND_DASHBOARD_TO_TAILSCALE}" && [[ -n "${DETECTED_TAILSCALE_IP}" ]]; then

@@ -46,14 +46,20 @@ tailscale_check() {
       record "FAIL" "tailscale: IPv4 address" "no Tailscale IPv4 — check auth key and login state"
     fi
 
-    local run_ssh_pref
+    local run_ssh_pref expected_run_ssh="false" expected_label="false"
     run_ssh_pref="$(tailscale_runssh_pref_value 5 1)"
-    if [[ "${run_ssh_pref}" == "false" ]]; then
-      record "PASS" "tailscale: RunSSH=false"
+    # dFlow's tailscale auth mode delegates SSH to tailscaled; allow RunSSH=true
+    # when the operator has explicitly opted in via PAAS=dflow + tailscale auth.
+    if [[ "${PAAS:-coolify}" == "dflow" && "${DFLOW_AUTH_MODE:-ssh}" == "tailscale" ]]; then
+      expected_run_ssh="true"
+      expected_label="true (dflow tailscale auth)"
+    fi
+    if [[ "${run_ssh_pref}" == "${expected_run_ssh}" ]]; then
+      record "PASS" "tailscale: RunSSH=${expected_label}"
     elif [[ "${run_ssh_pref}" == "unknown" ]]; then
-      record "FAIL" "tailscale: RunSSH" "expected false, got unknown after retries"
+      record "FAIL" "tailscale: RunSSH" "expected ${expected_label}, got unknown after retries"
     else
-      record "FAIL" "tailscale: RunSSH" "expected false, got ${run_ssh_pref}"
+      record "FAIL" "tailscale: RunSSH" "expected ${expected_label}, got ${run_ssh_pref}"
     fi
 
     local direct_count relay_count

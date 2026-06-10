@@ -1,10 +1,16 @@
 configure_sysctl() {
-  # Migration: remove old 60-prefixed drop-in (replaced by 99- for precedence)
-  local old_sysctl="/etc/sysctl.d/60-coolify-hardening.conf"
-  if [[ -f "${old_sysctl}" && "${old_sysctl}" != "${SYSCTL_DROPIN_FILE}" ]]; then
-    log "Removing superseded sysctl drop-in ${old_sysctl} (replaced by ${SYSCTL_DROPIN_FILE})."
-    run rm -f "${old_sysctl}"
-  fi
+  # Migration: remove superseded drop-ins. The 60- prefix predates the 99-
+  # precedence move; 99-base-hardening.conf lost to distro 99-protect-links.conf
+  # (basename sort, last wins) and is replaced by 99-zzz-hardening.conf.
+  local old_sysctl
+  for old_sysctl in \
+    /etc/sysctl.d/60-coolify-hardening.conf \
+    /etc/sysctl.d/99-base-hardening.conf; do
+    if [[ -f "${old_sysctl}" && "${old_sysctl}" != "${SYSCTL_DROPIN_FILE}" ]]; then
+      log "Removing superseded sysctl drop-in ${old_sysctl} (replaced by ${SYSCTL_DROPIN_FILE})."
+      run rm -f "${old_sysctl}"
+    fi
+  done
 
   # Check if BBR kernel module is available
   local bbr_available="false"
@@ -50,6 +56,7 @@ net.ipv4.tcp_wmem = 4096 65536 16777216
 net.core.netdev_max_backlog = 16384
 fs.protected_hardlinks = 1
 fs.protected_symlinks = 1
+fs.protected_fifos = 2
 fs.suid_dumpable = 0
 kernel.unprivileged_bpf_disabled = 2
 kernel.kexec_load_disabled = 1
@@ -57,8 +64,18 @@ kernel.sysrq = 4
 kernel.randomize_va_space = 2
 kernel.kptr_restrict = 2
 kernel.dmesg_restrict = 1
-kernel.yama.ptrace_scope = 1
+kernel.yama.ptrace_scope = 2
 kernel.perf_event_paranoid = 3
+kernel.core_pattern = |/bin/false
+# BPF JIT hardening: blind constants to prevent JIT spray attacks
+net.core.bpf_jit_harden = 2
+net.core.bpf_jit_kallsyms = 0
+# TCP hardening: TIME_WAIT assassination protection, disable timestamps
+net.ipv4.tcp_rfc1337 = 1
+net.ipv4.tcp_timestamps = 0
+# ICMP: reject secure redirects
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
 SYSCTL_BASE
 
     if [[ "${bbr_available}" == "true" ]]; then

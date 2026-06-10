@@ -91,6 +91,8 @@ configure_rsyslog_targets() {
       log "DRY-RUN: ensure /var/log is root:syslog mode 0770"
     else
       install -d -m 0770 -o root -g syslog /var/log
+      chown root:syslog /var/log
+      chmod 0770 /var/log
     fi
   else
     warn "Group 'syslog' not found; skipping /var/log ownership enforcement."

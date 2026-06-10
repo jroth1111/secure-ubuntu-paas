@@ -18,10 +18,11 @@ The problem is doing this **safely**. A fresh server is wide open: root login ov
 
 This project gives you two things:
 
-1. **A hardened server** — 15 security controls applied automatically (SSH locked down, firewall configured, audit logging, auto-updates, and more)
+1. **A hardened server** — applies **15 security controls** automatically (SSH locked down, firewall configured, audit logging, auto-updates, and more)
 2. **A self-hosting PaaS installed and secured** — pick the platform you want with `--paas`:
    - **Coolify** *(default)* — a Heroku-like web UI; admin dashboard reachable only over Tailscale, apps published through Cloudflare
    - **dFlow** — a Dokku-based PaaS where the worker is owned by a remote dFlow controller; this project hardens the worker, locks the controller's access path, and verifies the dFlow contract (Dokku 0.35.x, Beszel agent, Restic backups)
+   - **Dokploy** — a Docker Swarm PaaS with direct public app ingress on 80/443; dashboard/API stay reachable only over Tailscale on port 3000
 
 **Before:** a fresh VPS with root SSH, no firewall, and no apps running
 
@@ -41,6 +42,7 @@ You don't need to be an expert in these, but knowing what each one does helps:
 |------|---------------------------|
 | **[Coolify](https://coolify.io/)** *(`--paas coolify`, default)* | A web UI for deploying apps, databases, and services — like a self-hosted Heroku. This is what you'll use day-to-day to manage what runs on your server. |
 | **[dFlow](https://github.com/dflow-sh/dflow)** *(`--paas dflow`)* | An open-source Dokku-based PaaS. The worker is "attached" to a remote dFlow controller which installs Docker, Dokku 0.35.x, Beszel agent, and Restic backups; this project hardens the substrate and gates the controller's auth path. |
+| **[Dokploy](https://dokploy.com/)** *(`--paas dokploy`)* | A Docker Swarm PaaS with dashboard/API/CLI/MCP access kept on Tailscale and public apps exposed only through 80/443. Suitable for trusted workloads, not hostile multi-tenant isolation. |
 | **[Tailscale](https://tailscale.com/)** | A VPN that connects your laptop directly to your server over an encrypted private network. With Coolify, the admin dashboard and SSH live here. With dFlow, this is one of two supported paths for the controller to reach the worker. |
 | **[Cloudflare](https://cloudflare.com/)** *(Coolify only)* | Sits in front of your server for public traffic. Handles HTTPS certificates, DDoS protection, and (in the default mode) routes traffic through an outbound tunnel so your server never needs to open inbound ports 80/443. dFlow uses Traefik on the worker instead. |
 
@@ -72,6 +74,8 @@ Your laptop
 
 Admin access (Coolify dashboard, SSH) goes a different route entirely: only through the Tailscale private network.
 
+The bootstrap-level `--tunnel-mode` / `--mode tunnel` contract keeps WAN web ingress closed for Coolify tunnel deployments.
+
 ### dFlow mode (`--paas dflow`)
 
 ```
@@ -82,32 +86,54 @@ Admin access (Coolify dashboard, SSH) goes a different route entirely: only thro
                                        │  app.dflow.sh)       │
                                        └──────────┬───────────┘
                                                   │ "attach worker"
-                  ┌───────────────────────────────┼──────────────────────┐
-                  │ auth-mode=ssh                 │ auth-mode=tailscale  │
-                  │ root SSH from controller IP   │ Tailscale SSH path   │
-                  ▼                               ▼                      │
- ┌──────────────────────────────────────────────────────────────────────┐
- │                            Your VPS                                  │
- │                                                                      │
- │  Hardening substrate: UFW, SSH, kernel, audit, fail2ban, swap        │
- │  Docker daemon (hardened)                                            │
- │                                                                      │
- │  Installed by the dFlow controller during attach:                    │
- │    • Dokku 0.35.x + Railpack default builder                         │
- │    • Pre-deploy resource hook                                        │
- │    • Beszel agent (TCP 45876, controller CIDR only)                  │
- │    • Restic backups                                                  │
- │    • Traefik (app routing — managed by Dokku)                        │
- │                                                                      │
- │  Your apps (deployed via dFlow UI / `git push dokku`)                │
- └──────────────────────────────────────────────────────────────────────┘
+                  ┌────────────────────────────────────────────────┐
+                  │ Tailscale SSH path (controller tailnet)        │
+                  ▼                                                │
+ ┌────────────────────────────────────────────────────────────────┐
+ │                         Your VPS                               │
+ │                                                                │
+ │  Hardening substrate: UFW, SSH, kernel, audit, fail2ban, swap  │
+ │  Docker daemon (hardened)  · Tailscale SSH (RunSSH=true)       │
+ │  Secondary tailscaled-dfi (controller tailnet, tailscale1)     │
+ │                                                                │
+ │  Installed by the dFlow controller during attach:              │
+ │    • Dokku 0.35.x + Railpack default builder                   │
+ │    • Pre-deploy resource hook                                  │
+ │    • Beszel agent (TCP 45876, over tailnet)                    │
+ │    • Restic backups                                            │
+ │    • nginx-vhosts reverse proxy (managed by Dokku)             │
+ │                                                                │
+ │  Your apps (deployed via dFlow UI / `git push dokku`)          │
+ └────────────────────────────────────────────────────────────────┘
 ```
 
-**Division of responsibilities.** The hardening overlay guarantees the *substrate* — UFW, SSH, kernel, swap, audit, fail2ban — and locks down which path the controller is allowed to use. Everything inside dFlow's contract (Docker, Dokku, plugins, Beszel agent, Restic backups, Traefik) is owned by the dFlow controller and installed during the first attach. Phases 3 and 4 in this project are intentional no-ops for dFlow; phase 5 only verifies the substrate and surfaces dFlow-specific failures from `base/validate.sh`.
+**Division of responsibilities.** The hardening overlay guarantees the *substrate* — UFW, SSH, kernel, swap, audit, fail2ban — and enables the Tailscale SSH attach path the controller uses. Everything inside dFlow's contract (Docker, Dokku, plugins, Beszel agent, Restic backups) is owned by the dFlow controller and installed during the first attach. Phases 3 and 4 in this project are intentional no-ops for dFlow; phase 5 only verifies the substrate and surfaces dFlow-specific failures from `base/validate.sh`.
 
-**Two supported controller auth paths:**
-- `--dflow-auth-mode ssh` *(default)* — controller's SSH pubkey is installed for `root`. A `Match Address` block in `/etc/ssh/sshd_config.d/16-dflow-root-match.conf` permits root login *only* from the configured `--dflow-control-cidr`. If the CIDR is omitted, the drop-in is not installed and root SSH stays restricted to localhost — defense-in-depth: the controller cannot attach until you opt in by supplying its CIDR.
-- `--dflow-auth-mode tailscale` — Tailscale SSH brokers the session. The base hardening's localhost-only root rule stays in place; no pubkey or `Match Address` block is installed.
+**Controller auth path:** Tailscale SSH (`RunSSH=true` on the primary operator tailnet). The bootstrap also starts a secondary `tailscaled-dfi` daemon on a separate port (`tailscale1`) for the dFlow controller's own tailnet. No SSH pubkey or IP-range gating is needed — the tailnet ACL is the boundary.
+
+### Dokploy mode (`--paas dokploy`)
+
+```
+Your laptop
+     │
+     │  ssh + Dokploy dashboard/API (Tailscale only)
+     ▼
+ ┌────────────────────────────────────┐
+ │           Your VPS                 │
+ │                                    │
+ │  Dokploy dashboard/API (:3000)     │◄── only reachable via Tailscale
+ │  Dokploy / Traefik / Swarm         │
+ │  Your apps (Docker services)       │
+ │                                    │
+ └───────────────┬────────────────────┘
+                 │ public 80/443 only
+                 ▼
+            public internet
+```
+
+Dokploy mode installs Docker, initializes the Dokploy-managed Swarm path through the official Dokploy installer, and then applies the same Docker host hardening boundary used elsewhere in this project. UFW allows `tailscale0` access to `3000/tcp`; public `3000/tcp`, Docker API ports, Swarm manager/gossip/VXLAN ports, database ports, and private app ports are blocked by the host firewall plus DOCKER-USER policy. Public apps are deliberately exposed only through HTTP/HTTPS on `80/tcp` and `443/tcp`.
+
+> ⚠️ **Never set a panel domain in Dokploy → Settings → Web Server.** Doing so writes a Traefik route that serves the dashboard on **public 80/443** (any client sending that `Host:` header reaches the login page), silently bypassing the UFW port-3000 lockdown. The validator (`dokploy: panel not on public Traefik`) fails if a panel domain is configured. Access the dashboard only via `http://<tailscale-ip>:3000`.
 
 ---
 
@@ -116,18 +142,16 @@ Admin access (Coolify dashboard, SSH) goes a different route entirely: only thro
 The automation runs in 5 sequential phases, each with a verification gate before the next one starts:
 
 ```
-                              Coolify (--paas coolify)        dFlow (--paas dflow)
-Phase 1: Harden               same                            same
-          ↓ gate              all 15 controls pass            all 15 controls pass
-Phase 2: Tailscale switch     same                            same
-          ↓ gate              Tailscale reachable             Tailscale reachable
-Phase 3: PaaS install         install Docker + Coolify        no-op (controller installs)
-          ↓ gate              Coolify dashboard on Tailscale  substrate ready
-Phase 4: Routing              Cloudflare DNS + tunnel         no-op (Traefik via dFlow)
-          ↓ gate              tunnel established              n/a
-Phase 5: Verify               dashboard HTTPS, websockets     dFlow contract checks
-                                                              (Dokku 0.35.x, Beszel,
-                                                              backups, SSH path)
+                              Coolify              dFlow                  Dokploy
+Phase 1: Harden               same                 same                   same
+          ↓ gate              base controls pass   base controls pass     base controls pass
+Phase 2: Tailscale switch     same                 same                   same
+          ↓ gate              Tailscale reachable  Tailscale reachable    Tailscale reachable
+Phase 3: PaaS install         Docker + Coolify     no-op                  Docker + Dokploy
+                                                   (controller installs)
+Phase 4: Routing              Cloudflare routing   no-op                  dashboard/API firewall
+                                                   (controller-owned)      policy
+Phase 5: Verify               Coolify checks       dFlow contract checks  Dokploy/Swarm checks
 ```
 
 If any gate fails, the script stops and tells you exactly what went wrong and how to resume.
@@ -138,17 +162,15 @@ If any gate fails, the script stops and tells you exactly what went wrong and ho
 
 You need these before running anything:
 
-| What | Coolify | dFlow | How to get it |
-|------|:-:|:-:|---------------|
-| **Ubuntu 24.04 VPS** (2 GB RAM, 40 GB disk min) | required | required | Any provider: Hetzner, DigitalOcean, Linode, Vultr, etc. |
-| **A domain on Cloudflare** | required | not used | [Move your domain to Cloudflare](https://developers.cloudflare.com/dns/zone-setups/) (free tier works) |
-| **Tailscale account + auth key** | required | required for `auth-mode=tailscale`; recommended even with `ssh` for admin SSH | [tailscale.com](https://tailscale.com); generate keys at [admin/settings/keys](https://login.tailscale.com/admin/settings/keys) (tick "Reusable" and "Ephemeral") |
-| **Cloudflare API token** | required | not used | [Create one](https://dash.cloudflare.com/profile/api-tokens) with: `Zone:Read`, `Zone:DNS:Edit`, `Account:Cloudflare Tunnel:Edit` |
-| **dFlow controller pubkey** *(`--dflow-auth-mode ssh`)* | n/a | required | Generated on the dFlow controller; copy `~/.ssh/id_ed25519.pub` (or equivalent) to a file on your laptop |
-| **dFlow controller CIDR** | n/a | recommended | Public IPv4 (or `/32`) of the dFlow controller — restricts root SSH `Match Address` |
-| **SSH public key** (your own, not the controller's) | required | required | Run `ssh-keygen -t ed25519` if you don't have one |
-| **Bash 4+** | required | required | macOS ships Bash 3.2 which is too old. Install: `brew install bash` |
-| **sshpass** *(`deploy.sh` only)* | required | required | `brew install hudochenkov/sshpass/sshpass` |
+| What | Coolify | dFlow | Dokploy | How to get it |
+|------|:-:|:-:|:-:|---------------|
+| **Ubuntu 24.04 VPS** (2 GB RAM, 40 GB disk min) | required | required | required | Any provider: Hetzner, DigitalOcean, Linode, Vultr, etc. |
+| **Public app domain** | required on Cloudflare | not used | optional | For Dokploy, create app DNS records yourself and point them at the server public IP. |
+| **Tailscale account + auth key** | required | required | required | [tailscale.com](https://tailscale.com); generate keys at [admin/settings/keys](https://login.tailscale.com/admin/settings/keys) (tick "Reusable" and "Ephemeral") |
+| **Cloudflare API token** | required | not used | not used | [Create one](https://dash.cloudflare.com/profile/api-tokens) with: `Zone:Read`, `Zone:DNS:Edit`, `Account:Cloudflare Tunnel:Edit` |
+| **SSH public key** (your own admin key) | required | required | required | Run `ssh-keygen -t ed25519` if you don't have one |
+| **Bash 4+** | required | required | required | macOS ships Bash 3.2 which is too old. Install: `brew install bash` |
+| **sshpass** *(`deploy.sh` only)* | required | required | required | `brew install hudochenkov/sshpass/sshpass` |
 
 > **Domain tip (Coolify):** You don't need to move your whole domain — just ensure the zone is managed by Cloudflare. A subdomain delegation also works.
 
@@ -185,7 +207,7 @@ cd secure-ubuntu-paas
 
 ### Option B: From your laptop, dFlow worker
 
-Hardens the VPS, opens the dFlow controller's auth path, and stops. The controller then attaches and installs Dokku, Beszel, Restic, and Traefik on the worker:
+Hardens the VPS, enables Tailscale SSH for the dFlow controller, and stops. The controller then attaches and installs Dokku, Beszel, Restic, and the Dokku proxy on the worker:
 
 ```bash
 /opt/homebrew/bin/bash deploy.sh \
@@ -196,17 +218,31 @@ Hardens the VPS, opens the dFlow controller's auth path, and stops. The controll
   --pubkey-file ~/.ssh/id_ed25519.pub \
   --tailscale-auth-key tskey-auth-... \
   --server-timezone UTC \
-  --dflow-auth-mode ssh \
-  --dflow-control-pubkey-file /path/to/dflow-controller.pub \
-  --dflow-control-cidr 203.0.113.42/32 \
   --yes
 ```
 
-After `deploy.sh` finishes, register the worker in your dFlow controller (UI or CLI). The controller will SSH in as root from `203.0.113.42` and run its own onboarding.
+After `deploy.sh` finishes, register the worker in your dFlow controller (UI or CLI). The controller attaches via Tailscale SSH and runs its own onboarding.
 
-For the Tailscale-only auth path, swap the dFlow flags for `--dflow-auth-mode tailscale` (no pubkey/CIDR needed).
+### Option C: From your laptop, Dokploy
 
-### Option C: Already on the server
+Installs Docker + Dokploy, keeps the Dokploy dashboard/API on Tailscale port 3000, and leaves public app ingress on 80/443:
+
+```bash
+/opt/homebrew/bin/bash deploy.sh \
+  --paas dokploy \
+  --server-ip <your-vps-ip> \
+  --root-pass-file /path/to/root.pass \
+  --admin-user dokployadmin \
+  --pubkey-file ~/.ssh/id_ed25519.pub \
+  --tailscale-auth-key tskey-auth-... \
+  --server-timezone UTC \
+  --domain apps.example.com \
+  --yes
+```
+
+`--domain` is optional in Dokploy mode and is recorded as your intended public app domain. DNS is operator-managed: point app hostnames at the server public IP, but do not create public DNS for the Dokploy dashboard.
+
+### Option D: Already on the server
 
 If you've already SSH'd into the VPS, use `setup.sh` instead — same flag surface, runs locally:
 
@@ -229,13 +265,20 @@ If you've already SSH'd into the VPS, use `setup.sh` instead — same flag surfa
   --pubkey-file ~/.ssh/id_ed25519.pub \
   --tailscale-auth-key tskey-auth-... \
   --server-timezone UTC \
-  --dflow-auth-mode ssh \
-  --dflow-control-pubkey-file /path/to/dflow-controller.pub \
-  --dflow-control-cidr 203.0.113.42/32 \
+  --yes
+
+# Dokploy variant
+./setup.sh \
+  --paas dokploy \
+  --admin-user dokployadmin \
+  --pubkey-file ~/.ssh/id_ed25519.pub \
+  --tailscale-auth-key tskey-auth-... \
+  --server-timezone UTC \
+  --domain apps.example.com \
   --yes
 ```
 
-### Option D: Hardening only (no PaaS)
+### Option E: Hardening only (no PaaS)
 
 To just harden a server without installing or preparing for any PaaS:
 
@@ -271,14 +314,14 @@ No per-app DNS or certificate work needed.
 
 After hardening completes, finish onboarding from the dFlow controller:
 
-1. **Add the worker** in the dFlow controller (UI or CLI) using the public IP and the admin user you configured.
-2. **The controller attaches over the auth path you chose.** With `auth-mode=ssh`, that's root SSH from the controller's IP/CIDR (gated by the `Match Address` block this project installed). With `auth-mode=tailscale`, the controller reaches the worker via the tailnet.
-3. **First attach installs the dFlow contract** on the worker: Docker, Dokku 0.35.x, Railpack default builder, the pre-deploy resource hook, the Beszel agent (TCP 45876, restricted to your `--dflow-control-cidr`), Restic backups, and Traefik.
+1. **Add the worker** in the dFlow controller (UI or CLI) using the worker's Tailscale IP and the admin user you configured.
+2. **The controller attaches via Tailscale SSH** over the controller tailnet (`tailscale1` / `tailscaled-dfi`). No SSH pubkey or IP allowlist configuration is needed — the tailnet ACL is the boundary.
+3. **First attach installs the dFlow contract** on the worker: Docker, Dokku 0.35.x, Railpack default builder, the pre-deploy resource hook, the Beszel agent (TCP 45876, over tailnet), and Restic backups.
 4. **Re-run the validator** any time to confirm the contract is intact:
    ```bash
    sudo ./base/validate.sh --json
    ```
-   The dFlow checks (`dflow_dokku_check`, `dflow_beszel_check`, `dflow_backups_check`, `dflow_predeploy_hook_check`, `dflow_ssh_path_check`) report PASS once the controller has finished its installation. Before first attach they emit `INFO` (dependency not yet installed by controller), which is expected.
+   The dFlow checks (`dflow_substrate_check`, `dflow_dokku_check`, `dflow_beszel_check`, `dflow_backups_check`, `dflow_predeploy_hook_check`) report PASS once the controller has finished its installation. Before first attach, runtime checks emit `INFO` (dependency not yet installed by controller), which is expected.
 
 You then deploy apps through the dFlow UI or via `git push dokku <app> main` from your laptop — same as any Dokku worker.
 
@@ -414,18 +457,12 @@ Common fixes:
 <details>
 <summary>dFlow: controller can't reach the worker</summary>
 
-**`auth-mode=ssh`:**
-- Confirm the controller's source IP is in `--dflow-control-cidr` — the SSH `Match Address` block is the gate.
-- Check the worker: `sudo sshd -T -C addr=<controller-ip>,user=root,host=worker,laddr=<worker-ip> | grep permitrootlogin` should return `prohibit-password`.
-- Confirm the controller pubkey is in `/root/.ssh/authorized_keys` (or whatever path the dFlow ssh module installed).
+dFlow uses Tailscale SSH exclusively. There is no SSH pubkey or CIDR auth mode.
 
-**`auth-mode=tailscale`:**
-- Confirm both worker and controller are tagged correctly in your Tailscale ACLs.
-- On the worker: `sudo tailscale status` should show the controller node.
-- Tailscale SSH must be enabled by the worker; this project's `tailscale_ssh.sh` module handles that.
-- For secondary dFlow tailnet diagnostics, inspect `systemctl cat tailscaled-dfi.service` and use the
-  unit's actual `--socket` value. Managed workers use `/run/tailscale-dfi.sock`; do not assume
-  `/run/tailscale-dfi/tailscaled.sock`.
+- Confirm both the worker and controller nodes are authenticated to the same Tailscale tailnet and tagged correctly per your ACL policy.
+- On the worker: `sudo tailscale status` should list the controller node.
+- `tailscale_ssh.sh` enables Tailscale SSH (`RunSSH=true`) on the worker during bootstrap. Verify with `sudo tailscale status --json | jq '.Self.Tags,.TailscaleSSH'`.
+- If the worker has a secondary `tailscaled-dfi` daemon (controller tailnet), check its socket and status: `sudo tailscale --socket=/run/tailscale-dfi.sock status`. The socket path is set by the unit file — inspect `systemctl cat tailscaled-dfi.service` to confirm.
 
 </details>
 
@@ -475,12 +512,7 @@ resync companions before treating gate output as authoritative.
 
 **dFlow-only (`--paas dflow`):**
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--dflow-auth-mode <ssh\|tailscale>` | `ssh` | How the dFlow controller reaches the worker |
-| `--dflow-control-pubkey-file <path>` | required when `auth-mode=ssh` | dFlow controller's SSH public key file |
-| `--dflow-control-cidr <ipv4-cidr>` | empty *(controller cannot attach over WAN)* | Permit root SSH from this CIDR via a `Match Address` drop-in. Required to give the controller a path under `auth-mode=ssh`. |
-| `--dflow-beszel-port <port>` | `45876` | TCP port for Beszel agent (controller-only ingress) |
+No additional flags are needed — `--paas dflow` enables Tailscale SSH and the secondary `tailscaled-dfi` daemon automatically. The controller attaches via the tailnet; no pubkey, CIDR, or port flags are required.
 
 </details>
 

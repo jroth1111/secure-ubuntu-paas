@@ -41,10 +41,18 @@ ssh_check() {
     fi
   fi
 
-  # Verify Match Address block: root key-only login from localhost/Docker bridge CIDRs
+  # Match Address carve-out: Coolify needs root key-only login from
+  # localhost/Docker bridge CIDRs; every other PaaS must NOT have it.
   local match_local
   match_local="$(sshd -T -C addr=127.0.0.1,user=root,host=localhost,laddr=127.0.0.1 2>/dev/null)" || true
-  if [[ -n "${match_local}" ]]; then
+  if [[ "${PAAS}" != "coolify" ]]; then
+    if [[ -n "${match_local}" ]] && grep -qE "^permitrootlogin (prohibit-password|without-password|yes)$" <<< "${match_local}"; then
+      record "FAIL" "ssh: no root Match carve-out" "localhost/bridge root login permitted — Coolify-only path active for PAAS=${PAAS}"
+    else
+      record "PASS" "ssh: no root Match carve-out"
+    fi
+  fi
+  if [[ "${PAAS}" == "coolify" && -n "${match_local}" ]]; then
     local match_root_val
     match_root_val="$(grep -m1 "^permitrootlogin " <<< "${match_local}" | awk '{print $2}')"
     if grep -qE "^permitrootlogin (prohibit-password|without-password)$" <<< "${match_local}"; then
@@ -53,6 +61,14 @@ ssh_check() {
       record "FAIL" "ssh: Match localhost root" "expected prohibit-password/without-password, got ${match_root_val:-<empty>}"
     fi
 
+    if grep -qE "^allowusers .*\\broot\\b" <<< "${match_local}"; then
+      record "PASS" "ssh: Match localhost AllowUsers includes root"
+    else
+      record "FAIL" "ssh: Match localhost AllowUsers" "root not listed"
+    fi
+  fi
+
+  {
     # Root password should be locked
     local root_pw_status
     root_pw_status="$(passwd -S root 2>/dev/null | awk '{print $2}')" || true
@@ -78,34 +94,36 @@ ssh_check() {
     else
       record "FAIL" "ssh: DSA host key" "/etc/ssh/ssh_host_dsa_key exists — deprecated and should be removed"
     fi
-
-    if grep -qE "^allowusers .*\\broot\\b" <<< "${match_local}"; then
-      record "PASS" "ssh: Match localhost AllowUsers includes root"
-    else
-      record "FAIL" "ssh: Match localhost AllowUsers" "root not listed"
-    fi
-  fi
+  }
 
   local ssh_dropin docker_match_dropin match_line cidr
   ssh_dropin="/etc/ssh/sshd_config.d/00-base-hardening.conf"
   docker_match_dropin="/etc/ssh/sshd_config.d/15-docker-ssh-match.conf"
 
-  # Check Docker bridge CIDRs are in the docker-specific match dropin
-  if [[ -f "${docker_match_dropin}" ]]; then
-    match_line="$(grep -m1 '^Match Address ' "${docker_match_dropin}" || true)"
-    if [[ -n "${match_line}" ]]; then
-      while IFS= read -r cidr; do
-        if grep -qE "(^|,|[[:space:]])$(regex_escape "${cidr}")($|,|[[:space:]])" <<< "${match_line}"; then
-          record "PASS" "ssh: Match includes Docker CIDR ${cidr}"
-        else
-          record "FAIL" "ssh: Match Docker CIDR ${cidr}" "missing from ${docker_match_dropin}"
-        fi
-      done < <(load_docker_ssh_cidrs)
+  # Docker bridge match dropin: required for Coolify, forbidden otherwise.
+  if [[ "${PAAS}" == "coolify" ]]; then
+    if [[ -f "${docker_match_dropin}" ]]; then
+      match_line="$(grep -m1 '^Match Address ' "${docker_match_dropin}" || true)"
+      if [[ -n "${match_line}" ]]; then
+        while IFS= read -r cidr; do
+          if grep -qE "(^|,|[[:space:]])$(regex_escape "${cidr}")($|,|[[:space:]])" <<< "${match_line}"; then
+            record "PASS" "ssh: Match includes Docker CIDR ${cidr}"
+          else
+            record "FAIL" "ssh: Match Docker CIDR ${cidr}" "missing from ${docker_match_dropin}"
+          fi
+        done < <(load_docker_ssh_cidrs)
+      else
+        record "FAIL" "ssh: Docker match dropin" "Match Address block missing in ${docker_match_dropin}"
+      fi
     else
-      record "FAIL" "ssh: Docker match dropin" "Match Address block missing in ${docker_match_dropin}"
+      record "FAIL" "ssh: Docker match dropin" "${docker_match_dropin} not found"
     fi
   else
-    record "FAIL" "ssh: Docker match dropin" "${docker_match_dropin} not found"
+    if [[ -f "${docker_match_dropin}" ]]; then
+      record "FAIL" "ssh: Docker match dropin absent" "${docker_match_dropin} exists — Coolify-only root-over-bridge path must be removed for PAAS=${PAAS}"
+    else
+      record "PASS" "ssh: Docker match dropin absent"
+    fi
   fi
 
   if [[ -f "${ssh_dropin}" ]]; then

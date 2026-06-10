@@ -18,50 +18,12 @@ _dir="$(dirname "${BASH_SOURCE[0]}")"
 # shellcheck disable=SC1091
 source "${_dir}/../../lib/common.sh"
 
-DFLOW_IPV4_CIDR_RE='^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)/(3[0-2]|[12]?[0-9])$'
-DFLOW_PORT_RE='^[0-9]+$'
-
 finalize_dflow_inputs() {
-  DFLOW_AUTH_MODE="${DFLOW_AUTH_MODE:-ssh}"
-  DFLOW_CONTROL_PUBKEY_FILE="${DFLOW_CONTROL_PUBKEY_FILE:-}"
-  DFLOW_CONTROL_PUBKEY="${DFLOW_CONTROL_PUBKEY:-}"
-  DFLOW_CONTROL_CIDR="${DFLOW_CONTROL_CIDR:-}"
-  DFLOW_BESZEL_PORT="${DFLOW_BESZEL_PORT:-45876}"
-
-  case "${DFLOW_AUTH_MODE}" in
-    ssh|tailscale) ;;
-    *) die "dFlow auth mode must be 'ssh' or 'tailscale' (got: ${DFLOW_AUTH_MODE})" ;;
-  esac
-
-  if ! [[ "${DFLOW_BESZEL_PORT}" =~ ${DFLOW_PORT_RE} ]] \
-    || (( DFLOW_BESZEL_PORT < 1 || DFLOW_BESZEL_PORT > 65535 )); then
-    die "Invalid dFlow Beszel port: ${DFLOW_BESZEL_PORT}"
-  fi
-
-  if [[ "${DFLOW_AUTH_MODE}" == "tailscale" ]]; then
-    DFLOW_CONTROL_PUBKEY=""
-    DFLOW_CONTROL_CIDR=""
-    return 0
-  fi
-
-  if [[ -z "${DFLOW_CONTROL_PUBKEY}" && -n "${DFLOW_CONTROL_PUBKEY_FILE}" ]]; then
-    [[ -f "${DFLOW_CONTROL_PUBKEY_FILE}" ]] \
-      || die "dFlow controller public key file not found: ${DFLOW_CONTROL_PUBKEY_FILE}"
-    ssh-keygen -l -f "${DFLOW_CONTROL_PUBKEY_FILE}" >/dev/null 2>&1 \
-      || die "Invalid dFlow controller public key: ${DFLOW_CONTROL_PUBKEY_FILE}"
-    DFLOW_CONTROL_PUBKEY="$(< "${DFLOW_CONTROL_PUBKEY_FILE}")"
-    DFLOW_CONTROL_PUBKEY="${DFLOW_CONTROL_PUBKEY%$'\n'}"
-    DFLOW_CONTROL_PUBKEY="${DFLOW_CONTROL_PUBKEY%$'\r'}"
-  fi
-
-  if ! is_true "${SKIP_HARDEN:-false}" && ! is_true "${PREFLIGHT_ONLY:-false}"; then
-    [[ -n "${DFLOW_CONTROL_PUBKEY}" ]] \
-      || die "--dflow-control-pubkey-file is required for --paas dflow --dflow-auth-mode ssh"
-  fi
-
-  if [[ -n "${DFLOW_CONTROL_CIDR}" && ! "${DFLOW_CONTROL_CIDR}" =~ ${DFLOW_IPV4_CIDR_RE} ]]; then
-    die "Invalid --dflow-control-cidr: ${DFLOW_CONTROL_CIDR} (expected IPv4 CIDR such as 203.0.113.42/32)"
-  fi
+  # dFlow uses Tailscale SSH exclusively; there are no operator-supplied
+  # controller credentials to validate. This function is retained as a
+  # call-site stub so deploy.sh / setup.sh can call it symmetrically with
+  # the Coolify equivalent.
+  :
 }
 
 # collect_dflow_inputs — dFlow has no PAAS-specific operator inputs beyond the
@@ -70,8 +32,6 @@ finalize_dflow_inputs() {
 # Kept as an explicit stub so deploy.sh / setup.sh can call it symmetrically
 # with collect_coolify_inputs.
 collect_dflow_inputs() {
-  DFLOW_AUTH_MODE="${DFLOW_AUTH_MODE:-ssh}"
-  DFLOW_BESZEL_PORT="${DFLOW_BESZEL_PORT:-45876}"
   return 0
 }
 

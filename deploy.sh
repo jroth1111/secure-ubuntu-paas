@@ -26,9 +26,15 @@ source "${SCRIPT_DIR}/overlays/coolify/coolify-common.sh"
 # shellcheck source=overlays/dflow/dflow-common.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/overlays/dflow/dflow-common.sh"
+# shellcheck source=overlays/dokploy/dokploy-common.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/overlays/dokploy/dokploy-common.sh"
 # shellcheck source=lib/overlay-loader.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/overlay-loader.sh"
+# shellcheck source=lib/hardening_resume_reconcile.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/hardening_resume_reconcile.sh"
 
 # ── Inputs (populated by flags or prompts) ──────────────────────────────────
 
@@ -53,11 +59,6 @@ APP_DOMAIN_MODE="${APP_DOMAIN_MODE:-}"
 SWAP_SIZE="${SWAP_SIZE:-}"
 SERVER_TIMEZONE="${SERVER_TIMEZONE:-}"
 TAILSCALE_DIRECT_WAN="${TAILSCALE_DIRECT_WAN:-false}"
-DFLOW_AUTH_MODE="${DFLOW_AUTH_MODE:-ssh}"
-DFLOW_CONTROL_PUBKEY_FILE="${DFLOW_CONTROL_PUBKEY_FILE:-}"
-DFLOW_CONTROL_PUBKEY="${DFLOW_CONTROL_PUBKEY:-}"
-DFLOW_CONTROL_CIDR="${DFLOW_CONTROL_CIDR:-}"
-DFLOW_BESZEL_PORT="${DFLOW_BESZEL_PORT:-45876}"
 PRIVATE_TLS_CA="${PRIVATE_TLS_CA:-}"
 ZEROSSL_EAB_KID="${ZEROSSL_EAB_KID:-}"
 ZEROSSL_EAB_KID_FILE="${ZEROSSL_EAB_KID_FILE:-}"
@@ -203,7 +204,7 @@ init_root_password_auth() {
 
 usage() {
   cat <<'EOF'
-deploy.sh — Laptop-side orchestrator for secure Coolify deployment
+deploy.sh — Laptop-side orchestrator for secure PaaS deployment
 Run this on your LOCAL MACHINE (laptop/workstation), not on the server.
 
 Usage:
@@ -216,14 +217,14 @@ Required:
   --server-ip <ip>              Server public IPv4 address
   Root password                 Required unless --preflight-only or --ts-ip is used
   --tailscale-auth-key <key>    Required unless --preflight-only or --ts-ip is used
-  --domain <fqdn>               Domain name for Coolify
-  Cloudflare API token          Provide via CF_API_TOKEN, --cf-api-token-file, or prompt
+  --domain <fqdn>               Domain name for Coolify; optional public app domain for Dokploy
+  Cloudflare API token          Required for Coolify only; provide via CF_API_TOKEN, --cf-api-token-file, or prompt
 
 Optional:
   --cf-api-token-file <path>    File containing Cloudflare API token
   --cf-tunnel-api-token-file <path>
                                 File containing Cloudflare tunnel API token (optional; defaults to API token)
-  --admin-user <name>           Admin username (default: coolifyadmin)
+  --admin-user <name>           Admin username (default: coolifyadmin; dokployadmin for Dokploy)
   --root-pass-file <path>       Read root password from file (recommended for automation)
   --pubkey-file <path>          SSH public key file (default: ~/.ssh/id_ed25519.pub)
   --mode <tunnel|standard>       Deployment mode (default: tunnel)
@@ -240,12 +241,6 @@ Optional:
                                 File containing ZeroSSL EAB hmac (required when --private-tls-ca zerossl)
   --tailscale-direct-wan        Allow WAN UDP 41641 for direct Tailscale paths (optional optimization)
   --no-tailscale-direct-wan     Keep WAN UDP 41641 closed (default; DERP fallback remains available)
-  --dflow-auth-mode <ssh|tailscale>
-                                dFlow controller attach path (default: ssh)
-  --dflow-control-pubkey-file <path>
-                                dFlow controller public key for auth-mode=ssh
-  --dflow-control-cidr <cidr>   IPv4 CIDR allowed to root SSH for dFlow controller
-  --dflow-beszel-port <port>    Beszel agent TCP port (default: 45876)
   --preflight-only              Run local/Cloudflare preflight checks only, then exit
   --yes                         Skip confirmation prompts (for automation)
   --ts-ip <ip>                  Skip phase 1 (hardening already done); set Tailscale IP directly
@@ -287,10 +282,6 @@ parse_args() {
       --zerossl-eab-hmac-file) ZEROSSL_EAB_HMAC_FILE="${2:?--zerossl-eab-hmac-file requires a value}"; shift 2 ;;
       --tailscale-direct-wan) TAILSCALE_DIRECT_WAN="true"; shift ;;
       --no-tailscale-direct-wan) TAILSCALE_DIRECT_WAN="false"; shift ;;
-      --dflow-auth-mode) DFLOW_AUTH_MODE="${2:?--dflow-auth-mode requires a value}"; shift 2 ;;
-      --dflow-control-pubkey-file) DFLOW_CONTROL_PUBKEY_FILE="${2:?--dflow-control-pubkey-file requires a value}"; shift 2 ;;
-      --dflow-control-cidr) DFLOW_CONTROL_CIDR="${2:?--dflow-control-cidr requires a value}"; shift 2 ;;
-      --dflow-beszel-port) DFLOW_BESZEL_PORT="${2:?--dflow-beszel-port requires a value}"; shift 2 ;;
       --preflight-only)  PREFLIGHT_ONLY="true"; shift ;;
       --paas)            PAAS="${2:-coolify}"; shift 2 ;;
       --yes)             AUTO_YES="true"; shift ;;
@@ -314,8 +305,9 @@ collect_inputs() {
   fi
   case "${PAAS}" in
     dflow)   collect_dflow_setup_inputs ;;
+    dokploy) collect_dokploy_setup_inputs ;;
     coolify) collect_common_inputs ;;
-    *)       die "Unsupported PAAS: ${PAAS} (expected coolify or dflow)" ;;
+    *)       die "Unsupported PAAS: ${PAAS} (expected coolify, dflow, or dokploy)" ;;
   esac
   if ! is_true "${SKIP_HARDEN}" && ! is_true "${PREFLIGHT_ONLY}" \
     && [[ -z "${ROOT_PASS}" ]] && [[ -n "${ROOT_PASS_FILE}" ]]; then
@@ -375,8 +367,8 @@ validate_inputs() {
   esac
 
   case "${PAAS}" in
-    coolify|dflow) ;;
-    *) die "Invalid --paas value: ${PAAS} (expected coolify|dflow)" ;;
+    coolify|dflow|dokploy) ;;
+    *) die "Invalid --paas value: ${PAAS} (expected coolify|dflow|dokploy)" ;;
   esac
 
   if [[ "${PAAS}" == "coolify" ]]; then
@@ -401,8 +393,11 @@ validate_inputs() {
       || die "Invalid --cf-zone-id: ${CF_ZONE_ID} (expected 32-char hex)"
     [[ -z "${CF_ACCOUNT_ID}" || "${CF_ACCOUNT_ID}" =~ ${CF_ID_RE} ]] \
       || die "Invalid --cf-account-id: ${CF_ACCOUNT_ID} (expected 32-char hex)"
-  else
+  elif [[ "${PAAS}" == "dflow" ]]; then
     finalize_dflow_inputs
+  else
+    finalize_dokploy_inputs
+    [[ -z "${DOMAIN}" || "${DOMAIN}" =~ ${FQDN_RE} ]] || die "Invalid Dokploy public app domain: ${DOMAIN}"
   fi
 
   # Verify companion scripts exist before prompting to proceed
@@ -413,6 +408,16 @@ validate_inputs() {
   for script in "${scripts[@]}"; do
     [[ -f "${SCRIPT_DIR}/${script}" ]] || die "Required script not found: ${SCRIPT_DIR}/${script}"
   done
+
+  if [[ "${PAAS}" == "dokploy" ]]; then
+    local dokploy_required=(
+      overlays/dokploy/dokploy-common.sh
+      overlays/dokploy/checks/dokploy_check.sh
+    )
+    for f in "${dokploy_required[@]}"; do
+      [[ -f "${SCRIPT_DIR}/${f}" ]] || die "Required Dokploy file not found: ${SCRIPT_DIR}/${f}"
+    done
+  fi
 }
 
 # ── SSH wrappers ────────────────────────────────────────────────────────────
@@ -469,170 +474,74 @@ ssh_admin_sudo() {
   ssh "${SSH_OPTS[@]}" -i "${PRIVATE_KEY}" "${ADMIN_USER}@${TS_IP}" "sudo $1"
 }
 
-# Upload companion scripts to /root/ on the server using admin key + sudo.
-# Called at start of phase 2 so all phases always use the latest local scripts,
-# even when phase 1 (root SCP upload) was skipped via --ts-ip.
-sync_companion_scripts() {
-  local scripts=(base/bootstrap.sh base/validate.sh)
-  if [[ "${PAAS}" == "coolify" ]]; then
-    scripts+=(overlays/coolify/configure_coolify_binding.sh)
+package_deployment_tree() {
+  local dest="$1"
+  for d in base lib overlays; do
+    [[ -d "${SCRIPT_DIR}/${d}" ]] || die "Required directory not found: ${SCRIPT_DIR}/${d}"
+  done
+  if ! ( cd "${SCRIPT_DIR}" && COPYFILE_DISABLE=1 tar --exclude '._*' --exclude '.DS_Store' -czf "${dest}" base lib overlays ); then
+    die "Failed to package deployment tree from ${SCRIPT_DIR}"
   fi
-  log "Syncing companion scripts to server /root/..."
-  for script in "${scripts[@]}"; do
-    local local_path="${SCRIPT_DIR}/${script}"
-    [[ -f "${local_path}" ]] || die "Script not found: ${local_path}"
-    local script_bn script_dn remote_dir
-    script_bn="$(basename "${script}")"
-    script_dn="$(dirname "${script}")"
-    [[ "${script_dn}" == "." ]] && remote_dir="/root" || remote_dir="/root/${script_dn}"
-    ssh_admin_sudo "install -d -m 0755 -o root -g root '${remote_dir}'" \
-      || die "Failed to create ${remote_dir} on server"
-    scp_admin "${local_path}" "${ADMIN_USER}@${TS_IP}:/tmp/${script_bn}" \
-      || die "Failed to upload ${script}"
-    ssh_admin_sudo "bash -c 'mv /tmp/${script_bn} ${remote_dir}/${script_bn} && chmod 755 ${remote_dir}/${script_bn}'" \
-      || die "Failed to install ${script} to ${remote_dir}/"
-  done
+}
 
-  local lib_files=(lib/common.sh lib/tailscale.sh)
-  ssh_admin_sudo 'install -d -m 0755 -o root -g root /root/lib' \
-    || die "Failed to create /root/lib on server"
-  for libfile in "${lib_files[@]}"; do
-    local libpath="${SCRIPT_DIR}/${libfile}"
-    local libname
-    libname="$(basename "${libfile}")"
-    [[ -f "${libpath}" ]] || die "Library not found: ${libpath}"
-    scp_admin "${libpath}" "${ADMIN_USER}@${TS_IP}:/tmp/${libname}" \
-      || die "Failed to upload ${libfile}"
-    ssh_admin_sudo "bash -c 'mv /tmp/${libname} /root/lib/${libname} && chmod 644 /root/lib/${libname}'" \
-      || die "Failed to install ${libfile} to /root/lib/"
-  done
+install_deployment_tree_remote_script() {
+  cat <<'EOF'
+set -Eeuo pipefail
+archive="${DEPLOY_TREE_ARCHIVE:-/tmp/deploy-tree.tar.gz}"
+tar -C /root --no-same-owner -xzf "${archive}"
+rm -f "${archive}"
+chown -R root:root /root/base /root/lib /root/overlays
+chmod 755 /root/base/bootstrap.sh /root/base/validate.sh
+chmod 755 /root/overlays/coolify/configure_coolify_binding.sh 2>/dev/null || true
+chmod 755 /root/overlays/dflow/data/dokku-predeploy-resource-check.sh 2>/dev/null || true
+EOF
+}
 
-  # Upload overlay files (coolify)
-  local overlay_files=(
-    overlays/coolify/coolify-common.sh
-    overlays/coolify/modules/binding.sh
-    overlays/coolify/modules/binding_watchdog.sh
-    overlays/coolify/checks/coolify_binding_check.sh
-    overlays/coolify/checks/unattended_upgrades_check.sh
-    overlays/coolify/checks/coolify_ssh_check.sh
-    overlays/coolify/checks/cloudflared_check.sh
-    overlays/coolify/checks/coolify_container_check.sh
-    overlays/coolify/checks/coolify_instance_settings_check.sh
-    overlays/coolify/checks/validate_timer_check.sh
-  )
-  for ofile in "${overlay_files[@]}"; do
-    local opath="${SCRIPT_DIR}/${ofile}"
-    local odir
-    odir="$(dirname "${ofile}")"
-    [[ -f "${opath}" ]] || die "Overlay file not found: ${opath}"
-    ssh_admin_sudo "install -d -m 0755 -o root -g root '/root/${odir}'" \
-      || die "Failed to create /root/${odir} on server"
-    local obase
-    obase="$(basename "${ofile}")"
-    scp_admin "${opath}" "${ADMIN_USER}@${TS_IP}:/tmp/${obase}" \
-      || die "Failed to upload ${ofile}"
-    ssh_admin_sudo "bash -c 'mv /tmp/${obase} /root/${odir}/${obase} && chmod 644 /root/${odir}/${obase}'" \
-      || die "Failed to install ${ofile} to /root/${odir}/"
-  done
+# Upload base/, lib/, and overlays/ as one tarball. Phase 2 always re-syncs the
+# full tree so --ts-ip resumes get new validators without 60+ sequential SCPs.
+sync_companion_scripts() {
+  local tree_tar
+  log "Syncing deployment tree to server /root/ (tarball)..."
+  tree_tar="$(mktemp -t deploy-tree.XXXXXXXX.tar.gz)" || die "Failed to create temp tarball"
+  if ! package_deployment_tree "${tree_tar}"; then
+    rm -f "${tree_tar}"
+    die "Failed to package deployment tree"
+  fi
+  scp_admin "${tree_tar}" "${ADMIN_USER}@${TS_IP}:/tmp/deploy-tree.tar.gz" \
+    || { rm -f "${tree_tar}"; die "Failed to upload deployment tree"; }
+  rm -f "${tree_tar}"
+  local extract_script
+  extract_script="$(mktemp)" || die "Failed to create temp extract script"
+  install_deployment_tree_remote_script > "${extract_script}"
+  ssh_admin_sudo 'bash -s' < "${extract_script}" \
+    || { rm -f "${extract_script}"; die "Failed to extract deployment tree on server"; }
+  rm -f "${extract_script}"
+  pass "Deployment tree synced to server"
+}
 
-  # Upload dflow overlay files (always upload — base/bootstrap.sh sources them
-  # unconditionally; runtime gating is by PAAS env var.)
-  local dflow_files=(
-    overlays/dflow/dflow-common.sh
-    overlays/dflow/modules/ufw.sh
-    overlays/dflow/modules/ssh_access.sh
-    overlays/dflow/modules/ssh_match_dropin.sh
-    overlays/dflow/modules/tailscale_ssh.sh
-    overlays/dflow/modules/predeploy_hook.sh
-    overlays/dflow/data/dokku-predeploy-resource-check.sh
-    overlays/dflow/checks/dflow_substrate_check.sh
-    overlays/dflow/checks/dflow_dokku_check.sh
-    overlays/dflow/checks/dflow_beszel_check.sh
-    overlays/dflow/checks/dflow_backups_check.sh
-    overlays/dflow/checks/dflow_predeploy_hook_check.sh
-    overlays/dflow/checks/dflow_ssh_path_check.sh
-  )
-  for dffile in "${dflow_files[@]}"; do
-    local dfpath="${SCRIPT_DIR}/${dffile}"
-    local dfdir
-    dfdir="$(dirname "${dffile}")"
-    [[ -f "${dfpath}" ]] || die "dFlow overlay file not found: ${dfpath}"
-    ssh_admin_sudo "install -d -m 0755 -o root -g root '/root/${dfdir}'" \
-      || die "Failed to create /root/${dfdir} on server"
-    local dfbase
-    dfbase="$(basename "${dffile}")"
-    scp_admin "${dfpath}" "${ADMIN_USER}@${TS_IP}:/tmp/${dfbase}" \
-      || die "Failed to upload ${dffile}"
-    local dfmode="0644"
-    [[ "${dfbase}" == "dokku-predeploy-resource-check.sh" ]] && dfmode="0755"
-    ssh_admin_sudo "bash -c 'mv /tmp/${dfbase} /root/${dfdir}/${dfbase} && chmod ${dfmode} /root/${dfdir}/${dfbase}'" \
-      || die "Failed to install ${dffile} to /root/${dfdir}/"
-  done
+run_remote_script_via_admin() {
+  local label="$1"
+  shift
+  local script_tmp
+  script_tmp="$(mktemp)" || die "Failed to create temp script for ${label}"
+  "$@" > "${script_tmp}"
+  ssh_admin_sudo 'bash -s' < "${script_tmp}" \
+    || { rm -f "${script_tmp}"; die "${label} failed on server."; }
+  rm -f "${script_tmp}"
+}
 
-  # Upload docker-host overlay files
-  local dh_files=(
-    overlays/docker-host/modules/cidrs.sh
-    overlays/docker-host/modules/detect.sh
-    overlays/docker-host/modules/readiness.sh
-    overlays/docker-host/modules/user_rules.sh
-    overlays/docker-host/modules/daemon.sh
-    overlays/docker-host/modules/cidr_sync_timer.sh
-    overlays/docker-host/modules/ssh_match_dropin.sh
-    overlays/docker-host/checks/_helpers.sh
-    overlays/docker-host/checks/docker_user_check.sh
-    overlays/docker-host/checks/docker_user_lifecycle_check.sh
-    overlays/docker-host/checks/docker_ssh_cidr_sync_check.sh
-    overlays/docker-host/checks/docker_daemon_check.sh
-    overlays/docker-host/checks/docker_trust_boundary_check.sh
-  )
-  for dfile in "${dh_files[@]}"; do
-    local dpath="${SCRIPT_DIR}/${dfile}"
-    local ddir
-    ddir="$(dirname "${dfile}")"
-    [[ -f "${dpath}" ]] || die "Overlay file not found: ${dpath}"
-    ssh_admin_sudo "install -d -m 0755 -o root -g root '/root/${ddir}'" \
-      || die "Failed to create /root/${ddir} on server"
-    local dbase
-    dbase="$(basename "${dfile}")"
-    scp_admin "${dpath}" "${ADMIN_USER}@${TS_IP}:/tmp/${dbase}" \
-      || die "Failed to upload ${dfile}"
-    ssh_admin_sudo "bash -c 'mv /tmp/${dbase} /root/${ddir}/${dbase} && chmod 644 /root/${ddir}/${dbase}'" \
-      || die "Failed to install ${dfile} to /root/${ddir}/"
-  done
-
-  # Upload base module and check files
-  local base_files=(
-    base/modules/os_detect.sh base/modules/system.sh base/modules/bootloader.sh
-    base/modules/services.sh base/modules/kernel_sysctl.sh base/modules/fail2ban.sh
-    base/modules/system_limits.sh
-    base/modules/ssh.sh base/modules/ssh_socket.sh base/modules/password_policy.sh
-    base/modules/ufw.sh base/modules/rsyslog.sh base/modules/journald.sh
-    base/modules/auditd.sh base/modules/unattended.sh base/modules/post_checks.sh
-    base/modules/state.sh base/modules/validation_timer.sh
-    base/checks/_runtime.sh base/checks/ssh_check.sh base/checks/ufw_check.sh
-    base/checks/sysctl_check.sh base/checks/fail2ban_check.sh base/checks/auditd_check.sh
-    base/checks/journald_check.sh base/checks/rsyslog_check.sh base/checks/timesync_check.sh
-    base/checks/timezone_check.sh base/checks/swap_check.sh base/checks/bootloader_check.sh
-    base/checks/reboot_required_check.sh base/checks/banner_check.sh base/checks/admin_sudo_check.sh
-    base/checks/apparmor_check.sh base/checks/disabled_services_check.sh base/checks/apport_check.sh
-    base/checks/cron_check.sh base/checks/networkd_wait_online_check.sh base/checks/tailscale_check.sh
-  )
-  for bfile in "${base_files[@]}"; do
-    local bpath="${SCRIPT_DIR}/${bfile}"
-    local bdir
-    bdir="$(dirname "${bfile}")"
-    [[ -f "${bpath}" ]] || die "Base file not found: ${bpath}"
-    ssh_admin_sudo "install -d -m 0755 -o root -g root '/root/${bdir}'" \
-      || die "Failed to create /root/${bdir} on server"
-    local bbase
-    bbase="$(basename "${bfile}")"
-    scp_admin "${bpath}" "${ADMIN_USER}@${TS_IP}:/tmp/${bbase}" \
-      || die "Failed to upload ${bfile}"
-    ssh_admin_sudo "bash -c 'mv /tmp/${bbase} /root/${bdir}/${bbase} && chmod 644 /root/${bdir}/${bbase}'" \
-      || die "Failed to install ${bfile} to /root/${bdir}/"
-  done
-
-  pass "Companion scripts synced to server"
+reconcile_resume_hardening_remote() {
+  log "Reconciling idempotent hardening state before Gate C..."
+  run_remote_script_via_admin "Base hardening reconcile" hardening_resume_reconcile_script
+  case "${PAAS}" in
+    dokploy)
+      run_remote_script_via_admin "Stale Coolify UFW cleanup" dokploy_remove_stale_coolify_dashboard_ufw_script \
+        || true
+      run_remote_script_via_admin "Dokploy dashboard UFW policy" dokploy_dashboard_ufw_policy_script
+      run_remote_script_via_admin "Dokploy runtime finalize" dokploy_finalize_runtime_script
+      ;;
+  esac
+  pass "Hardening state reconciled for Gate C"
 }
 
 verify_docker_user_gate_remote() {
@@ -691,8 +600,10 @@ preflight() {
     resolve_app_domain
     cf_verify_private_tls_ca_caa
     pass "Cloudflare API verified (zone: ${CF_ZONE_ID})"
-  else
+  elif [[ "${PAAS}" == "dflow" ]]; then
     pass "dFlow: Cloudflare preflight skipped (controller manages routing)"
+  else
+    pass "Dokploy: Cloudflare preflight skipped (public app DNS is operator-managed)"
   fi
 
   # Test SSH connectivity (skipped for --ts-ip and --preflight-only).
@@ -724,19 +635,11 @@ EOF
   printf -v bootstrap_cmd 'bash -lc %q' "${bootstrap_cmd_script}"
   local bootstrap_transport="root"
 
-  # Upload deployment tree as a single tarball. base/, lib/, and overlays/
-  # together contain every file bootstrap.sh and validate.sh source, so packaging
-  # them in one transfer keeps phase 1 robust against per-file SSH bursts on
-  # password-authenticated transports. Phase 2 sync_companion_scripts later
-  # re-syncs the same tree via admin SSH for resume runs.
-  for d in base lib overlays; do
-    [[ -d "${SCRIPT_DIR}/${d}" ]] || die "Required directory not found: ${SCRIPT_DIR}/${d}"
-  done
   local tree_tar
   tree_tar="$(mktemp -t deploy-tree.XXXXXXXX.tar.gz)" || die "Failed to create temp tarball"
-  if ! ( cd "${SCRIPT_DIR}" && tar -czf "${tree_tar}" base lib overlays ); then
+  if ! package_deployment_tree "${tree_tar}"; then
     rm -f "${tree_tar}"
-    die "Failed to package deployment tree from ${SCRIPT_DIR}"
+    die "Failed to package deployment tree"
   fi
 
   if ! retry_root_transport "Uploading deployment tree to ${SERVER_IP}" \
@@ -747,7 +650,8 @@ EOF
   rm -f "${tree_tar}"
 
   retry_root_transport "Extracting deployment tree on ${SERVER_IP}" \
-    ssh_root "tar -C /root -xzf /root/deploy-tree.tar.gz && rm -f /root/deploy-tree.tar.gz && chmod 755 /root/base/bootstrap.sh /root/base/validate.sh /root/overlays/coolify/configure_coolify_binding.sh /root/overlays/dflow/data/dokku-predeploy-resource-check.sh" \
+    ssh_root "DEPLOY_TREE_ARCHIVE=/root/deploy-tree.tar.gz bash -s" \
+    < <(install_deployment_tree_remote_script) \
     || die "Failed to extract deployment tree on ${SERVER_IP}"
   pass "Scripts uploaded"
 
@@ -779,10 +683,6 @@ EOF
     printf 'TAILSCALE_DIRECT_WAN="%s"\n' "${TAILSCALE_DIRECT_WAN//\"/\\\"}"
     printf 'BIND_DASHBOARD_TO_TAILSCALE="false"\n'
     printf 'PAAS="%s"\n' "${PAAS//\"/\\\"}"
-    printf 'DFLOW_AUTH_MODE="%s"\n' "${DFLOW_AUTH_MODE//\"/\\\"}"
-    printf 'DFLOW_CONTROL_PUBKEY="%s"\n' "${DFLOW_CONTROL_PUBKEY//\"/\\\"}"
-    printf 'DFLOW_CONTROL_CIDR="%s"\n' "${DFLOW_CONTROL_CIDR//\"/\\\"}"
-    printf 'DFLOW_BESZEL_PORT="%s"\n' "${DFLOW_BESZEL_PORT//\"/\\\"}"
   } > "${deploy_env_tmp}"
   chmod 600 "${deploy_env_tmp}"
   if ! scp_root "${deploy_env_tmp}" "root@${SERVER_IP}:${REMOTE_DEPLOY_ENV_PATH}"; then
@@ -929,6 +829,28 @@ gate_c_failures_are_transient() {
   ' >/dev/null 2>&1 <<< "${json}"
 }
 
+fetch_phase1_state_line_remote() {
+  ssh "${SSH_OPTS[@]}" -i "${PRIVATE_KEY}" "${ADMIN_USER}@${TS_IP}" "sudo bash -s" 2>/dev/null <<'REMOTE' || true
+set -Eeuo pipefail
+state_file="/var/lib/server-hardening/state"
+state_lock_file="${state_file}.lock"
+state_snapshot="$(mktemp)"
+cleanup() {
+  rm -f "${state_snapshot}"
+}
+trap cleanup EXIT
+[[ -f "${state_file}" ]] || exit 4
+if command -v flock >/dev/null 2>&1; then
+  flock -s "${state_lock_file}" cp "${state_file}" "${state_snapshot}"
+else
+  cp "${state_file}" "${state_snapshot}"
+fi
+# shellcheck disable=SC1090
+source "${state_snapshot}"
+printf "%s\t%s\n" "${domain:-}" "${tunnel_mode:-}"
+REMOTE
+}
+
 assert_resume_phase1_contract_remote() {
   is_true "${SKIP_HARDEN}" || return 0
 
@@ -936,32 +858,18 @@ assert_resume_phase1_contract_remote() {
   expected_tunnel_mode="false"
   [[ "${DEPLOY_MODE}" == "tunnel" ]] && expected_tunnel_mode="true"
 
-  state_line="$(ssh_admin_sudo 'bash -ceu '"'"'
-    state_file="/var/lib/server-hardening/state"
-    state_lock_file="${state_file}.lock"
-    state_snapshot="$(mktemp)"
-    cleanup() {
-      rm -f "${state_snapshot}"
-    }
-    trap cleanup EXIT
-    [[ -f "${state_file}" ]] || exit 4
-    if command -v flock >/dev/null 2>&1; then
-      flock -s "${state_lock_file}" bash -ceu '\''cat "$1" > "$2"'\'' _ "${state_file}" "${state_snapshot}"
-    else
-      cat "${state_file}" > "${state_snapshot}"
-    fi
-    # shellcheck disable=SC1090
-    source "${state_snapshot}"
-    printf "%s\t%s\n" "${domain:-}" "${tunnel_mode:-}"
-  '"'" 2>/dev/null || true)"
+  state_line="$(fetch_phase1_state_line_remote)"
 
   [[ -n "${state_line}" ]] || die "Resume contract failed: phase 1 state is unavailable on the server. Run a fresh deploy instead of --ts-ip."
 
   IFS=$'\t' read -r state_domain state_tunnel_mode <<< "${state_line}"
-  [[ -n "${state_domain}" ]] || die "Resume contract failed: phase 1 state does not contain a domain. Run a fresh deploy instead of --ts-ip."
+  # Domain may be empty for Dokploy (optional public app domain).
+  if [[ -n "${DOMAIN}" || "${PAAS}" == "coolify" ]]; then
+    [[ -n "${state_domain}" ]] || die "Resume contract failed: phase 1 state does not contain a domain. Run a fresh deploy instead of --ts-ip."
+  fi
   [[ -n "${state_tunnel_mode}" ]] || state_tunnel_mode="false"
 
-  if [[ "${state_domain}" != "${DOMAIN}" ]]; then
+  if [[ -n "${DOMAIN}" && "${state_domain}" != "${DOMAIN}" ]]; then
     die "Resume contract failed: --domain ${DOMAIN} does not match phase 1 state (${state_domain}). Run a fresh deploy."
   fi
 
@@ -1098,6 +1006,7 @@ phase2_gates() {
   # Always re-sync companion scripts via admin SCP after Gate A/B confirm SSH works.
   # This ensures the latest versions are used even when phase 1 (root upload) was skipped.
   sync_companion_scripts
+  reconcile_resume_hardening_remote
 
   # Resume safety: if Docker was already installed by a prior partial run, re-apply
   # hardening-owned Docker settings before Gate C validation. This keeps --ts-ip
@@ -1137,6 +1046,7 @@ paas_phase3_dispatch() {
   overlay_topo_sort "${PAAS}"
   case "${PAAS}" in
     dflow)   dflow_phase3_install_shared "$@" ;;
+    dokploy) dokploy_phase3_install_shared "$@" ;;
     coolify) coolify_phase3_docker_coolify_shared "$@" ;;
     *)       die "Unsupported PAAS: ${PAAS}" ;;
   esac
@@ -1145,6 +1055,7 @@ paas_phase3_dispatch() {
 paas_phase4_dispatch() {
   case "${PAAS}" in
     dflow)   dflow_phase4_routing_shared "$@" ;;
+    dokploy) dokploy_phase4_routing_shared "$@" ;;
     coolify) coolify_phase4_binding_dns_shared "$@" ;;
     *)       die "Unsupported PAAS: ${PAAS}" ;;
   esac
@@ -1153,6 +1064,7 @@ paas_phase4_dispatch() {
 paas_phase5_dispatch() {
   case "${PAAS}" in
     dflow)   dflow_phase5_verify_shared "${1:-}" ;;
+    dokploy) dokploy_phase5_verify_shared "${1:-}" ;;
     coolify) coolify_phase5_verify_shared "$@" ;;
     *)       die "Unsupported PAAS: ${PAAS}" ;;
   esac
@@ -1186,6 +1098,39 @@ phase3_docker_coolify() {
     phase3_add_coolify_root_key \
     phase3_fix_host_docker_internal \
     phase3_sync_docker_ssh_cidrs
+}
+
+phase3_docker_dokploy() {
+  phase3_has_docker() { ssh_admin_sudo 'docker version >/dev/null 2>&1'; }
+  phase3_install_docker() { coolify_install_docker_engine_script | ssh_admin_sudo 'bash -s'; }
+  phase3_start_docker_user() { ssh_admin_sudo 'systemctl enable --now docker-user-hardening.service'; }
+  phase3_verify_docker_user() { verify_docker_user_gate_remote "$1"; }
+  phase3_has_dokploy() { ssh_admin_sudo 'docker service inspect dokploy >/dev/null 2>&1'; }
+  phase3_install_dokploy() { dokploy_install_dokploy_script | ssh_admin_sudo 'bash -s'; }
+  phase3_reconcile_docker_daemon() { reconcile_docker_daemon_remote; }
+  phase3_restart_docker_user() { ssh_admin_sudo 'systemctl restart docker-user-hardening.service'; }
+  phase3_sync_docker_ssh_cidrs() { ssh_admin_sudo 'systemctl start docker-ssh-cidr-sync.service'; }
+  phase3_finalize_dokploy_runtime() {
+    local script_tmp
+    script_tmp="$(mktemp)"
+    dokploy_finalize_runtime_script > "${script_tmp}"
+    ssh_admin_sudo 'bash -s' < "${script_tmp}"
+    local rc=$?
+    rm -f "${script_tmp}"
+    return "${rc}"
+  }
+
+  paas_phase3_dispatch \
+    phase3_has_docker \
+    phase3_install_docker \
+    phase3_start_docker_user \
+    phase3_verify_docker_user \
+    phase3_has_dokploy \
+    phase3_install_dokploy \
+    phase3_reconcile_docker_daemon \
+    phase3_restart_docker_user \
+    phase3_sync_docker_ssh_cidrs \
+    phase3_finalize_dokploy_runtime
 }
 
 # ── Phase 4: Binding + DNS ─────────────────────────────────────────────────
@@ -1303,6 +1248,31 @@ EOF
     phase4_restore_public_tls
 }
 
+phase4_dokploy_access_policy() {
+  phase4_remove_stale_coolify_dashboard_ufw() {
+    local script_tmp
+    script_tmp="$(mktemp)"
+    dokploy_remove_stale_coolify_dashboard_ufw_script > "${script_tmp}"
+    ssh_admin_sudo 'bash -s' < "${script_tmp}"
+    local rc=$?
+    rm -f "${script_tmp}"
+    return "${rc}"
+  }
+  phase4_configure_dokploy_dashboard_ufw() {
+    local script_tmp
+    script_tmp="$(mktemp)"
+    dokploy_dashboard_ufw_policy_script > "${script_tmp}"
+    ssh_admin_sudo 'bash -s' < "${script_tmp}"
+    local rc=$?
+    rm -f "${script_tmp}"
+    return "${rc}"
+  }
+
+  paas_phase4_dispatch \
+    phase4_configure_dokploy_dashboard_ufw \
+    phase4_remove_stale_coolify_dashboard_ufw
+}
+
 # ── Phase 5: Verification ─────────────────────────────────────────────────
 
 phase5_fetch_validate_json() { ssh_admin_sudo '/root/base/validate.sh --json'; }
@@ -1321,6 +1291,7 @@ main() {
   run_report_init "${SCRIPT_NAME}"
   init_ssh_options
   parse_args "$@"
+  ROOT_SSH_HOST="${SERVER_IP}"
   collect_inputs
   validate_inputs
   init_root_password_auth
@@ -1342,8 +1313,12 @@ main() {
     [[ "${DEPLOY_MODE}" == "tunnel" ]] && log "  Private TLS CA: ${PRIVATE_TLS_CA}"
     print_private_tls_ca_notice
     [[ "${CF_TUNNEL_API_TOKEN}" != "${CF_API_TOKEN}" ]] && log "  CF tunnel token: custom"
-  else
+  elif [[ "${PAAS}" == "dflow" ]]; then
     log "  Controller: dFlow (Tailscale SSH)"
+  else
+    log "  Public app ingress: 80/443"
+    [[ -n "${DOMAIN:-}" ]] && log "  App domain: ${DOMAIN}"
+    log "  Dashboard/API: Tailscale port 3000"
   fi
   is_true "${PREFLIGHT_ONLY}" && log "  Mode:      preflight-only (no server changes)"
   is_true "${SKIP_HARDEN}" && log "  TS IP:     ${TS_IP} (--ts-ip; skipping phase 1)"
@@ -1365,6 +1340,10 @@ main() {
     dflow)
       paas_phase3_dispatch
       paas_phase4_dispatch
+      ;;
+    dokploy)
+      phase3_docker_dokploy
+      phase4_dokploy_access_policy
       ;;
     coolify)
       phase3_docker_coolify

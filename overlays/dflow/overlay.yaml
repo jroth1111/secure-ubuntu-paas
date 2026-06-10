@@ -5,9 +5,6 @@ depends_on: [docker-host]
 state_namespace: /var/lib/server-hardening/overlays/dflow
 modules:
   bootstrap:
-    - modules/ufw.sh
-    - modules/ssh_access.sh
-    - modules/ssh_match_dropin.sh
     - modules/tailscale_ssh.sh
     - modules/predeploy_hook.sh
   validate:
@@ -16,5 +13,4 @@ modules:
     - {file: checks/dflow_beszel_check.sh, gate_c: true}
     - {file: checks/dflow_backups_check.sh, gate_c: true}
     - {file: checks/dflow_predeploy_hook_check.sh, gate_c: true}
-    - {file: checks/dflow_ssh_path_check.sh, gate_c: true}
 companion_scripts: []

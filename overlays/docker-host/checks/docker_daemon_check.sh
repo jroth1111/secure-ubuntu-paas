@@ -27,22 +27,29 @@ docker_daemon_check() {
     record "FAIL" "docker-daemon: log-opts.max-size" "not set in daemon.json"
   fi
 
-  local live_restore
-  live_restore="$(jq -r 'if has("live-restore") then .["live-restore"] else "missing" end | tostring' "${daemon_json}" 2>/dev/null || echo "invalid")"
-  case "${live_restore}" in
-    true)
-      record "PASS" "docker-daemon: live-restore=true"
-      ;;
-    false)
-      record "FAIL" "docker-daemon: live-restore" "expected true, got false"
-      ;;
-    missing)
-      record "FAIL" "docker-daemon: live-restore" "not set in daemon.json"
-      ;;
-    *)
-      record "FAIL" "docker-daemon: live-restore" "invalid value in daemon.json"
-      ;;
-  esac
+  # live-restore is incompatible with Docker Swarm; skip when Swarm is active.
+  local swarm_state
+  swarm_state="$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || true)"
+  if [[ "${swarm_state}" == "active" || "${swarm_state}" == "locked" || "${swarm_state}" == "pending" ]]; then
+    record "INFO" "docker-daemon: live-restore" "skipped — incompatible with Docker Swarm"
+  else
+    local live_restore
+    live_restore="$(jq -r 'if has("live-restore") then .["live-restore"] else "missing" end | tostring' "${daemon_json}" 2>/dev/null || echo "invalid")"
+    case "${live_restore}" in
+      true)
+        record "PASS" "docker-daemon: live-restore=true"
+        ;;
+      false)
+        record "FAIL" "docker-daemon: live-restore" "expected true, got false"
+        ;;
+      missing)
+        record "FAIL" "docker-daemon: live-restore" "not set in daemon.json"
+        ;;
+      *)
+        record "FAIL" "docker-daemon: live-restore" "invalid value in daemon.json"
+        ;;
+    esac
+  fi
 
   # CIS 5.19: isolate container IPC namespaces
   local ipc_mode

@@ -124,9 +124,6 @@ load_state_context() {
   DOCKER_RULES_APPLIED="${docker_rules_applied:-false}"
   CONFIGURED_TIMEZONE="${timezone:-}"
   PAAS="${paas:-coolify}"
-  DFLOW_AUTH_MODE="${dflow_auth_mode:-ssh}"
-  DFLOW_CONTROL_CIDR="${dflow_control_cidr:-}"
-  DFLOW_BESZEL_PORT="${dflow_beszel_port:-45876}"
 }
 
 is_true() {

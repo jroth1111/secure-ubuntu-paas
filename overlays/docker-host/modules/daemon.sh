@@ -11,21 +11,25 @@ configure_docker_daemon() {
   #   userns-remap       — breaks volume ownership + Docker socket mounting
   #   icc: false          — breaks inter-container networking (app→PostgreSQL→Redis)
   #   userland-proxy: false — risky for user service deployments
-  local required_settings
+  local required_settings live_restore_json="true"
+  if [[ "${PAAS}" == "dokploy" ]]; then
+    live_restore_json="false"
+  fi
   required_settings="$(jq -nc \
     --argjson nproc_hard "${DOCKER_NPROC_HARD}" \
     --argjson nproc_soft "${DOCKER_NPROC_SOFT}" \
+    --argjson live_restore "${live_restore_json}" \
     '{
       "log-driver":"json-file",
       "log-opts":{"max-size":"10m","max-file":"3"},
-      "live-restore":true,
       "default-ipc-mode":"private",
       "storage-driver":"overlay2",
       "default-ulimits":{
         "nofile":{"Name":"nofile","Hard":65536,"Soft":65536},
         "nproc":{"Name":"nproc","Hard":$nproc_hard,"Soft":$nproc_soft}
       }
-    }')"
+    }
+    + if $live_restore then {"live-restore":true} else {} end')"
 
   if [[ "${DOCKER_PRESENT}" != "true" ]]; then
     log "Docker not present; skipping daemon.json creation (will be needed post-install)."
@@ -63,6 +67,9 @@ configure_docker_daemon() {
     if [[ -z "${merged}" ]]; then
       die "Failed to merge ${DOCKER_DAEMON_JSON} with jq; cannot safely apply hardening settings."
     else
+      if [[ "${PAAS}" == "dokploy" ]]; then
+        merged="$(jq 'del(.["live-restore"])' <<< "${merged}")"
+      fi
       echo "${merged}" > "${DOCKER_DAEMON_JSON}"
       chmod 0644 "${DOCKER_DAEMON_JSON}"
     fi
@@ -82,7 +89,24 @@ configure_docker_daemon() {
   # Note: log-driver uses json-file (same as Coolify) for compatibility.
   # Hardening owns: log-driver, log-opts, live-restore, default-ipc-mode,
   #   storage-driver, default-ulimits. Coolify may add: default-address-pools.
-  write_file "${DOCKER_DAEMON_JSON}" "0644" "root" "root" <<EOF
+  if [[ "${PAAS}" == "dokploy" ]]; then
+    write_file "${DOCKER_DAEMON_JSON}" "0644" "root" "root" <<EOF
+{
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  },
+  "default-ipc-mode": "private",
+  "storage-driver": "overlay2",
+  "default-ulimits": {
+    "nofile": { "Name": "nofile", "Hard": 65536, "Soft": 65536 },
+    "nproc": { "Name": "nproc", "Hard": ${DOCKER_NPROC_HARD}, "Soft": ${DOCKER_NPROC_SOFT} }
+  }
+}
+EOF
+  else
+    write_file "${DOCKER_DAEMON_JSON}" "0644" "root" "root" <<EOF
 {
   "log-driver": "json-file",
   "log-opts": {
@@ -98,6 +122,7 @@ configure_docker_daemon() {
   }
 }
 EOF
+  fi
 
   log "Docker daemon.json written with log rotation, live-restore, IPC isolation, overlay2, and ulimits."
 }

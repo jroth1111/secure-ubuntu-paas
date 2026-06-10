@@ -22,7 +22,10 @@ configure_hardening_validation_timer() {
   # Final fallback: use directory of script invocation
   script_dir="${script_dir:-$(pwd)}"
 
-  validate_src="${script_dir}/validate.sh"
+  validate_src="${script_dir}/../validate.sh"
+  if [[ ! -f "${validate_src}" && -f /root/base/validate.sh ]]; then
+    validate_src="/root/base/validate.sh"
+  fi
   validate_dest="/usr/local/sbin/validate-hardening"
 
   if [[ -f "${validate_src}" ]]; then

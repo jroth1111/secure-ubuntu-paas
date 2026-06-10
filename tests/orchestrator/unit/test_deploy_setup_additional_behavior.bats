@@ -87,7 +87,7 @@ load '../../helpers/helpers'
     SKIP_HARDEN="true"
     DEPLOY_MODE="tunnel"
     DOMAIN="coolify.example.com"
-    ssh_admin_sudo() {
+    fetch_phase1_state_line_remote() {
       printf "coolify.example.com\ttrue\n"
     }
     assert_resume_phase1_contract_remote
@@ -311,21 +311,35 @@ EOF
   assert_output --partial "alice@100.64.0.10 sudo echo ok"
 }
 
-@test "sync_companion_scripts: uploads and installs all companion scripts and lib files" {
+@test "sync_companion_scripts: uploads deployment tree tarball and extracts once" {
   run bash -c '
     source "'"${DEPLOY_SCRIPT}"'"
     SCRIPT_DIR="'"${PROJECT_ROOT}"'"
     ADMIN_USER="alice"
     TS_IP="100.64.0.10"
     upload_count=0
-    install_count=0
+    extract_count=0
     scp_admin() { upload_count=$((upload_count + 1)); return 0; }
-    ssh_admin_sudo() { install_count=$((install_count + 1)); return 0; }
+    ssh_admin_sudo() { extract_count=$((extract_count + 1)); return 0; }
     sync_companion_scripts
-    # 3 companion scripts + 2 lib files + 10 coolify overlay + 13 docker-host overlay + 35 base modules/checks = 63 scp_admin invocations
-    [[ "${upload_count}" -ge 4 ]]
-    # mkdir + mv+chmod for each = at least 8 ssh_admin_sudo invocations
-    [[ "${install_count}" -ge 8 ]]
+    [[ "${upload_count}" -eq 1 ]]
+    [[ "${extract_count}" -eq 1 ]]
+  '
+  assert_success
+}
+
+@test "reconcile_resume_hardening_remote: runs base and dokploy reconciles" {
+  run bash -c '
+    source "'"${DEPLOY_SCRIPT}"'"
+    PAAS="dokploy"
+    remote_calls=0
+    hardening_resume_reconcile_script() { echo "base-reconcile"; }
+    dokploy_remove_stale_coolify_dashboard_ufw_script() { echo "coolify-ufw"; }
+    dokploy_dashboard_ufw_policy_script() { echo "dokploy-ufw"; }
+    dokploy_finalize_runtime_script() { echo "dokploy-finalize"; }
+    ssh_admin_sudo() { remote_calls=$((remote_calls + 1)); return 0; }
+    reconcile_resume_hardening_remote
+    [[ "${remote_calls}" -eq 4 ]]
   '
   assert_success
 }
@@ -458,7 +472,7 @@ EOF
       return 0
     }
     ssh_root() {
-      if [[ "$1" == *"tar -C /root -xzf "* ]]; then
+      if [[ "$1" == *"tar -C /root"*"-xzf "* ]]; then
         count="$(cat "${extract_counter}")"
         count=$((count + 1))
         echo "${count}" > "${extract_counter}"
@@ -684,6 +698,45 @@ EOF
   assert_success
 }
 
+@test "phase3_docker_dokploy (deploy): executes docker/dokploy reconcile flow" {
+  run bash -c '
+    source "'"${DEPLOY_SCRIPT}"'"
+    PAAS="dokploy"
+    calls_file="$(mktemp)"
+    ssh_admin_sudo() {
+      if [[ "$1" == "docker version >/dev/null 2>&1" ]]; then return 0; fi
+      if [[ "$1" == "docker service inspect dokploy >/dev/null 2>&1" ]]; then return 1; fi
+      if [[ "$1" == "bash -s" ]]; then cat >/dev/null || true; echo installer >> "${calls_file}"; return 0; fi
+      return 0
+    }
+    verify_docker_user_gate_remote() { echo "gate:$1" >> "${calls_file}"; }
+    reconcile_docker_daemon_remote() { :; }
+    run_with_heartbeat() { local label="$1"; shift; "$@"; }
+    phase3_docker_dokploy
+    grep -q "^gate:Gate D$" "${calls_file}"
+    grep -q "^gate:Gate D (post-Dokploy)$" "${calls_file}"
+    grep -q "^installer$" "${calls_file}"
+  '
+  assert_success
+}
+
+@test "phase4_dokploy_access_policy (deploy): restricts dashboard and swarm ports to tailscale0" {
+  run bash -c '
+    source "'"${DEPLOY_SCRIPT}"'"
+    PAAS="dokploy"
+    ssh_admin_sudo() { if [[ "$1" == "bash -s" ]]; then cat; else printf "%s\n" "$1"; fi; }
+    phase4_dokploy_access_policy
+  '
+  assert_success
+  assert_output --partial "ufw delete allow 3000/tcp"
+  assert_output --partial "ufw allow in on tailscale0 proto tcp to any port 3000"
+  assert_output --partial "ufw deny 3000/tcp"
+  assert_output --partial "ufw allow in on tailscale0 proto tcp to any port 2377"
+  assert_output --partial "ufw deny 2377/tcp"
+  assert_output --partial "ufw allow in on tailscale0 proto udp to any port 4789"
+  assert_output --partial "ufw deny 4789/udp"
+}
+
 @test "collect_inputs (setup): populates shared fields via common collector" {
   run bash -c '
     source "'"${SETUP_SCRIPT}"'"
@@ -767,6 +820,45 @@ EOF
     [[ "${gate_calls}" -ge 2 ]]
   '
   assert_success
+}
+
+@test "phase3_docker_dokploy (setup): executes local docker/dokploy reconcile flow" {
+  run bash -c '
+    source "'"${SETUP_SCRIPT}"'"
+    PAAS="dokploy"
+    calls_file="$(mktemp)"
+    docker() {
+      if [[ "$1" == "version" ]]; then return 0; fi
+      if [[ "$1 $2" == "service inspect" ]]; then return 1; fi
+      return 0
+    }
+    systemctl() { return 0; }
+    verify_docker_user_gate_local() { echo "gate:$1" >> "${calls_file}"; }
+    bash() { cat >/dev/null || true; echo installer >> "${calls_file}"; }
+    run_with_heartbeat() { local label="$1"; shift; "$@"; }
+    phase3_docker_dokploy
+    grep -q "^gate:Gate D$" "${calls_file}"
+    grep -q "^gate:Gate D (post-Dokploy)$" "${calls_file}"
+    grep -q "^installer$" "${calls_file}"
+  '
+  assert_success
+}
+
+@test "phase4_dokploy_access_policy (setup): restricts dashboard and swarm ports to tailscale0" {
+  run bash -c '
+    source "'"${SETUP_SCRIPT}"'"
+    PAAS="dokploy"
+    bash() { if [[ "$1" == "-s" ]]; then cat; else printf "%s\n" "$*"; fi; }
+    phase4_dokploy_access_policy
+  '
+  assert_success
+  assert_output --partial "ufw delete allow 3000/tcp"
+  assert_output --partial "ufw allow in on tailscale0 proto tcp to any port 3000"
+  assert_output --partial "ufw deny 3000/tcp"
+  assert_output --partial "ufw allow in on tailscale0 proto tcp to any port 2377"
+  assert_output --partial "ufw deny 2377/tcp"
+  assert_output --partial "ufw allow in on tailscale0 proto udp to any port 4789"
+  assert_output --partial "ufw deny 4789/udp"
 }
 
 @test "main (deploy): executes all deployment phases in order with stubs" {

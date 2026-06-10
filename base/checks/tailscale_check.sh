@@ -48,11 +48,10 @@ tailscale_check() {
 
     local run_ssh_pref expected_run_ssh="false" expected_label="false"
     run_ssh_pref="$(tailscale_runssh_pref_value 5 1)"
-    # dFlow's tailscale auth mode delegates SSH to tailscaled; allow RunSSH=true
-    # when the operator has explicitly opted in via PAAS=dflow + tailscale auth.
-    if [[ "${PAAS:-coolify}" == "dflow" && "${DFLOW_AUTH_MODE:-ssh}" == "tailscale" ]]; then
+    # dFlow uses Tailscale SSH exclusively; RunSSH=true is required.
+    if [[ "${PAAS:-coolify}" == "dflow" ]]; then
       expected_run_ssh="true"
-      expected_label="true (dflow tailscale auth)"
+      expected_label="true (dflow tailscale ssh)"
     fi
     if [[ "${run_ssh_pref}" == "${expected_run_ssh}" ]]; then
       record "PASS" "tailscale: RunSSH=${expected_label}"

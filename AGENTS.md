@@ -35,16 +35,16 @@ An LLM can run this project safely only if it tracks this operator model:
 5. **Required inputs/secrets** (PaaS-conditional):
    - Common: server IP, root auth (laptop flow), Tailscale auth key, server timezone.
    - Coolify only: domain, Cloudflare token(s).
-   - dFlow only: `--dflow-auth-mode`; if `ssh`, controller pubkey file (`--dflow-control-pubkey-file`) and recommended `--dflow-control-cidr`.
+   - dFlow only: no additional credentials — the controller attaches via Tailscale SSH.
 6. **Mode decision**:
    - Coolify: `tunnel` vs `standard` changes exposure, DNS, and verification behavior.
-   - dFlow: `auth-mode=ssh` vs `auth-mode=tailscale` decides which path the controller uses to attach. `--mode` is not consumed by dFlow.
+   - dFlow: `--mode` is not consumed. The controller attaches exclusively via Tailscale SSH; there is no ssh/tailscale auth-mode choice.
 7. **State machine**: phases `[0/5]..[5/5]` with hard gates (A-F); do not skip failed gates. For `--paas dflow`, phases 3 and 4 are intentional no-ops (the dFlow controller installs Docker/Dokku/Beszel/Restic/Traefik on first attach); phase 5 runs the validator with dFlow-specific checks.
 8. **Machine contracts**:
    - `base/bootstrap.sh` emits `HARDEN_RESULT_TAILSCALE_IP=<ip>` on stdout.
    - `base/validate.sh --json` emits `{pass,fail,info,checks}` (PaaS-aware: branches on `PAAS=` from state).
    - `PAAS` env var (default `coolify`) is propagated through `deploy.env` into `bootstrap.sh` and `validate.sh` via the bootstrap key allowlist.
-9. **Security invariants**: UFW default-deny, strict SSH posture, DOCKER-USER WAN drop semantics (Coolify only — dFlow defers Docker config to controller, but the substrate's UFW posture stands), fail2ban posture. dFlow adds: root SSH `Match Address` restricted to `--dflow-control-cidr` when set; Beszel TCP port (default 45876) allowed only on the Tailscale interface (not WAN).
+9. **Security invariants**: UFW default-deny, strict SSH posture, DOCKER-USER WAN drop semantics (Coolify only — dFlow defers Docker config to controller, but the substrate's UFW posture stands), fail2ban posture. dFlow adds: Tailscale SSH exclusively for controller attach; no root SSH pubkey or CIDR rules managed by this project.
 10. **Idempotency/resume**: reruns must be safe; `--ts-ip` resumes from phase 2; companion scripts re-sync in phase 2.
 11. **Destructive-op discipline**: deploying is high impact regardless of PaaS. Cloudflare mutations apply only to `--paas coolify`. State command + effect and require explicit confirmation.
 12. **Recovery discipline**: separate real misconfiguration from validation false positives before editing checks. For dFlow, INFO results from `dflow_dokku_check`/`dflow_beszel_check`/`dflow_backups_check` before the controller has attached are expected, not failures.
@@ -83,9 +83,6 @@ Then, branched by PaaS:
 | Server public IPv4 | required | required |
 | Coolify mode | `tunnel` (default) or `standard` | n/a |
 | App-domain mode | `apex` (default) or `vps` | n/a |
-| dFlow auth-mode | n/a | `ssh` (default) or `tailscale` |
-| dFlow control CIDR | n/a | recommended (IPv4 CIDR of controller) |
-| Beszel port | n/a | optional override (default `45876`) |
 
 ### Step 3: Collect Secrets and Required Credentials
 
@@ -94,7 +91,7 @@ Collect:
 - root password (or root password file path for automation) for `deploy.sh` fresh runs (not required for `--ts-ip` resume or `--preflight-only`)
 - Tailscale auth key (`tskey-auth-*`) unless resuming with `--ts-ip` or running `--preflight-only`
 - **Coolify only**: Cloudflare API token (or `--cf-api-token-file`); Cloudflare tunnel token if split-token model is used (`--cf-tunnel-api-token-file`)
-- **dFlow only, `auth-mode=ssh`**: dFlow controller's SSH public key file (`--dflow-control-pubkey-file`)
+- **dFlow only**: no additional credentials required beyond the common set above
 
 ### Step 4: Confirm Defaults
 
@@ -108,8 +105,6 @@ Unless user overrides:
 - app domain mode: `apex` (Coolify only)
 - tailscale direct WAN: disabled (`--no-tailscale-direct-wan`)
 - server timezone: operator must choose explicitly (no implicit recommendation)
-- dFlow auth-mode: `ssh`
-- dFlow Beszel port: `45876`
 
 ### Step 5: Confirm Command + Impact, Then Execute
 
@@ -156,22 +151,14 @@ sudo /opt/homebrew/bin/bash setup.sh --paas coolify --server-ip <ip> --admin-use
   --domain <fqdn> --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> \
   --cf-api-token-file <path> --yes
 
-# dFlow: deploy.sh fresh run, auth-mode=ssh
+# dFlow: deploy.sh fresh run
 /opt/homebrew/bin/bash deploy.sh --paas dflow --server-ip <ip> --root-pass-file <path> \
   --admin-user dflowadmin --pubkey-file <path> \
-  --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> \
-  --dflow-auth-mode ssh --dflow-control-pubkey-file <path> --dflow-control-cidr <ipv4-cidr> --yes
-
-# dFlow: deploy.sh fresh run, auth-mode=tailscale
-/opt/homebrew/bin/bash deploy.sh --paas dflow --server-ip <ip> --root-pass-file <path> \
-  --admin-user dflowadmin --pubkey-file <path> \
-  --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> \
-  --dflow-auth-mode tailscale --yes
+  --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> --yes
 
 # dFlow: setup.sh server-local
 sudo /opt/homebrew/bin/bash setup.sh --paas dflow --server-ip <ip> --admin-user <name> --pubkey-file <path> \
-  --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> \
-  --dflow-auth-mode ssh --dflow-control-pubkey-file <path> --dflow-control-cidr <ipv4-cidr> --yes
+  --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> --yes
 ```
 
 Decision tree:
@@ -213,7 +200,7 @@ Pre-run checklist:
   - dFlow: no-op (Traefik is owned by dFlow).
 - **[5/5] Final verify**:
   - Coolify: Gate E (dashboard/websocket reachable on Tailscale and blocked on public paths) + Gate F (mode-specific external/private route assertions).
-  - dFlow: Gate F runs `base/validate.sh --json` on the worker; dFlow-specific checks (`dflow_dokku_check`, `dflow_beszel_check`, `dflow_backups_check`, `dflow_predeploy_hook_check`, `dflow_ssh_path_check`) must not regress. INFO results from runtime checks pre-attach are expected.
+  - dFlow: Gate F runs `base/validate.sh --json` on the worker; dFlow-specific checks (`dflow_substrate_check`, `dflow_dokku_check`, `dflow_beszel_check`, `dflow_backups_check`, `dflow_predeploy_hook_check`) must not regress. INFO results from runtime checks pre-attach are expected.
   - Final `base/validate.sh --json` must report 0 failures.
 
 ---
@@ -258,8 +245,7 @@ change is the explicit, user-confirmed goal.
 | State file `/var/lib/server-hardening/state` (key=value) | `base/bootstrap.sh write_state()` | `base/validate.sh` (state-derived checks; `PAAS=` selects branch) |
 | `PAAS=` env var allowlisted in bootstrap env-file parsing | `base/bootstrap.sh env_file_key_supported` | `setup.sh phase1_harden` writes `deploy.env`; bootstrap reads it |
 | Tunnel name `coolify-<domain-slug>-<sha256-12>` | `overlays/coolify/coolify-common.sh coolify_tunnel_name()` / `cf_create_tunnel()` | same function on re-run (reuse configured tunnel when possible; otherwise reconcile by deterministic name) |
-| dFlow controller pubkey installed in `/root/.ssh/authorized_keys` with stable tag `dflow-control@managed` | `overlays/dflow/modules/ssh_access.sh` | dFlow controller (uses corresponding private key); `dflow_ssh_path_check` |
-| dFlow Beszel agent ingress: TCP `${DFLOW_BESZEL_PORT:-45876}` allowed only on `tailscale0` (UFW comment `dflow-hardening-beszel-tailscale`) | `overlays/dflow/modules/ufw.sh` | dFlow controller's Beszel hub (over tailnet); `dflow_beszel_check` |
+| dFlow controller attach path: Tailscale SSH (`RunSSH=true`) on secondary `tailscaled-dfi` instance (controller tailnet) | `overlays/dflow/modules/tailscale_ssh.sh`, `overlays/dflow/checks/dflow_substrate_check.sh` | dFlow controller; `tailscale_check` (PAAS=dflow expects RunSSH=true) |
 
 Changing these without updating all consumers is a breaking change.
 

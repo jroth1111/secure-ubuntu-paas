@@ -1,7 +1,9 @@
 configure_docker_ssh_cidr_sync_timer() {
-  if ! is_true "${STRICT_DOCKER_SSH_CIDRS}"; then
+  # The sync timer exists solely to keep the Coolify root-over-bridge SSH path
+  # aligned with Docker bridge CIDRs. Any other PaaS must not run it.
+  if ! is_true "${STRICT_DOCKER_SSH_CIDRS}" || [[ "${PAAS}" != "coolify" ]]; then
     if is_true "${DRY_RUN}"; then
-      log "DRY-RUN: would disable docker-ssh-cidr-sync.timer in compatibility CIDR mode."
+      log "DRY-RUN: would disable docker-ssh-cidr-sync.timer (PAAS=${PAAS}, strict=${STRICT_DOCKER_SSH_CIDRS})."
       return 0
     fi
     systemctl disable --now docker-ssh-cidr-sync.timer 2>/dev/null || true
@@ -80,6 +82,11 @@ is_true() {
 }
 
 if ! is_true "${strict_docker_ssh_cidrs:-false}"; then
+  exit 0
+fi
+
+# Coolify-only path: never (re)create root-over-bridge SSH access for other PaaS.
+if [[ "${paas:-coolify}" != "coolify" ]]; then
   exit 0
 fi
 

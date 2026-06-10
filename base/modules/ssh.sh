@@ -241,6 +241,22 @@ configure_ssh() {
     log "DRY-RUN: would neutralize cloud-init SSH password auth override."
   fi
 
+  local match_block=""
+  if [[ "${PAAS}" == "coolify" ]]; then
+    # Coolify connects to its own host as root via localhost / Docker bridge.
+    # Compatibility mode uses broad RFC1918 ranges; strict mode uses discovered
+    # Docker bridge CIDRs with safe fallback if discovery fails.
+    # Other PaaS (dFlow, Dokploy) never SSH from containers to the host, so
+    # they get no root Match carve-out at all.
+    match_block="
+# Coolify connects to its own host as root via localhost / Docker bridge.
+# Compatibility mode uses broad RFC1918 ranges; strict mode uses discovered
+# Docker bridge CIDRs with safe fallback if discovery fails.
+Match Address ${match_addresses}
+    PermitRootLogin prohibit-password
+    AllowUsers ${ADMIN_USER} root"
+  fi
+
   write_file "${SSH_DROPIN_FILE}" "0644" "root" "root" <<EOF
 # Managed by ${SCRIPT_NAME}
 Port ${SSH_PORT}
@@ -261,23 +277,33 @@ LoginGraceTime 30
 ClientAliveInterval 300
 ClientAliveCountMax 2
 PerSourceMaxStartups 3
-# Modern algorithms only — explicit allowlist, no legacy defaults.
-Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
-MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com
-KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org
-HostKeyAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
+Ciphers ^chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+MACs ^hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com,umac-128-etm@openssh.com
+KexAlgorithms ^sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org
+HostKeyAlgorithms ^ssh-ed25519,rsa-sha2-512,rsa-sha2-256
 Banner /etc/issue.net
-
-# Coolify connects to its own host as root via localhost / Docker bridge.
-# Compatibility mode uses broad RFC1918 ranges; strict mode uses discovered
-# Docker bridge CIDRs with safe fallback if discovery fails.
-Match Address ${match_addresses}
-    PermitRootLogin prohibit-password
-    AllowUsers ${ADMIN_USER} root
+${match_block}
 EOF
 
   if is_true "${DRY_RUN}"; then
     return 0
+  fi
+
+  # Safety: normalize duplicate '^' operators if a partial manual edit occurred.
+  if [[ -f "${SSH_DROPIN_FILE}" ]]; then
+    sed -i -E \
+      -e 's/^Ciphers \^+/Ciphers ^/' \
+      -e 's/^MACs \^+/MACs ^/' \
+      -e 's/^KexAlgorithms \^+/KexAlgorithms ^/' \
+      -e 's/^HostKeyAlgorithms \^+/HostKeyAlgorithms ^/' \
+      "${SSH_DROPIN_FILE}"
+  fi
+
+  # Migration: non-Coolify hosts must not keep the Docker-bridge root Match
+  # dropin from an earlier Coolify-era run (docker-ssh-cidr-sync layout).
+  if [[ "${PAAS}" != "coolify" && -f /etc/ssh/sshd_config.d/15-docker-ssh-match.conf ]]; then
+    rm -f /etc/ssh/sshd_config.d/15-docker-ssh-match.conf
+    log "Removed stale Docker-bridge SSH match dropin (not used for PAAS=${PAAS})."
   fi
 
   if ! sshd -t; then
@@ -293,9 +319,17 @@ EOF
 
   local match_effective
   match_effective="$(sshd -T -C addr=127.0.0.1,user=root,host=localhost,laddr=127.0.0.1 2>/dev/null || true)"
-  if ! assert_sshd_match_localhost "${match_effective}"; then
-    restore_ssh_dropin "${backup}"
-    die "sshd -T -C (localhost Match block) did not match expected values."
+  if [[ "${PAAS}" == "coolify" ]]; then
+    if ! assert_sshd_match_localhost "${match_effective}"; then
+      restore_ssh_dropin "${backup}"
+      die "sshd -T -C (localhost Match block) did not match expected values."
+    fi
+  else
+    # Non-Coolify PaaS must NOT allow root from localhost/bridges.
+    if grep -qE "^permitrootlogin (prohibit-password|without-password|yes)$" <<< "${match_effective}"; then
+      restore_ssh_dropin "${backup}"
+      die "sshd -T -C (localhost) still permits root login — root Match carve-out must not exist for PAAS=${PAAS}."
+    fi
   fi
 
   if ! reload_ssh_service; then

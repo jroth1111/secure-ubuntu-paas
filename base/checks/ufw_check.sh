@@ -24,42 +24,63 @@ ufw_check() {
     record "FAIL" "ufw: SSH on ${TAILSCALE_IFACE}" "rule missing"
   fi
 
-  # Coolify SSHes from its Docker bridge CIDRs to the host.
+  # Coolify SSHes from its Docker bridge CIDRs to the host; other PaaS must
+  # NOT have any bridge→SSH allow rules.
   local cidr escaped_cidr
-  while IFS= read -r cidr; do
-    escaped_cidr="$(regex_escape "${cidr}")"
-    if grep -qE "(^|[[:space:]])${SSH_PORT}/tcp([[:space:]]|$).*ALLOW.*${escaped_cidr}" <<< "${ufw_out}"; then
-      record "PASS" "ufw: SSH from Docker bridge (${cidr})"
-    else
-      record "FAIL" "ufw: SSH from Docker bridge (${cidr})" "${cidr} → port ${SSH_PORT}/tcp rule missing — Coolify cannot reach host"
-    fi
-    # Also check for orphaned non-tcp rules (legacy drift)
-    if grep -qE "(^|[[:space:]])${SSH_PORT}([[:space:]]|$).*ALLOW.*${escaped_cidr}" <<< "${ufw_out}" \
-      && ! grep -qE "(^|[[:space:]])${SSH_PORT}/tcp([[:space:]]|$).*ALLOW.*${escaped_cidr}" <<< "${ufw_out}"; then
-      record "FAIL" "ufw: SSH from Docker bridge (${cidr})" \
-        "${cidr} → port ${SSH_PORT} must be tcp-only; broad rule allows non-SSH protocols"
-    fi
-  done < <(load_docker_ssh_cidrs)
+  if [[ "${PAAS}" == "coolify" ]]; then
+    while IFS= read -r cidr; do
+      escaped_cidr="$(regex_escape "${cidr}")"
+      if grep -qE "(^|[[:space:]])${SSH_PORT}/tcp([[:space:]]|$).*ALLOW.*${escaped_cidr}" <<< "${ufw_out}"; then
+        record "PASS" "ufw: SSH from Docker bridge (${cidr})"
+      else
+        record "FAIL" "ufw: SSH from Docker bridge (${cidr})" "${cidr} → port ${SSH_PORT}/tcp rule missing — Coolify cannot reach host"
+      fi
+      # Also check for orphaned non-tcp rules (legacy drift)
+      if grep -qE "(^|[[:space:]])${SSH_PORT}([[:space:]]|$).*ALLOW.*${escaped_cidr}" <<< "${ufw_out}" \
+        && ! grep -qE "(^|[[:space:]])${SSH_PORT}/tcp([[:space:]]|$).*ALLOW.*${escaped_cidr}" <<< "${ufw_out}"; then
+        record "FAIL" "ufw: SSH from Docker bridge (${cidr})" \
+          "${cidr} → port ${SSH_PORT} must be tcp-only; broad rule allows non-SSH protocols"
+      fi
+    done < <(load_docker_ssh_cidrs)
 
-  # Check for orphaned non-tcp SSH rules from Docker bridges (even if tcp rules exist)
-  while IFS= read -r cidr; do
-    escaped_cidr="$(regex_escape "${cidr}")"
-    # Match "22 " (port without /tcp) followed by ALLOW and the CIDR
-    if grep -qE "(^|[[:space:]])${SSH_PORT}([[:space:]]+ALLOW[[:space:]]|ALLOW[[:space:]]IN[[:space:]]).*${escaped_cidr}" <<< "${ufw_out}"; then
-      record "FAIL" "ufw: orphaned non-tcp SSH rule (${cidr})" \
-        "${cidr} → port ${SSH_PORT} rule without 'proto tcp' must be removed"
+    # Check for orphaned non-tcp SSH rules from Docker bridges (even if tcp rules exist)
+    while IFS= read -r cidr; do
+      escaped_cidr="$(regex_escape "${cidr}")"
+      # Match "22 " (port without /tcp) followed by ALLOW and the CIDR
+      if grep -qE "(^|[[:space:]])${SSH_PORT}([[:space:]]+ALLOW[[:space:]]|ALLOW[[:space:]]IN[[:space:]]).*${escaped_cidr}" <<< "${ufw_out}"; then
+        record "FAIL" "ufw: orphaned non-tcp SSH rule (${cidr})" \
+          "${cidr} → port ${SSH_PORT} rule without 'proto tcp' must be removed"
+      fi
+    done < <(load_docker_ssh_cidrs)
+  else
+    local bridge_ssh_hit="false"
+    if grep -q "coolify-hardening-ssh-docker-bridge" <<< "${ufw_out}"; then
+      bridge_ssh_hit="true"
     fi
-  done < <(load_docker_ssh_cidrs)
+    while IFS= read -r cidr; do
+      escaped_cidr="$(regex_escape "${cidr}")"
+      if grep -qE "(^|[[:space:]])${SSH_PORT}(/tcp)?([[:space:]]|$).*ALLOW.*${escaped_cidr}" <<< "${ufw_out}"; then
+        bridge_ssh_hit="true"
+      fi
+    done < <(load_docker_ssh_cidrs)
+    if [[ "${bridge_ssh_hit}" == "true" ]]; then
+      record "FAIL" "ufw: no SSH from Docker bridges" "bridge→SSH allow rule present — Coolify-only path active for PAAS=${PAAS}"
+    else
+      record "PASS" "ufw: no SSH from Docker bridges"
+    fi
+  fi
 
   # Coolify dashboard (8000), Soketi (6001), terminal (6002) on Tailscale only.
-  for port_label in "8000:dashboard" "6001:soketi" "6002:terminal"; do
-    local port="${port_label%%:*}" label="${port_label##*:}"
-    if ufw_has_port_on_iface "${port}" "${TAILSCALE_IFACE}"; then
-      record "PASS" "ufw: Coolify ${label} (${port}) on ${TAILSCALE_IFACE}"
-    else
-      record "FAIL" "ufw: Coolify ${label} (${port})" "port ${port} not allowed on ${TAILSCALE_IFACE}"
-    fi
-  done
+  if [[ "${PAAS}" == "coolify" ]]; then
+    for port_label in "8000:dashboard" "6001:soketi" "6002:terminal"; do
+      local port="${port_label%%:*}" label="${port_label##*:}"
+      if ufw_has_port_on_iface "${port}" "${TAILSCALE_IFACE}"; then
+        record "PASS" "ufw: Coolify ${label} (${port}) on ${TAILSCALE_IFACE}"
+      else
+        record "FAIL" "ufw: Coolify ${label} (${port})" "port ${port} not allowed on ${TAILSCALE_IFACE}"
+      fi
+    done
+  fi
 
   if [[ -n "${WAN_IFACE}" ]]; then
     # SSH must not be on WAN
@@ -71,16 +92,18 @@ ufw_check() {
     fi
 
     # Coolify ports must not be on WAN (must only be on tailscale0)
-    for port_label in "8000:dashboard" "6001:soketi" "6002:terminal"; do
-      local port="${port_label%%:*}" label="${port_label##*:}"
-      if ufw_has_port_on_iface "${port}" "${WAN_IFACE}" \
-         || ufw_has_port_anywhere_unscoped "${port}"; then
-        record "FAIL" "ufw: ${label} (${port}) NOT on WAN" \
-          "port ${port} allowed on WAN — must be tailscale0-only"
-      else
-        record "PASS" "ufw: ${label} (${port}) NOT on WAN"
-      fi
-    done
+    if [[ "${PAAS}" == "coolify" ]]; then
+      for port_label in "8000:dashboard" "6001:soketi" "6002:terminal"; do
+        local port="${port_label%%:*}" label="${port_label##*:}"
+        if ufw_has_port_on_iface "${port}" "${WAN_IFACE}" \
+           || ufw_has_port_anywhere_unscoped "${port}"; then
+          record "FAIL" "ufw: ${label} (${port}) NOT on WAN" \
+            "port ${port} allowed on WAN — must be tailscale0-only"
+        else
+          record "PASS" "ufw: ${label} (${port}) NOT on WAN"
+        fi
+      done
+    fi
 
     if is_true "${TUNNEL_MODE}"; then
       if ufw_has_port_on_iface "80" "${WAN_IFACE}" \

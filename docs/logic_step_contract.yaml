@@ -2653,3 +2653,39 @@ entries:
   checks:
   - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::paas_phase5_dispatch
     (setup): delegates to coolify shared'
+- id: LS-DOKPLOY-001
+  script_path: deploy.sh
+  function: phase3_docker_dokploy
+  criticality: orchestration
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::phase3_docker_dokploy
+    (deploy): executes docker/dokploy reconcile flow'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::phase3_docker_dokploy
+    (deploy): executes docker/dokploy reconcile flow'
+- id: LS-DOKPLOY-002
+  script_path: deploy.sh
+  function: phase4_dokploy_access_policy
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::phase4_dokploy_access_policy
+    (deploy): restricts dashboard to tailscale0'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::phase4_dokploy_access_policy
+    (deploy): restricts dashboard to tailscale0'
+- id: LS-DOKPLOY-003
+  script_path: setup.sh
+  function: phase3_docker_dokploy
+  criticality: orchestration
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::phase3_docker_dokploy
+    (setup): executes local docker/dokploy reconcile flow'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::phase3_docker_dokploy
+    (setup): executes local docker/dokploy reconcile flow'
+- id: LS-DOKPLOY-004
+  script_path: setup.sh
+  function: phase4_dokploy_access_policy
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::phase4_dokploy_access_policy
+    (setup): restricts dashboard to tailscale0'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::phase4_dokploy_access_policy
+    (setup): restricts dashboard to tailscale0'

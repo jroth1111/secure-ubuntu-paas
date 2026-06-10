@@ -27,16 +27,22 @@ configure_ufw() {
 
   # Allow Coolify to SSH to the host from Docker bridge CIDRs.
   # Compatibility mode uses broad ranges; strict mode uses discovered bridge CIDRs.
-  for cidr in "${DOCKER_SSH_CIDRS[@]}"; do
-    run ufw allow in proto tcp from "${cidr}" to any port "${SSH_PORT}" comment "coolify-hardening-ssh-docker-bridge"
-  done
+  # Coolify-only: dFlow and Dokploy never SSH from containers to the host, so
+  # the bridge→SSH path stays closed for them (reconciliation above removes
+  # stale coolify-hardening-ssh-docker-bridge rules on PaaS switch).
+  if [[ "${PAAS}" == "coolify" ]]; then
+    for cidr in "${DOCKER_SSH_CIDRS[@]}"; do
+      run ufw allow in proto tcp from "${cidr}" to any port "${SSH_PORT}" comment "coolify-hardening-ssh-docker-bridge"
+    done
+  fi
 
-  # Allow Coolify dashboard, Soketi, and terminal on Tailscale interface only.
-  # UFW default deny blocks external access; these rules make them reachable via VPN.
-  # 8000 = dashboard, 6001 = Soketi real-time, 6002 = terminal (required since beta.336)
-  run ufw allow in on "${TAILSCALE_IFACE}" proto tcp to any port 8000 comment "coolify-hardening-dashboard-tailscale"
-  run ufw allow in on "${TAILSCALE_IFACE}" proto tcp to any port 6001 comment "coolify-hardening-soketi-tailscale"
-  run ufw allow in on "${TAILSCALE_IFACE}" proto tcp to any port 6002 comment "coolify-hardening-terminal-tailscale"
+  # Coolify dashboard/Soketi/terminal on Tailscale only. Dokploy uses port 3000 instead.
+  if [[ "${PAAS}" == "coolify" ]]; then
+    # 8000 = dashboard, 6001 = Soketi real-time, 6002 = terminal (required since beta.336)
+    run ufw allow in on "${TAILSCALE_IFACE}" proto tcp to any port 8000 comment "coolify-hardening-dashboard-tailscale"
+    run ufw allow in on "${TAILSCALE_IFACE}" proto tcp to any port 6001 comment "coolify-hardening-soketi-tailscale"
+    run ufw allow in on "${TAILSCALE_IFACE}" proto tcp to any port 6002 comment "coolify-hardening-terminal-tailscale"
+  fi
 
   if is_true "${TUNNEL_MODE}"; then
     log "Tunnel mode: skipping WAN 80/443 UFW rules (traffic arrives via outbound tunnel)."

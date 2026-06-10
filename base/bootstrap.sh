@@ -48,15 +48,6 @@ source "${SCRIPT_DIR}/../overlays/coolify/modules/binding.sh"
 # shellcheck source=../overlays/coolify/modules/binding_watchdog.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../overlays/coolify/modules/binding_watchdog.sh"
-# shellcheck source=../overlays/dflow/modules/ufw.sh
-# shellcheck disable=SC1091
-source "${SCRIPT_DIR}/../overlays/dflow/modules/ufw.sh"
-# shellcheck source=../overlays/dflow/modules/ssh_access.sh
-# shellcheck disable=SC1091
-source "${SCRIPT_DIR}/../overlays/dflow/modules/ssh_access.sh"
-# shellcheck source=../overlays/dflow/modules/ssh_match_dropin.sh
-# shellcheck disable=SC1091
-source "${SCRIPT_DIR}/../overlays/dflow/modules/ssh_match_dropin.sh"
 # shellcheck source=../overlays/dflow/modules/tailscale_ssh.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../overlays/dflow/modules/tailscale_ssh.sh"
@@ -79,6 +70,9 @@ source "${SCRIPT_DIR}/modules/services.sh"
 # shellcheck source=./modules/kernel_sysctl.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/modules/kernel_sysctl.sh"
+# shellcheck source=./modules/kernel_modules.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/modules/kernel_modules.sh"
 # shellcheck source=./modules/system_limits.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/modules/system_limits.sh"
@@ -136,7 +130,12 @@ DOCKER_USER_ENV_FILE="/etc/default/docker-user-hardening"
 DOCKER_USER_UNIT_FILE="/etc/systemd/system/docker-user-hardening.service"
 APT_AUTO_FILE="/etc/apt/apt.conf.d/20auto-upgrades"
 APT_LOCAL_FILE="/etc/apt/apt.conf.d/52unattended-upgrades-local"
-SYSCTL_DROPIN_FILE="/etc/sysctl.d/99-base-hardening.conf"
+# Sorts after distro defaults like /usr/lib/sysctl.d/99-protect-links.conf
+# (which sets fs.protected_fifos=1); sysctl.d applies files by basename order,
+# last wins, so our hardening must sort last to take effect on boot.
+SYSCTL_DROPIN_FILE="/etc/sysctl.d/99-zzz-hardening.conf"
+# 99-zzz prefix sorts after distro modprobe.d blacklists so our install-rules win.
+KERNEL_MODULES_DROPIN_FILE="/etc/modprobe.d/99-zzz-hardening-modules.conf"
 FAIL2BAN_JAIL_FILE="/etc/fail2ban/jail.d/coolify-hardening.local"
 FAIL2BAN_LOCAL_FILE="/etc/fail2ban/fail2ban.local"
 APPORT_DEFAULT_FILE="/etc/default/apport"
@@ -173,10 +172,6 @@ INSTALL_TAILSCALE="${INSTALL_TAILSCALE:-false}"
 TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"
 TAILSCALE_DIRECT_WAN="${TAILSCALE_DIRECT_WAN:-false}"
 PAAS="${PAAS:-coolify}"
-DFLOW_AUTH_MODE="${DFLOW_AUTH_MODE:-ssh}"
-DFLOW_CONTROL_PUBKEY="${DFLOW_CONTROL_PUBKEY:-}"
-DFLOW_CONTROL_CIDR="${DFLOW_CONTROL_CIDR:-}"
-DFLOW_BESZEL_PORT="${DFLOW_BESZEL_PORT:-45876}"
 STRICT_DOCKER_SSH_CIDRS="${STRICT_DOCKER_SSH_CIDRS:-true}"
 INSECURE_ENV="${INSECURE_ENV:-false}"
 DOCKER_NPROC_HARD="${DOCKER_NPROC_HARD:-8192}"
@@ -331,7 +326,7 @@ unescape_backslash_sequences() {
 
 env_file_key_supported() {
   case "$1" in
-    ADMIN_USER|ADMIN_PUBKEY|DOMAIN|TAILSCALE_CIDR|SSH_PORT|WAN_IFACE|ENABLE_AUTO_REBOOT|AUTO_REBOOT_TIME|UPDATE_PROFILE|JOURNAL_RETENTION|JOURNAL_MAX_USE|TUNNEL_MODE|SWAP_SIZE|TIMEZONE|DRY_RUN|FORCE|UPGRADE_MAIL|BIND_DASHBOARD_TO_TAILSCALE|INSTALL_TAILSCALE|TAILSCALE_AUTH_KEY|TAILSCALE_DIRECT_WAN|STRICT_DOCKER_SSH_CIDRS|INSECURE_ENV|DOCKER_NPROC_HARD|DOCKER_NPROC_SOFT|ALLOWED_PRIVILEGED_CONTAINERS|PAAS|DFLOW_AUTH_MODE|DFLOW_CONTROL_PUBKEY|DFLOW_CONTROL_CIDR|DFLOW_BESZEL_PORT)
+    ADMIN_USER|ADMIN_PUBKEY|DOMAIN|TAILSCALE_CIDR|SSH_PORT|WAN_IFACE|ENABLE_AUTO_REBOOT|AUTO_REBOOT_TIME|UPDATE_PROFILE|JOURNAL_RETENTION|JOURNAL_MAX_USE|TUNNEL_MODE|SWAP_SIZE|TIMEZONE|DRY_RUN|FORCE|UPGRADE_MAIL|BIND_DASHBOARD_TO_TAILSCALE|INSTALL_TAILSCALE|TAILSCALE_AUTH_KEY|TAILSCALE_DIRECT_WAN|STRICT_DOCKER_SSH_CIDRS|INSECURE_ENV|DOCKER_NPROC_HARD|DOCKER_NPROC_SOFT|ALLOWED_PRIVILEGED_CONTAINERS|PAAS)
       return 0
       ;;
     *)
@@ -344,7 +339,7 @@ set_env_file_value() {
   local key="$1"
   local value="$2"
   case "${key}" in
-    ADMIN_USER|ADMIN_PUBKEY|DOMAIN|TAILSCALE_CIDR|SSH_PORT|WAN_IFACE|ENABLE_AUTO_REBOOT|AUTO_REBOOT_TIME|UPDATE_PROFILE|JOURNAL_RETENTION|JOURNAL_MAX_USE|TUNNEL_MODE|SWAP_SIZE|TIMEZONE|DRY_RUN|FORCE|UPGRADE_MAIL|BIND_DASHBOARD_TO_TAILSCALE|INSTALL_TAILSCALE|TAILSCALE_AUTH_KEY|TAILSCALE_DIRECT_WAN|STRICT_DOCKER_SSH_CIDRS|INSECURE_ENV|DOCKER_NPROC_HARD|DOCKER_NPROC_SOFT|ALLOWED_PRIVILEGED_CONTAINERS|PAAS|DFLOW_AUTH_MODE|DFLOW_CONTROL_PUBKEY|DFLOW_CONTROL_CIDR|DFLOW_BESZEL_PORT)
+    ADMIN_USER|ADMIN_PUBKEY|DOMAIN|TAILSCALE_CIDR|SSH_PORT|WAN_IFACE|ENABLE_AUTO_REBOOT|AUTO_REBOOT_TIME|UPDATE_PROFILE|JOURNAL_RETENTION|JOURNAL_MAX_USE|TUNNEL_MODE|SWAP_SIZE|TIMEZONE|DRY_RUN|FORCE|UPGRADE_MAIL|BIND_DASHBOARD_TO_TAILSCALE|INSTALL_TAILSCALE|TAILSCALE_AUTH_KEY|TAILSCALE_DIRECT_WAN|STRICT_DOCKER_SSH_CIDRS|INSECURE_ENV|DOCKER_NPROC_HARD|DOCKER_NPROC_SOFT|ALLOWED_PRIVILEGED_CONTAINERS|PAAS)
       printf -v "${key}" '%s' "${value}"
       ;;
     *)
@@ -613,6 +608,8 @@ setup_logging() {
   # to create missing active targets.
   if getent group syslog >/dev/null 2>&1; then
     install -d -m 0770 -o root -g syslog /var/log
+    chown root:syslog /var/log
+    chmod 0770 /var/log
   else
     install -d -m 0750 /var/log
     warn "Group 'syslog' not found; using fallback /var/log mode 0750."
@@ -840,6 +837,9 @@ main() {
   log "Applying sysctl kernel hardening."
   configure_sysctl
   configure_system_limits
+
+  log "Blocking unused kernel modules."
+  configure_kernel_modules
 
   log "Applying Docker daemon log rotation."
   configure_docker_daemon

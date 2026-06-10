@@ -1,0 +1,10 @@
+version: 1
+id: dokploy
+display_name: "Dokploy"
+depends_on: [docker-host]
+state_namespace: /var/lib/server-hardening/overlays/dokploy
+modules:
+  bootstrap: []
+  validate:
+    - {file: checks/dokploy_check.sh, gate_c: false}
+companion_scripts: []

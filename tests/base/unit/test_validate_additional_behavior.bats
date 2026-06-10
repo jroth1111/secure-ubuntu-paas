@@ -2438,6 +2438,51 @@ SSHD
   assert_json_check_status "${json}" "sysctl: vm.swappiness=10" "PASS"
 }
 
+@test "kernel_modules_check: PASS when all modules blocked and none resident" {
+  KERNEL_MODULES_DROPIN_FILE="$(mktemp)"
+  {
+    for m in dccp sctp rds tipc cramfs freevxfs jffs2 hfs hfsplus; do
+      echo "install ${m} /bin/false"
+    done
+  } > "${KERNEL_MODULES_DROPIN_FILE}"
+  lsmod() { echo "Module Size Used by"; }
+
+  kernel_modules_check
+  local json
+  json="$(emit_validate_results_json)"
+  rm -f "${KERNEL_MODULES_DROPIN_FILE}"
+  assert_json_check_status "${json}" "kernel-modules: unused modules blocked" "PASS"
+  assert_json_check_status "${json}" "kernel-modules: no blocked module resident" "PASS"
+}
+
+@test "kernel_modules_check: FAIL when drop-in missing" {
+  KERNEL_MODULES_DROPIN_FILE="$(mktemp)"
+  rm -f "${KERNEL_MODULES_DROPIN_FILE}"
+
+  kernel_modules_check
+  local json
+  json="$(emit_validate_results_json)"
+  assert_json_check_status "${json}" "kernel-modules: blacklist drop-in" "FAIL"
+}
+
+@test "kernel_modules_check: FAIL when a module is missing or still resident" {
+  KERNEL_MODULES_DROPIN_FILE="$(mktemp)"
+  # Omit 'sctp' to trigger the missing path.
+  {
+    for m in dccp rds tipc cramfs freevxfs jffs2 hfs hfsplus; do
+      echo "install ${m} /bin/false"
+    done
+  } > "${KERNEL_MODULES_DROPIN_FILE}"
+  lsmod() { printf 'Module Size Used by\ndccp 12345 0\n'; }
+
+  kernel_modules_check
+  local json
+  json="$(emit_validate_results_json)"
+  rm -f "${KERNEL_MODULES_DROPIN_FILE}"
+  assert_json_check_status "${json}" "kernel-modules: unused modules blocked" "FAIL"
+  assert_json_check_status "${json}" "kernel-modules: no blocked module resident" "FAIL"
+}
+
 @test "timesync_check: passes when timedatectl reports synchronized NTP" {
   timedatectl() {
     if [[ "$1" == "show" && "$2" == "--property=NTP" ]]; then

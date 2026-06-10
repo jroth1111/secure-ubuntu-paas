@@ -58,6 +58,9 @@ source "${SCRIPT_DIR}/checks/ufw_check.sh"
 # shellcheck source=./checks/sysctl_check.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/checks/sysctl_check.sh"
+# shellcheck source=./checks/kernel_modules_check.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/checks/kernel_modules_check.sh"
 # shellcheck source=./checks/fail2ban_check.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/checks/fail2ban_check.sh"
@@ -148,9 +151,12 @@ source "${SCRIPT_DIR}/../overlays/dflow/checks/dflow_backups_check.sh"
 # shellcheck source=../overlays/dflow/checks/dflow_predeploy_hook_check.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/../overlays/dflow/checks/dflow_predeploy_hook_check.sh"
-# shellcheck source=../overlays/dflow/checks/dflow_ssh_path_check.sh
+# shellcheck source=../overlays/dokploy/dokploy-common.sh
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/../overlays/dflow/checks/dflow_ssh_path_check.sh"
+source "${SCRIPT_DIR}/../overlays/dokploy/dokploy-common.sh"
+# shellcheck source=../overlays/dokploy/checks/dokploy_check.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/../overlays/dokploy/checks/dokploy_check.sh"
 
 
 
@@ -291,6 +297,7 @@ main() {
   docker_daemon_check
   docker_trust_boundary_check
   sysctl_check
+  kernel_modules_check
   fail2ban_check
   auditd_check
   unattended_upgrades_check
@@ -320,7 +327,13 @@ main() {
         dflow_beszel_check
         dflow_backups_check
         dflow_predeploy_hook_check
-        dflow_ssh_path_check
+      fi
+      ;;
+    dokploy)
+      if [[ "${GATE_C_MODE}" == "true" ]]; then
+        record "INFO" "gate-c: dokploy runtime checks" "skipped in --gate-c mode"
+      else
+        dokploy_check
       fi
       ;;
     coolify|*)

@@ -529,6 +529,63 @@ EOF
   [ ! -f "${SYSCTL_DROPIN_FILE}" ]
 }
 
+@test "configure_kernel_modules: writes install rules for unused modules and is idempotent" {
+  KERNEL_MODULES_DROPIN_FILE="$(mktemp)"
+  rm -f "${KERNEL_MODULES_DROPIN_FILE}"
+  lsmod() { echo "Module Size Used by"; }
+
+  run configure_kernel_modules
+  assert_success
+  [ -f "${KERNEL_MODULES_DROPIN_FILE}" ]
+  # Network protocols not covered by the distro net-pf aliases.
+  grep -qx 'install dccp /bin/false' "${KERNEL_MODULES_DROPIN_FILE}"
+  grep -qx 'install sctp /bin/false' "${KERNEL_MODULES_DROPIN_FILE}"
+  grep -qx 'install tipc /bin/false' "${KERNEL_MODULES_DROPIN_FILE}"
+  # Unused filesystems.
+  grep -qx 'install cramfs /bin/false' "${KERNEL_MODULES_DROPIN_FILE}"
+  grep -qx 'install hfsplus /bin/false' "${KERNEL_MODULES_DROPIN_FILE}"
+  # Must NOT block modules Docker/Swarm/snap/cloud-init need.
+  ! grep -qE '^install (squashfs|overlay|vxlan|bridge|vfat|udf|iso9660) ' "${KERNEL_MODULES_DROPIN_FILE}"
+  rm -f "${KERNEL_MODULES_DROPIN_FILE}"
+}
+
+@test "configure_kernel_modules: dry-run writes nothing" {
+  DRY_RUN="true"
+  KERNEL_MODULES_DROPIN_FILE="$(mktemp)"
+  rm -f "${KERNEL_MODULES_DROPIN_FILE}"
+
+  run configure_kernel_modules
+  assert_success
+  assert_output --partial "DRY-RUN"
+  [ ! -f "${KERNEL_MODULES_DROPIN_FILE}" ]
+}
+
+@test "KERNEL_MODULES_DROPIN_FILE: sorts after distro modprobe.d blacklists" {
+  local ours distro="blacklist-rare-network.conf"
+  ours="$(basename "${KERNEL_MODULES_DROPIN_FILE}")"
+  [ "$(printf '%s\n%s\n' "${ours}" "${distro}" | LC_ALL=C sort | tail -1)" = "${ours}" ]
+}
+
+@test "SYSCTL_DROPIN_FILE: sorts after distro 99-protect-links.conf so hardening wins on boot" {
+  # sysctl.d applies files by basename, last wins. /usr/lib/sysctl.d/
+  # 99-protect-links.conf sets fs.protected_fifos=1; our drop-in must sort
+  # strictly after it or the distro default silently overrides hardening.
+  local ours distro="99-protect-links.conf"
+  ours="$(basename "${SYSCTL_DROPIN_FILE}")"
+  # Lexicographically-last of the two must be ours.
+  [ "$(printf '%s\n%s\n' "${ours}" "${distro}" | LC_ALL=C sort | tail -1)" = "${ours}" ]
+}
+
+@test "configure_sysctl: migrates away from the old 99-base-hardening.conf name" {
+  DRY_RUN="true"
+  SYSCTL_DROPIN_FILE="/etc/sysctl.d/99-zzz-hardening.conf"
+  modinfo() { return 1; }
+
+  run configure_sysctl
+  assert_success
+  assert_output --partial "/etc/sysctl.d/99-base-hardening.conf"
+}
+
 @test "configure_ufw: dry-run logs firewall rule reconciliation" {
   DRY_RUN="true"
   SSH_PORT="22"

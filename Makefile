@@ -91,14 +91,14 @@ test-lint-docker: docker-build-tier1
 
 # Tier 0: Unit tests - local (fastest, no Docker)
 test-unit-local: setup-bats
-	bats tests/base/unit/ tests/overlays/coolify/unit/ tests/orchestrator/unit/
+	bats tests/base/unit/ tests/overlays/coolify/unit/ tests/overlays/dflow/unit/ tests/overlays/dokploy/unit/ tests/orchestrator/unit/
 
 # Tier 1: Unit tests in Docker (for CI consistency)
 test-unit-docker: docker-build-tier1
 	$(RUNNER_BATS_TIER1) \
 	  --image $(IMAGE_TIER1) \
 	  --lane unit \
-	  --target /workspace/tests/base/unit/ /workspace/tests/overlays/coolify/unit/ /workspace/tests/orchestrator/unit/ \
+	  --target /workspace/tests/base/unit/ /workspace/tests/overlays/coolify/unit/ /workspace/tests/overlays/dflow/unit/ /workspace/tests/overlays/dokploy/unit/ /workspace/tests/orchestrator/unit/ \
 	  --workspace $(WORKSPACE) \
 	  --artifacts-dir $(ARTIFACTS_DIR)
 

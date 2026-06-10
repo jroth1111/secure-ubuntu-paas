@@ -26,9 +26,15 @@ source "${SCRIPT_DIR}/overlays/coolify/coolify-common.sh"
 # shellcheck source=overlays/dflow/dflow-common.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/overlays/dflow/dflow-common.sh"
+# shellcheck source=overlays/dokploy/dokploy-common.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/overlays/dokploy/dokploy-common.sh"
 # shellcheck source=lib/overlay-loader.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/overlay-loader.sh"
+# shellcheck source=lib/hardening_resume_reconcile.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/hardening_resume_reconcile.sh"
 
 # ── Inputs (populated by flags or prompts) ──────────────────────────────────
 
@@ -50,11 +56,6 @@ APP_DOMAIN_MODE="${APP_DOMAIN_MODE:-}"
 SWAP_SIZE="${SWAP_SIZE:-}"
 SERVER_TIMEZONE="${SERVER_TIMEZONE:-}"
 TAILSCALE_DIRECT_WAN="${TAILSCALE_DIRECT_WAN:-false}"
-DFLOW_AUTH_MODE="${DFLOW_AUTH_MODE:-ssh}"
-DFLOW_CONTROL_PUBKEY_FILE="${DFLOW_CONTROL_PUBKEY_FILE:-}"
-DFLOW_CONTROL_PUBKEY="${DFLOW_CONTROL_PUBKEY:-}"
-DFLOW_CONTROL_CIDR="${DFLOW_CONTROL_CIDR:-}"
-DFLOW_BESZEL_PORT="${DFLOW_BESZEL_PORT:-45876}"
 PRIVATE_TLS_CA="${PRIVATE_TLS_CA:-}"
 ZEROSSL_EAB_KID="${ZEROSSL_EAB_KID:-}"
 ZEROSSL_EAB_KID_FILE="${ZEROSSL_EAB_KID_FILE:-}"
@@ -105,7 +106,8 @@ Run this directly on the server. If all required flags are provided,
 runs non-interactively. If any are missing, prompts for them.
 
 PaaS selection:
-  --paas <coolify|dflow>        Which PaaS to deploy (default: coolify)
+  --paas <coolify|dflow|dokploy>
+                                Which PaaS to deploy (default: coolify)
 
 Required (all):
   --server-ip <ip>              Server public IPv4 address
@@ -116,6 +118,9 @@ Required (all):
 Required (coolify only):
   --domain <fqdn>               Domain name for Coolify
   Cloudflare API token          Provide via CF_API_TOKEN, --cf-api-token-file, or prompt
+
+Optional (dokploy):
+  --domain <fqdn>               Intended public app domain (DNS is operator-managed)
 
 Optional (coolify):
   --cf-api-token-file <path>    File containing Cloudflare API token
@@ -138,12 +143,6 @@ Optional (all):
   --tailscale-direct-wan        Allow WAN UDP 41641 for direct Tailscale paths (optional optimization)
   --no-tailscale-direct-wan     Keep WAN UDP 41641 closed (default; DERP fallback remains available)
   --preflight-only              Run local preflight checks only, then exit
-  --dflow-auth-mode <ssh|tailscale>
-                                dFlow controller attach path (default: ssh)
-  --dflow-control-pubkey-file <path>
-                                dFlow controller public key for auth-mode=ssh
-  --dflow-control-cidr <cidr>   IPv4 CIDR allowed to root SSH for dFlow controller
-  --dflow-beszel-port <port>    Beszel agent TCP port (default: 45876)
   --yes                         Skip confirmation prompts (preflight-only; full setup still requires operator checks)
   -h, --help                    Show this help
 EOF
@@ -180,10 +179,6 @@ parse_args() {
       --zerossl-eab-hmac-file) ZEROSSL_EAB_HMAC_FILE="${2:?--zerossl-eab-hmac-file requires a value}"; shift 2 ;;
       --tailscale-direct-wan) TAILSCALE_DIRECT_WAN="true"; shift ;;
       --no-tailscale-direct-wan) TAILSCALE_DIRECT_WAN="false"; shift ;;
-      --dflow-auth-mode) DFLOW_AUTH_MODE="${2:?--dflow-auth-mode requires a value}"; shift 2 ;;
-      --dflow-control-pubkey-file) DFLOW_CONTROL_PUBKEY_FILE="${2:?--dflow-control-pubkey-file requires a value}"; shift 2 ;;
-      --dflow-control-cidr) DFLOW_CONTROL_CIDR="${2:?--dflow-control-cidr requires a value}"; shift 2 ;;
-      --dflow-beszel-port) DFLOW_BESZEL_PORT="${2:?--dflow-beszel-port requires a value}"; shift 2 ;;
       --preflight-only)  PREFLIGHT_ONLY="true"; shift ;;
       --yes)             AUTO_YES="true"; shift ;;
       -h|--help)         usage; exit 0 ;;
@@ -202,11 +197,14 @@ collect_inputs() {
     dflow)
       collect_dflow_setup_inputs
       ;;
+    dokploy)
+      collect_dokploy_setup_inputs
+      ;;
     coolify)
       collect_common_inputs
       ;;
     *)
-      die "Unsupported PAAS: ${PAAS} (expected coolify or dflow)"
+      die "Unsupported PAAS: ${PAAS} (expected coolify, dflow, or dokploy)"
       ;;
   esac
 }
@@ -215,8 +213,8 @@ collect_inputs() {
 
 validate_inputs() {
   case "${PAAS}" in
-    coolify|dflow) ;;
-    *) die "Unsupported PAAS: ${PAAS} (expected coolify or dflow)" ;;
+    coolify|dflow|dokploy) ;;
+    *) die "Unsupported PAAS: ${PAAS} (expected coolify, dflow, or dokploy)" ;;
   esac
 
   if [[ "${PAAS}" == "coolify" ]]; then
@@ -276,6 +274,9 @@ validate_inputs() {
 
   if [[ "${PAAS}" == "dflow" ]]; then
     finalize_dflow_inputs
+  elif [[ "${PAAS}" == "dokploy" ]]; then
+    finalize_dokploy_inputs
+    [[ -z "${DOMAIN}" || "${DOMAIN}" =~ ${FQDN_RE} ]] || die "Invalid Dokploy public app domain: ${DOMAIN}"
   fi
 
 
@@ -291,9 +292,6 @@ validate_inputs() {
   if [[ "${PAAS}" == "dflow" ]]; then
     local dflow_required=(
       overlays/dflow/dflow-common.sh
-      overlays/dflow/modules/ufw.sh
-      overlays/dflow/modules/ssh_access.sh
-      overlays/dflow/modules/ssh_match_dropin.sh
       overlays/dflow/modules/tailscale_ssh.sh
       overlays/dflow/modules/predeploy_hook.sh
       overlays/dflow/data/dokku-predeploy-resource-check.sh
@@ -302,10 +300,18 @@ validate_inputs() {
       overlays/dflow/checks/dflow_beszel_check.sh
       overlays/dflow/checks/dflow_backups_check.sh
       overlays/dflow/checks/dflow_predeploy_hook_check.sh
-      overlays/dflow/checks/dflow_ssh_path_check.sh
     )
     for f in "${dflow_required[@]}"; do
       [[ -f "${SCRIPT_DIR}/${f}" ]] || die "Required dFlow file not found: ${SCRIPT_DIR}/${f}"
+    done
+  fi
+  if [[ "${PAAS}" == "dokploy" ]]; then
+    local dokploy_required=(
+      overlays/dokploy/dokploy-common.sh
+      overlays/dokploy/checks/dokploy_check.sh
+    )
+    for f in "${dokploy_required[@]}"; do
+      [[ -f "${SCRIPT_DIR}/${f}" ]] || die "Required Dokploy file not found: ${SCRIPT_DIR}/${f}"
     done
   fi
 
@@ -371,8 +377,10 @@ preflight() {
     resolve_app_domain
     cf_verify_private_tls_ca_caa
     pass "Cloudflare API verified (zone: ${CF_ZONE_ID})"
-  else
+  elif [[ "${PAAS}" == "dflow" ]]; then
     pass "dFlow: Cloudflare preflight skipped (controller manages routing)"
+  else
+    pass "Dokploy: Cloudflare preflight skipped (public app DNS is operator-managed)"
   fi
 }
 
@@ -400,10 +408,6 @@ phase1_harden() {
     printf 'TAILSCALE_DIRECT_WAN="%s"\n' "${TAILSCALE_DIRECT_WAN//\"/\\\"}"
     printf 'BIND_DASHBOARD_TO_TAILSCALE="false"\n'
     printf 'PAAS="%s"\n' "${PAAS//\"/\\\"}"
-    printf 'DFLOW_AUTH_MODE="%s"\n' "${DFLOW_AUTH_MODE//\"/\\\"}"
-    printf 'DFLOW_CONTROL_PUBKEY="%s"\n' "${DFLOW_CONTROL_PUBKEY//\"/\\\"}"
-    printf 'DFLOW_CONTROL_CIDR="%s"\n' "${DFLOW_CONTROL_CIDR//\"/\\\"}"
-    printf 'DFLOW_BESZEL_PORT="%s"\n' "${DFLOW_BESZEL_PORT//\"/\\\"}"
   } > "${deploy_env_file}"
   chmod 600 "${deploy_env_file}"
   pass "Environment file written"
@@ -466,6 +470,32 @@ phase2_gates() {
     die "Gate B failed."
   fi
 
+  run_local_generated_script() {
+    local label="$1"
+    shift
+    local script_tmp
+    script_tmp="$(mktemp)" || die "Failed to create temp script for ${label}"
+    "$@" > "${script_tmp}"
+    bash -s < "${script_tmp}" || { rm -f "${script_tmp}"; die "${label} failed."; }
+    rm -f "${script_tmp}"
+  }
+
+  reconcile_resume_hardening_local() {
+    log "Reconciling idempotent hardening state before Gate C..."
+    run_local_generated_script "Base hardening reconcile" hardening_resume_reconcile_script
+    case "${PAAS}" in
+      dokploy)
+        run_local_generated_script "Stale Coolify UFW cleanup" dokploy_remove_stale_coolify_dashboard_ufw_script \
+          || true
+        run_local_generated_script "Dokploy dashboard UFW policy" dokploy_dashboard_ufw_policy_script
+        run_local_generated_script "Dokploy runtime finalize" dokploy_finalize_runtime_script
+        ;;
+    esac
+    pass "Hardening state reconciled for Gate C"
+  }
+
+  reconcile_resume_hardening_local
+
   # Gate C: Validation passes
   # Resume safety: if Docker is already present from a prior partial run, re-apply
   # hardening-owned Docker settings before Gate C validation.
@@ -523,6 +553,7 @@ paas_phase3_dispatch() {
   overlay_topo_sort "${PAAS}"
   case "${PAAS}" in
     dflow)   dflow_phase3_install_shared "$@" ;;
+    dokploy) dokploy_phase3_install_shared "$@" ;;
     coolify) coolify_phase3_docker_coolify_shared "$@" ;;
     *)       die "Unsupported PAAS: ${PAAS}" ;;
   esac
@@ -531,6 +562,7 @@ paas_phase3_dispatch() {
 paas_phase4_dispatch() {
   case "${PAAS}" in
     dflow)   dflow_phase4_routing_shared "$@" ;;
+    dokploy) dokploy_phase4_routing_shared "$@" ;;
     coolify) coolify_phase4_binding_dns_shared "$@" ;;
     *)       die "Unsupported PAAS: ${PAAS}" ;;
   esac
@@ -539,6 +571,7 @@ paas_phase4_dispatch() {
 paas_phase5_dispatch() {
   case "${PAAS}" in
     dflow)   dflow_phase5_verify_shared "${1:-}" ;;
+    dokploy) dokploy_phase5_verify_shared "${1:-}" ;;
     coolify) coolify_phase5_verify_shared "$@" ;;
     *)       die "Unsupported PAAS: ${PAAS}" ;;
   esac
@@ -570,6 +603,39 @@ phase3_docker_coolify() {
     phase3_add_coolify_root_key \
     phase3_fix_host_docker_internal \
     phase3_sync_docker_ssh_cidrs
+}
+
+phase3_docker_dokploy() {
+  phase3_has_docker() { docker version >/dev/null 2>&1; }
+  phase3_install_docker() { coolify_install_docker_engine_script | bash -s; }
+  phase3_start_docker_user() { systemctl enable --now docker-user-hardening.service; }
+  phase3_verify_docker_user() { verify_docker_user_gate_local "$1"; }
+  phase3_has_dokploy() { docker service inspect dokploy >/dev/null 2>&1; }
+  phase3_install_dokploy() { dokploy_install_dokploy_script | bash -s; }
+  phase3_reconcile_docker_daemon() { reconcile_docker_daemon_local; }
+  phase3_restart_docker_user() { systemctl restart docker-user-hardening.service; }
+  phase3_sync_docker_ssh_cidrs() { systemctl start docker-ssh-cidr-sync.service; }
+  phase3_finalize_dokploy_runtime() {
+    local script_tmp
+    script_tmp="$(mktemp)"
+    dokploy_finalize_runtime_script > "${script_tmp}"
+    bash -s < "${script_tmp}"
+    local rc=$?
+    rm -f "${script_tmp}"
+    return "${rc}"
+  }
+
+  paas_phase3_dispatch \
+    phase3_has_docker \
+    phase3_install_docker \
+    phase3_start_docker_user \
+    phase3_verify_docker_user \
+    phase3_has_dokploy \
+    phase3_install_dokploy \
+    phase3_reconcile_docker_daemon \
+    phase3_restart_docker_user \
+    phase3_sync_docker_ssh_cidrs \
+    phase3_finalize_dokploy_runtime
 }
 
 # ── Phase 4: Binding + DNS ─────────────────────────────────────────────────
@@ -656,6 +722,31 @@ phase4_binding_dns() {
     phase4_restore_public_tls
 }
 
+phase4_dokploy_access_policy() {
+  phase4_remove_stale_coolify_dashboard_ufw() {
+    local script_tmp
+    script_tmp="$(mktemp)"
+    dokploy_remove_stale_coolify_dashboard_ufw_script > "${script_tmp}"
+    bash -s < "${script_tmp}"
+    local rc=$?
+    rm -f "${script_tmp}"
+    return "${rc}"
+  }
+  phase4_configure_dokploy_dashboard_ufw() {
+    local script_tmp
+    script_tmp="$(mktemp)"
+    dokploy_dashboard_ufw_policy_script > "${script_tmp}"
+    bash -s < "${script_tmp}"
+    local rc=$?
+    rm -f "${script_tmp}"
+    return "${rc}"
+  }
+
+  paas_phase4_dispatch \
+    phase4_configure_dokploy_dashboard_ufw \
+    phase4_remove_stale_coolify_dashboard_ufw
+}
+
 # ── Phase 5: Verification ─────────────────────────────────────────────────
 
 phase5_fetch_validate_json() { "${SCRIPT_DIR}/base/validate.sh" --json; }
@@ -694,8 +785,12 @@ main() {
     [[ "${DEPLOY_MODE}" == "tunnel" ]] && log "  Private TLS CA: ${PRIVATE_TLS_CA}"
     print_private_tls_ca_notice
     [[ "${CF_TUNNEL_API_TOKEN}" != "${CF_API_TOKEN}" ]] && log "  CF tunnel token: custom"
-  else
+  elif [[ "${PAAS}" == "dflow" ]]; then
     log "  Controller: dFlow (Tailscale SSH)"
+  else
+    log "  Public app ingress: 80/443"
+    [[ -n "${DOMAIN:-}" ]] && log "  App domain: ${DOMAIN}"
+    log "  Dashboard/API: Tailscale port 3000"
   fi
   is_true "${PREFLIGHT_ONLY}" && log "  Mode:      preflight-only (no server changes)"
   confirm "Proceed with deployment?"
@@ -711,6 +806,10 @@ main() {
     dflow)
       paas_phase3_dispatch
       paas_phase4_dispatch
+      ;;
+    dokploy)
+      phase3_docker_dokploy
+      phase4_dokploy_access_policy
       ;;
     coolify)
       phase3_docker_coolify

@@ -3,6 +3,20 @@ configure_docker_ssh_match_dropin() {
   local cidr
   local match_addresses=""
 
+  # Coolify-only: no other PaaS SSHes from containers to the host as root.
+  if [[ "${PAAS}" != "coolify" ]]; then
+    if is_true "${DRY_RUN}"; then
+      log "DRY-RUN: would ensure ${dropin} is absent (PAAS=${PAAS})."
+      return 0
+    fi
+    if [[ -f "${dropin}" ]]; then
+      rm -f "${dropin}"
+      reload_ssh_service || true
+      log "Removed Docker SSH match dropin ${dropin} (not used for PAAS=${PAAS})."
+    fi
+    return 0
+  fi
+
   for cidr in "${DOCKER_SSH_CIDRS[@]}"; do
     if [[ -n "${match_addresses}" ]]; then
       match_addresses+=","

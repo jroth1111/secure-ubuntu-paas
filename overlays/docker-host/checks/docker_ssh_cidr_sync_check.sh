@@ -1,4 +1,21 @@
 docker_ssh_cidr_sync_check() {
+  # The sync machinery exists solely for Coolify's root-over-bridge SSH path.
+  # Any other PaaS must have it absent.
+  if [[ "${PAAS}" != "coolify" ]]; then
+    local leftover=()
+    [[ -f "${DOCKER_SSH_CIDR_SYNC_SCRIPT}" ]] && leftover+=("${DOCKER_SSH_CIDR_SYNC_SCRIPT}")
+    if command -v systemctl >/dev/null 2>&1 \
+      && systemctl is-active --quiet "${DOCKER_SSH_CIDR_SYNC_TIMER}" 2>/dev/null; then
+      leftover+=("${DOCKER_SSH_CIDR_SYNC_TIMER} active")
+    fi
+    if (( ${#leftover[@]} > 0 )); then
+      record "FAIL" "docker-ssh-cidr-sync: absent for PAAS=${PAAS}" "leftover: ${leftover[*]}"
+    else
+      record "PASS" "docker-ssh-cidr-sync: absent for PAAS=${PAAS}"
+    fi
+    return
+  fi
+
   if ! is_true "${STRICT_DOCKER_SSH_CIDRS}"; then
     record "INFO" "docker-ssh-cidr-sync: strict mode" "disabled"
     return

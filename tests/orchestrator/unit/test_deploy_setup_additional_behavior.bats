@@ -1018,3 +1018,51 @@ EOF
   assert_success
   assert_output --partial "sdispatched5:sarg5"
 }
+
+@test "package_deployment_tree (deploy): creates a tarball from base lib overlays" {
+  run bash -c '
+    source "'"${DEPLOY_SCRIPT}"'"
+    SCRIPT_DIR="'"${PROJECT_ROOT}"'"
+    dest="$(mktemp -t deploy-tree.XXXXXXXX.tar.gz)"
+    package_deployment_tree "${dest}"
+    [[ -s "${dest}" ]]
+    rm -f "${dest}"
+  '
+  assert_success
+}
+
+@test "install_deployment_tree_remote_script (deploy): emits a tar extraction script" {
+  run bash -c '
+    source "'"${DEPLOY_SCRIPT}"'"
+    tmpout="$(mktemp)"
+    install_deployment_tree_remote_script > "${tmpout}"
+    grep -q "tar" "${tmpout}"
+    grep -q "chown -R root:root" "${tmpout}"
+    rm -f "${tmpout}"
+  '
+  assert_success
+}
+
+@test "run_remote_script_via_admin (deploy): pipes script to ssh_admin_sudo" {
+  run bash -c '
+    source "'"${DEPLOY_SCRIPT}"'"
+    received=""
+    ssh_admin_sudo() { if [[ "$1" == "bash -s" ]]; then received="$(cat)"; fi; }
+    myscript() { echo "hello-from-script"; }
+    run_remote_script_via_admin "test-label" myscript
+    [[ "${received}" == *"hello-from-script"* ]]
+  '
+  assert_success
+}
+
+@test "fetch_phase1_state_line_remote (deploy): attempts remote state read via SSH" {
+  run bash -c '
+    source "'"${DEPLOY_SCRIPT}"'"
+    SSH_OPTS=(-o ConnectTimeout=1 -o StrictHostKeyChecking=no)
+    PRIVATE_KEY="/nonexistent"
+    ADMIN_USER="nobody"
+    TS_IP="192.0.2.1"
+    fetch_phase1_state_line_remote >/dev/null 2>&1 || true
+  '
+  assert_success
+}

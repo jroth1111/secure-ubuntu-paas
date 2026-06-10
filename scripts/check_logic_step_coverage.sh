@@ -314,13 +314,27 @@ def extract_functions(script_rel: str) -> list[str]:
     script_abs = repo / script_rel
     raw = script_abs.read_text(encoding="utf-8")
     stripped = strip_heredocs(raw)
-    names = sorted(
-        set(
-            m.group(1)
-            for m in re.finditer(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{", stripped, re.M)
-        )
+    names: set[str] = set(
+        m.group(1)
+        for m in re.finditer(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{", stripped, re.M)
     )
-    return names
+    # Follow relative source directives (source "${_dir}/lib/...") so functions
+    # defined in sourced sub-files are included in the inventory.  This covers
+    # scripts like coolify-common.sh that delegate to lib/ and modules/ files.
+    script_dir = script_abs.parent
+    for src_m in re.finditer(r'\bsource\b\s+"?\$\{?_dir\}?/([^\s"\']+)', raw):
+        rel_path = src_m.group(1)
+        if ".." in rel_path:
+            continue  # skip parent-traversing paths (e.g. ../../lib/common.sh)
+        sourced = script_dir / rel_path
+        if sourced.exists():
+            src_raw = sourced.read_text(encoding="utf-8")
+            src_stripped = strip_heredocs(src_raw)
+            names.update(
+                m2.group(1)
+                for m2 in re.finditer(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{", src_stripped, re.M)
+            )
+    return sorted(names)
 
 
 def parse_bats_tests() -> tuple[dict[str, dict[str, str]], dict[str, str]]:

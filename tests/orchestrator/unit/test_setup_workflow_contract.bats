@@ -161,6 +161,7 @@ EOF
     mkdir -p "${tmphome}/.ssh"
     getent() { echo "coolifyadmin:x:1001:1001::${tmphome}:/bin/bash"; }
     report_validation_result() { :; }
+    hardening_resume_reconcile_script() { :; }
 
     phase2_gates
   '
@@ -204,6 +205,7 @@ EOF
     pause_for_operator() { :; }
     getent() { echo "coolifyadmin:x:1001:1001::/tmp/missinghome:/bin/bash"; }
     report_validation_result() { :; }
+    hardening_resume_reconcile_script() { :; }
 
     phase2_gates
   '
@@ -236,6 +238,7 @@ EOF
       [[ "$2" == *"\"fail\":0"* ]]
       report_seen=1
     }
+    hardening_resume_reconcile_script() { :; }
 
     phase2_gates
     [[ -f "${tmpdir}/validate_called" ]]
@@ -281,6 +284,7 @@ EOF
     }
     sleep() { :; }
     report_validation_result() { :; }
+    hardening_resume_reconcile_script() { :; }
 
     phase2_gates
     [[ "$(cat "${timesync_file}")" -eq 2 ]]

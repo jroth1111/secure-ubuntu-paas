@@ -995,10 +995,10 @@ entries:
   function: sync_companion_scripts
   criticality: utility
   behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::sync_companion_scripts:
-    uploads and installs all companion scripts and lib files'
+    uploads deployment tree tarball and extracts once'
   checks:
   - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::sync_companion_scripts:
-    uploads and installs all companion scripts and lib files'
+    uploads deployment tree tarball and extracts once'
 - id: LS-DEP-020
   script_path: deploy.sh
   function: usage
@@ -2667,10 +2667,10 @@ entries:
   function: phase4_dokploy_access_policy
   criticality: security
   behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::phase4_dokploy_access_policy
-    (deploy): restricts dashboard to tailscale0'
+    (deploy): restricts dashboard and swarm ports to tailscale0'
   checks:
   - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::phase4_dokploy_access_policy
-    (deploy): restricts dashboard to tailscale0'
+    (deploy): restricts dashboard and swarm ports to tailscale0'
 - id: LS-DOKPLOY-003
   script_path: setup.sh
   function: phase3_docker_dokploy
@@ -2685,7 +2685,52 @@ entries:
   function: phase4_dokploy_access_policy
   criticality: security
   behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::phase4_dokploy_access_policy
-    (setup): restricts dashboard to tailscale0'
+    (setup): restricts dashboard and swarm ports to tailscale0'
   checks:
   - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::phase4_dokploy_access_policy
-    (setup): restricts dashboard to tailscale0'
+    (setup): restricts dashboard and swarm ports to tailscale0'
+- id: LS-DEP-036
+  script_path: deploy.sh
+  function: package_deployment_tree
+  criticality: utility
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::package_deployment_tree
+    (deploy): creates a tarball from base lib overlays'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::package_deployment_tree
+    (deploy): creates a tarball from base lib overlays'
+- id: LS-DEP-037
+  script_path: deploy.sh
+  function: install_deployment_tree_remote_script
+  criticality: utility
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::install_deployment_tree_remote_script
+    (deploy): emits a tar extraction script'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::install_deployment_tree_remote_script
+    (deploy): emits a tar extraction script'
+- id: LS-DEP-038
+  script_path: deploy.sh
+  function: run_remote_script_via_admin
+  criticality: orchestration
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::run_remote_script_via_admin
+    (deploy): pipes script to ssh_admin_sudo'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::run_remote_script_via_admin
+    (deploy): pipes script to ssh_admin_sudo'
+- id: LS-DEP-039
+  script_path: deploy.sh
+  function: fetch_phase1_state_line_remote
+  criticality: utility
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::fetch_phase1_state_line_remote
+    (deploy): attempts remote state read via SSH'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::fetch_phase1_state_line_remote
+    (deploy): attempts remote state read via SSH'
+- id: LS-DEP-040
+  script_path: deploy.sh
+  function: reconcile_resume_hardening_remote
+  criticality: orchestration
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::reconcile_resume_hardening_remote:
+    runs base and dokploy reconciles'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::reconcile_resume_hardening_remote:
+    runs base and dokploy reconciles'

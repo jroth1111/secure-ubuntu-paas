@@ -1,5 +1,38 @@
 # Ubuntu / Dokploy / Hermes audit handoff
 
+## Continuation verification
+
+The immutable-snapshot Linux unit suite now passes **676/676, exit 0**. All 338
+tracked shell functions have a verified test mapping; workflow consistency,
+shell syntax, error-level shellcheck and active-credential source comparison
+passed. The earlier 76-failure run below is historical, not current acceptance.
+
+Additional fixes: fail-closed Docker privilege inspection, actual DROP-target
+validation, protocol-unspecified WAN SSH detection, correct dry-run dispatch
+for overlay modules, and denial of unverifiable dashboard firewall acceptance.
+Unattended image builds now use a dedicated writable Docker metadata directory
+instead of attempting to write through the hardened service's read-only home.
+The real hardened updater rebuilt, tested, backed up and deployed successfully.
+
+Same-version Pack and Railpack helpers now use a current Go compiler; current
+same-major package managers replace vulnerable cached copies. Fingerprints
+include helper binary hashes and the dependency lock, with component-scoped
+recipes so future compiler patches cannot be silently deduplicated away.
+
+Latest scan: Dokploy **337 HIGH/CRITICAL occurrences, 22 critical, 174 with a
+listed upstream fix** (previous derivative 413/27/250). Other scan totals are
+unchanged. This is not a clean-image claim: remaining language/helper findings
+still need compatibility work, and signed host packages do not yet contain every
+listed upstream fix. No findings were hidden to make the scan green.
+
+Tailscale administrator API independently returned keyExpiryDisabled=true for
+the approved VPS device. A protected receipt is bound to its current node and
+IP; missing CLI expiry fields are not interpreted as disabled. The API key was
+not copied to the VPS. Live validation passed **234/0/9** and Hermes password
+login, protected configuration, frontend assets and blocked public access passed.
+Automatic Docker restarts/required reboots remain approved; no host reboot was
+performed during this continuation.
+
 ## Verified live result
 
 Ubuntu 24.04 (not Debian), running kernel 6.8.0-146-generic; no host reboot

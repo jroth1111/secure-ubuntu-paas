@@ -17,7 +17,7 @@ assert stat.S_ISREG(s.st_mode) and s.st_uid==0 and stat.S_IMODE(s.st_mode)==0o60
 assert json.loads(p.read_text())['isolatedTestsPassed'] is True
 PY
 source_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-install -d -m 0700 /usr/local/lib/hermes-hardening/image
+install -d -m 0700 /usr/local/lib/hermes-hardening/image /var/lib/server-hardening/hermes/docker-config
 for file in Dockerfile patch-python.py patch-node.cjs patch-uv.py smoke.py manifest.py test-image.py; do
   install -m 0600 "${source_dir}/${file}" "/usr/local/lib/hermes-hardening/image/${file}"
 done

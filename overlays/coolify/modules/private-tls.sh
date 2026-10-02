@@ -475,9 +475,9 @@ wait_for_private_tls_ready() {
     local ready_regex="${4:?probe_private_tls_host requires ready regex}"
     local code insecure_code cert_meta cert_subject cert_issuer
 
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 \
+    code="$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 10 \
       --resolve "${probe_host}:443:127.0.0.1" "https://${probe_host}${probe_path}" 2>/dev/null || true)"
-    insecure_code="$(curl -k -s -o /dev/null -w '%{http_code}' --max-time 10 \
+    insecure_code="$(curl --noproxy '*' -k -s -o /dev/null -w '%{http_code}' --max-time 10 \
       --resolve "${probe_host}:443:127.0.0.1" "https://${probe_host}${probe_path}" 2>/dev/null || true)"
     code="${code:-000}"
     insecure_code="${insecure_code:-000}"

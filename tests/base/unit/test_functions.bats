@@ -504,8 +504,9 @@ EOF
   run /bin/bash -c '
     source "'"${SCRIPT}"'"
     command() {
-      if [[ "$1" == "-v" && "$2" == "systemctl" ]]; then
-        return 1
+      if [[ "$1" == "-v" ]]; then
+        [[ "$2" != systemctl ]]
+        return
       fi
       builtin command "$@"
     }
@@ -723,11 +724,11 @@ EOF
     rsyslog_collect_log_targets >/dev/null || true
     stat() {
       if [[ "${1:-}" == "-c" && "${2:-}" == "%U" ]]; then echo "root"; return 0; fi
-      if [[ "${1:-}" == "-c" && "${2:-}" == "%G" ]]; then echo "syslog"; return 0; fi
-      if [[ "${1:-}" == "-c" && "${2:-}" == "%a" ]]; then echo "0770"; return 0; fi
+      if [[ "${1:-}" == "-c" && "${2:-}" == "%G" ]]; then echo "root"; return 0; fi
+      if [[ "${1:-}" == "-c" && "${2:-}" == "%a" ]]; then echo "755"; return 0; fi
       return 0
     }
-    rsyslog_collect_log_targets() { echo "/var/log/auth.log"; }
+    rsyslog_collect_log_targets() { :; }
     su() { return 0; }
     grep() { return 0; }
     assert_rsyslog_posture
@@ -736,6 +737,17 @@ EOF
 }
 
 # ── assert_sshd_effective() ──────────────────────────────────────────────────
+
+@test "rsyslog_collect_log_targets: extracts legacy and RainerScript omfile paths" {
+  local tmpdir="${BATS_TEST_TMPDIR}/rsyslog"
+  mkdir -p "${tmpdir}/rsyslog.d"
+  RSYSLOG_CONFIG_ROOT="${tmpdir}"
+  printf '%s\n' 'auth.* /var/log/auth.log' 'action(type="omfile" file="/var/log/custom.log")' > "${tmpdir}/rsyslog.conf"
+  run rsyslog_collect_log_targets
+  assert_success
+  assert_output --partial /var/log/auth.log
+  assert_output --partial /var/log/custom.log
+}
 
 @test "assert_sshd_effective: correct config passes" {
   ADMIN_USER="testadmin"

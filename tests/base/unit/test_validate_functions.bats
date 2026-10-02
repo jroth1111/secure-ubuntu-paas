@@ -177,7 +177,7 @@ EOF
 }
 
 @test "regex_escape: escapes regex metacharacters" {
-  run regex_escape 'a.b[c]\\d+$'
+  run regex_escape 'a.b[c]\d+$'
   assert_success
   assert_output 'a\.b\[c\]\\d\+\$'
 }

@@ -74,9 +74,8 @@ load '../../helpers/helpers'
   expect_args=""
   expect_input=""
   expect() {
-    expect_args="$*"
-    expect_input="$(cat; printf '.')"
-    expect_input="${expect_input%.}"
+    printf '%s' "$*" > "${BATS_TEST_TMPDIR}/expect-args"
+    cat > "${BATS_TEST_TMPDIR}/expect-input"
     return 0
   }
   security() {
@@ -89,6 +88,9 @@ load '../../helpers/helpers'
     esac
   }
   store_dokploy_swarm_unlock_key "SWMKEY-test"
+  expect_args="$(cat "${BATS_TEST_TMPDIR}/expect-args")"
+  expect_input="$(cat "${BATS_TEST_TMPDIR}/expect-input"; printf '.')"
+  expect_input="${expect_input%.}"
   [[ "${expect_input}" == $'SWMKEY-test\n' ]]
   [[ "${expect_args}" != *SWMKEY-test* ]]
   load_dokploy_swarm_unlock_key
@@ -1148,6 +1150,7 @@ EOF
   run bash -c '
     source "'"${DEPLOY_SCRIPT}"'"
     PAAS="dokploy"
+    ADMIN_PUBKEY='"'"'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyData test@example.com'"'"'
     calls_file="$(mktemp)"
     ssh_admin_sudo() {
       if [[ "$1" == "docker version >/dev/null 2>&1" ]]; then return 0; fi
@@ -1179,9 +1182,9 @@ EOF
   assert_output --partial "ufw delete allow 3000/tcp"
   assert_output --partial "ufw allow in on tailscale0 proto tcp to any port 3000"
   assert_output --partial "ufw deny 3000/tcp"
-  assert_output --partial "ufw allow in on tailscale0 proto tcp to any port 2377"
+  assert_output --partial "ufw delete allow in on tailscale0 proto tcp to any port 2377"
   assert_output --partial "ufw deny 2377/tcp"
-  assert_output --partial "ufw allow in on tailscale0 proto udp to any port 4789"
+  assert_output --partial "ufw delete allow in on tailscale0 proto udp to any port 4789"
   assert_output --partial "ufw deny 4789/udp"
 }
 
@@ -1274,6 +1277,7 @@ EOF
   run bash -c '
     source "'"${SETUP_SCRIPT}"'"
     PAAS="dokploy"
+    ADMIN_PUBKEY='"'"'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyData test@example.com'"'"'
     calls_file="$(mktemp)"
     docker() {
       if [[ "$1" == "version" ]]; then return 0; fi
@@ -1303,9 +1307,9 @@ EOF
   assert_output --partial "ufw delete allow 3000/tcp"
   assert_output --partial "ufw allow in on tailscale0 proto tcp to any port 3000"
   assert_output --partial "ufw deny 3000/tcp"
-  assert_output --partial "ufw allow in on tailscale0 proto tcp to any port 2377"
+  assert_output --partial "ufw delete allow in on tailscale0 proto tcp to any port 2377"
   assert_output --partial "ufw deny 2377/tcp"
-  assert_output --partial "ufw allow in on tailscale0 proto udp to any port 4789"
+  assert_output --partial "ufw delete allow in on tailscale0 proto udp to any port 4789"
   assert_output --partial "ufw deny 4789/udp"
 }
 

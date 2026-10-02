@@ -1,6 +1,6 @@
 coolify_ssh_check() {
   local ssh_dir="/data/coolify/ssh/keys"
-  local coolify_env="/data/coolify/source/.env"
+  local coolify_env="${COOLIFY_ENV_FILE:-/data/coolify/source/.env}"
 
   # Gate-C safe: if Coolify environment is not present yet, treat this as
   # pre-install state and skip SSH key checks.
@@ -105,4 +105,3 @@ coolify_ssh_check() {
     record "INFO" "coolify: container→host SSH" "coolify container not running; skipped"
   fi
 }
-

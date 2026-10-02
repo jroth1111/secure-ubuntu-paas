@@ -113,7 +113,7 @@ setup() {
 
   run configure_coolify_binding
   assert_success
-  assert_output --partial "Dashboard access restricted to Tailscale via UFW on 100.64.1.42:8000"
+  assert_output --partial "DRY-RUN: would verify UFW rules for ports 8000, 6001, and 6002 on tailscale0"
   refute_output --partial "Dashboard accessible at:"
   refute_output --partial "public IP"
 
@@ -122,14 +122,15 @@ setup() {
 
 # ── Error handling ──────────────────────────────────────────────────────────────
 
-@test "configure_coolify_binding: fails when Tailscale IP not detected" {
+@test "configure_coolify_binding: missing UFW cannot claim verified restriction" {
   BIND_DASHBOARD_TO_TAILSCALE="true"
   DETECTED_TAILSCALE_IP=""
   DRY_RUN="false"
 
+  ufw() { return 1; }
   run configure_coolify_binding
   assert_failure
-  assert_output --partial "Failed to detect Tailscale IP"
+  assert_output --partial "UFW"
 }
 
 # ── State file tracking ─────────────────────────────────────────────────────────
@@ -138,27 +139,27 @@ setup() {
   ADMIN_USER="testadmin"
   BIND_DASHBOARD_TO_TAILSCALE="true"
   DETECTED_TAILSCALE_IP="100.64.1.42"
-  DRY_RUN="true"
-  STATE_FILE="$(mktemp)"
-  rm -f "${STATE_FILE}"
+  DRY_RUN="false"
+  STATE_FILE="${BATS_TEST_TMPDIR}/state"
+  STATE_LOCK_FILE="${BATS_TEST_TMPDIR}/state.lock"
 
   run write_state
   assert_success
-  assert_output --partial "tailscale_ip"
-  [ ! -f "${STATE_FILE}" ]
+  run grep '^tailscale_ip=100.64.1.42$' "${STATE_FILE}"
+  assert_success
 }
 
 @test "write_state: includes bind_dashboard_to_tailscale flag" {
   ADMIN_USER="testadmin"
   BIND_DASHBOARD_TO_TAILSCALE="true"
-  DRY_RUN="true"
-  STATE_FILE="$(mktemp)"
-  rm -f "${STATE_FILE}"
+  DRY_RUN="false"
+  STATE_FILE="${BATS_TEST_TMPDIR}/state"
+  STATE_LOCK_FILE="${BATS_TEST_TMPDIR}/state.lock"
 
   run write_state
   assert_success
-  assert_output --partial "bind_dashboard_to_tailscale=true"
-  [ ! -f "${STATE_FILE}" ]
+  run grep '^bind_dashboard_to_tailscale=true$' "${STATE_FILE}"
+  assert_success
 }
 
 # ── CIDR validation ─────────────────────────────────────────────────────────────

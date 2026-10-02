@@ -91,15 +91,27 @@ docker_trust_boundary_check() {
   docker_ps_status=0
   docker_ps_output="$(docker ps -q 2>/dev/null)" || docker_ps_status=$?
   if (( docker_ps_status != 0 )); then
-    record "INFO" "docker-trust: privileged containers" "unable to enumerate running containers"
+    record "FAIL" "docker-trust: privileged containers" "unable to enumerate running containers; inspection cannot be proved"
     return
   fi
 
   local priv_containers
-  priv_containers="$(xargs -r docker inspect --format '{{if .HostConfig.Privileged}}{{.Name}}{{end}}' <<< "${docker_ps_output}" 2>/dev/null \
-    | sed 's|^/||' \
-    | awk 'NF' \
-    | paste -sd, - || true)"
+  local container_id inspected
+  priv_containers=""
+  while IFS= read -r container_id; do
+    [[ -n "${container_id}" ]] || continue
+    if ! inspected="$(docker inspect --format '{{if .HostConfig.Privileged}}{{.Name}}{{end}}' "${container_id}" 2>/dev/null)"; then
+      record "FAIL" "docker-trust: privileged container inspection" "unable to inspect a running container; refusing an empty allowlist result"
+      return
+    fi
+    inspected="${inspected#/}"
+    [[ -n "${inspected}" ]] || continue
+    if [[ ! "${inspected}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+      record "FAIL" "docker-trust: privileged container inspection" "invalid container name in inspection result"
+      return
+    fi
+    priv_containers+="${priv_containers:+,}${inspected}"
+  done <<< "${docker_ps_output}"
   if [[ -z "${priv_containers}" ]]; then
     record "PASS" "docker-trust: privileged containers allowlist" "no privileged containers running"
     return

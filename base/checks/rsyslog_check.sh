@@ -26,6 +26,8 @@ rsyslog_collect_log_targets() {
 }
 
 rsyslog_check() {
+  local rsyslog_rotate="${RSYSLOG_LOGROTATE_FILE:-/etc/logrotate.d/rsyslog}"
+  local ufw_rotate="${UFW_LOGROTATE_FILE:-/etc/logrotate.d/ufw}"
   local mode owner group
   local target q_target target_owner target_group target_mode
   local target_count=0
@@ -104,22 +106,22 @@ rsyslog_check() {
     record "INFO" "rsyslog: configured /var/log targets" "none found in rsyslog config"
   fi
 
-  if [[ -f /etc/logrotate.d/rsyslog ]] \
-    && grep -Eq "^[[:space:]]*create[[:space:]]+640[[:space:]]+${expected_target_owner}[[:space:]]+${expected_target_group}([[:space:]]|$)" /etc/logrotate.d/rsyslog; then
+  if [[ -f "${rsyslog_rotate}" ]] \
+    && grep -Eq "^[[:space:]]*create[[:space:]]+640[[:space:]]+${expected_target_owner}[[:space:]]+${expected_target_group}([[:space:]]|$)" "${rsyslog_rotate}"; then
     record "PASS" "rsyslog: logrotate create directive"
-  elif [[ ! -f /etc/logrotate.d/rsyslog ]]; then
-    record "INFO" "rsyslog: logrotate create directive" "/etc/logrotate.d/rsyslog missing; rsyslog package may be absent"
+  elif [[ ! -f "${rsyslog_rotate}" ]]; then
+    record "INFO" "rsyslog: logrotate create directive" "${rsyslog_rotate} missing; rsyslog package may be absent"
   else
     record "FAIL" "rsyslog: logrotate create directive" \
-      "missing in /etc/logrotate.d/rsyslog (expected create 640 ${expected_target_owner} ${expected_target_group})"
+      "missing in ${rsyslog_rotate} (expected create 640 ${expected_target_owner} ${expected_target_group})"
   fi
 
-  if [[ -f /etc/logrotate.d/ufw ]] \
-    && grep -Eq "^[[:space:]]*create[[:space:]]+640[[:space:]]+${expected_target_owner}[[:space:]]+${expected_target_group}([[:space:]]|$)" /etc/logrotate.d/ufw; then
+  if [[ -f "${ufw_rotate}" ]] \
+    && grep -Eq "^[[:space:]]*create[[:space:]]+640[[:space:]]+${expected_target_owner}[[:space:]]+${expected_target_group}([[:space:]]|$)" "${ufw_rotate}"; then
     record "PASS" "rsyslog: ufw logrotate create directive"
   else
     record "FAIL" "rsyslog: ufw logrotate create directive" \
-      "missing in /etc/logrotate.d/ufw (expected create 640 ${expected_target_owner} ${expected_target_group})"
+      "missing in ${ufw_rotate} (expected create 640 ${expected_target_owner} ${expected_target_group})"
   fi
 
   if [[ "${rsyslog_service_loaded}" == "true" ]] && systemctl is-active --quiet rsyslog 2>/dev/null; then

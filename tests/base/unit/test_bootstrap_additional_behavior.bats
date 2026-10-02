@@ -415,7 +415,10 @@ EOF
   local marker
   marker="$(mktemp)"
   rm -f "${marker}"
-  systemctl() { echo called > "${marker}"; return 0; }
+  systemctl() {
+    if [[ "$1" == list-unit-files ]]; then printf '%s enabled\n' "${@: -1}";
+    else echo called > "${marker}"; fi
+  }
 
   run disable_unused_services
   assert_success
@@ -464,7 +467,7 @@ EOF
 
   discover_docker_ssh_cidrs
   [[ "${DOCKER_SSH_CIDRS[*]}" == *"172.20.0.0/16"* ]]
-  [[ "${DOCKER_SSH_CIDRS[*]}" == *"172.17.0.1/16"* ]]
+  [[ "${DOCKER_SSH_CIDRS[*]}" == *"172.17.0.0/16"* ]]
 }
 
 @test "configure_ssh: dry-run builds hardened config with docker CIDR match" {
@@ -870,9 +873,9 @@ EOF
   assert_success
   run grep -F 'bak.' "${DOCKER_SSH_CIDR_SYNC_SCRIPT}"
   assert_success
-  run grep -F 'ufw --force delete allow in proto tcp from "${old_cidr}" to any port "${ssh_port}" comment "${RULE_COMMENT}"' "${DOCKER_SSH_CIDR_SYNC_SCRIPT}"
+  run grep -F 'ufw --force delete "${ufw_num}"' "${DOCKER_SSH_CIDR_SYNC_SCRIPT}"
   assert_success
-  run grep -F 'ufw --force delete allow from "${old_cidr}" to any port "${ssh_port}" comment "${RULE_COMMENT}"' "${DOCKER_SSH_CIDR_SYNC_SCRIPT}"
+  run grep -F 'index($0, cidr) && index($0, comment)' "${DOCKER_SSH_CIDR_SYNC_SCRIPT}"
   assert_success
   run grep -F 'ufw allow in proto tcp from "${cidr}" to any port "${ssh_port}" comment "${RULE_COMMENT}"' "${DOCKER_SSH_CIDR_SYNC_SCRIPT}"
   assert_success
@@ -1095,7 +1098,9 @@ EOF
   local marker
   marker="$(mktemp)"
   rm -f "${marker}"
-  systemctl() { echo called > "${marker}"; return 0; }
+  systemctl() {
+    if [[ "$1" == restart ]]; then echo called > "${marker}"; else echo loaded; fi
+  }
 
   run configure_rsyslog_targets
   assert_success
@@ -1161,7 +1166,7 @@ EOF
   getent() {
     [[ "${1:-}" == "group" && "${2:-}" == "adm" ]]
   }
-  install() { :; }
+  install() { printf '%s\n' "$*" >> "${chown_log}"; }
   touch() { :; }
   chown() { printf '%s\n' "$*" >> "${chown_log}"; }
   chmod() { :; }
@@ -1171,7 +1176,7 @@ EOF
   run configure_rsyslog_targets
   assert_success
   assert_output --partial "fallback owner root"
-  run grep -F -- 'root:adm /var/log/ufw.log' "${chown_log}"
+  run grep -F -- '-m 0640 -o root -g adm /dev/null /var/log/ufw.log' "${chown_log}"
   assert_success
   run grep -F -- '/etc/logrotate.d/ufw|root|adm' "${directive_log}"
   assert_success
@@ -1200,6 +1205,7 @@ EOF
 }
 
 @test "docker helper readiness functions: converge when Docker and managed rules become ready" {
+  docker_ipv6_disabled_without_listeners() { return 0; }
   sleep() { :; }
 
   systemctl() {
@@ -1238,7 +1244,8 @@ EOF
         '-A SECURE-DOCKER-USER -i eth0 -m comment --comment coolify-hardening-wan-drop -j DROP' \
         '-A SECURE-DOCKER-USER -i docker0 -m comment --comment coolify-hardening-bridge-docker0 -j RETURN' \
         '-A SECURE-DOCKER-USER -i docker_gwbridge -m comment --comment coolify-hardening-bridge-docker-gw -j RETURN' \
-        '-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-unmatched-drop -j DROP'
+        '-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-unmatched-drop -j DROP' \
+        '-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-return -j RETURN'
       return 0
     fi
     return 1
@@ -1418,11 +1425,12 @@ EOF
     TAILSCALE_IFACE="tailscale0"
     WAN_IFACE="eth0"
     TIMEZONE="UTC"
-    JOURNALD_DROPIN="$(mktemp)"
+    JOURNALD_DROPIN_FILE="$(mktemp)"
     AUDIT_RULES_FILE="$(mktemp)"
     APT_AUTO_FILE="$(mktemp)"
     APPORT_DEFAULT_FILE="$(mktemp)"
-    printf "Storage=persistent\n" > "${JOURNALD_DROPIN}"
+    printf "enabled=0\n" > "${APPORT_DEFAULT_FILE}"
+    printf "Storage=persistent\n" > "${JOURNALD_DROPIN_FILE}"
     printf "identity\nsudoers-change\nuser_commands\n" > "${AUDIT_RULES_FILE}"
     printf "APT::Periodic::Unattended-Upgrade \"1\";\n" > "${APT_AUTO_FILE}"
 
@@ -1431,7 +1439,7 @@ EOF
     sshd() { :; }
     ufw() {
       if [[ "$1" == "status" && "${2:-}" == "verbose" ]]; then
-        printf "Status: active\n2222/tcp ALLOW IN on tailscale0\n"
+        printf "Status: active\nDefault: deny (incoming), allow (outgoing), deny (routed)\n2222/tcp on tailscale0 ALLOW IN Anywhere\n"
         return 0
       fi
       printf "Status: active\n"
@@ -1479,7 +1487,7 @@ EOF
 
 @test "on_err: reports failing command context" {
   run on_err 123 "failing-command"
-  assert_failure
+  assert_success
   assert_output --partial "line 123"
   assert_output --partial "failing-command"
 }
@@ -1515,6 +1523,12 @@ EOF
     configure_banner() { :; }
     ensure_admin_access() { :; }
     configure_ssh() { :; }
+    configure_ssh_socket() { :; }
+    configure_docker_ssh_match_dropin() { :; }
+    configure_password_policy() { :; }
+    configure_system_limits() { :; }
+    configure_kernel_modules() { :; }
+    migrate_legacy_state() { :; }
     configure_auditd() { :; }
     configure_apport() { :; }
     configure_sysctl() { :; }
@@ -1532,8 +1546,8 @@ EOF
     configure_docker_ssh_cidr_sync_timer() { :; }
     run_post_checks() { :; }
     generate_report() { :; }
-    get_tailscale_ip() { DETECTED_TAILSCALE_IP=\"100.64.0.10\"; return 0; }
-    tailscale() { [[ \"$1\" == \"ip\" && \"$2\" == \"-4\" ]] && echo \"100.64.0.10\"; }
+    get_tailscale_ip() { DETECTED_TAILSCALE_IP="100.64.0.10"; return 0; }
+    tailscale() { [[ "$1" == "ip" && "$2" == "-4" ]] && echo "100.64.0.10"; }
     main
   '
   assert_success
@@ -1574,6 +1588,12 @@ EOF
     configure_banner() { :; }
     ensure_admin_access() { :; }
     configure_ssh() { :; }
+    configure_ssh_socket() { :; }
+    configure_docker_ssh_match_dropin() { :; }
+    configure_password_policy() { :; }
+    configure_system_limits() { :; }
+    configure_kernel_modules() { :; }
+    migrate_legacy_state() { :; }
     configure_auditd() { :; }
     configure_apport() { :; }
     configure_sysctl() { :; }
@@ -1591,6 +1611,7 @@ EOF
     configure_docker_ssh_cidr_sync_timer() { :; }
     run_post_checks() { :; }
     INSTALL_TAILSCALE="true"
+    generate_report() { :; }
     get_tailscale_ip() { DETECTED_TAILSCALE_IP="100.64.0.10"; echo "100.64.0.10"; }
     main > "${tmp}"
     sent_line="$(grep -n "HARDEN_RESULT_TAILSCALE_IP=100.64.0.10" "${tmp}" | head -n1 | cut -d: -f1)"
@@ -1634,6 +1655,12 @@ EOF
     configure_banner() { :; }
     ensure_admin_access() { :; }
     configure_ssh() { :; }
+    configure_ssh_socket() { :; }
+    configure_docker_ssh_match_dropin() { :; }
+    configure_password_policy() { :; }
+    configure_system_limits() { :; }
+    configure_kernel_modules() { :; }
+    migrate_legacy_state() { :; }
     configure_auditd() { :; }
     configure_apport() { :; }
     configure_sysctl() { :; }
@@ -1694,6 +1721,12 @@ EOF
     configure_banner() { :; }
     ensure_admin_access() { :; }
     configure_ssh() { :; }
+    configure_ssh_socket() { :; }
+    configure_docker_ssh_match_dropin() { :; }
+    configure_password_policy() { :; }
+    configure_system_limits() { :; }
+    configure_kernel_modules() { :; }
+    migrate_legacy_state() { :; }
     configure_auditd() { :; }
     configure_apport() { :; }
     configure_sysctl() { :; }
@@ -1729,7 +1762,7 @@ EOF
   '
   assert_success
   assert_output --partial "apt-get full-upgrade"
-  assert_output --partial "autoremove --purge"
+  assert_output --partial "autoremove for baseline patching"
 }
 
 @test "configure_apport: dry-run updates apport defaults and service state" {
@@ -1779,17 +1812,20 @@ EOF
 @test "ensure_bootloader_embed_safety: callable under non-gpt layouts" {
   run bash -c '
     source "'"${SCRIPT}"'"
-    findmnt() { echo /dev/vda1; }
+    [[ ! -e /dev/hardening-test-disk ]] || exit 1
+    mknod /dev/hardening-test-disk b 240 0
+    findmnt() { echo /dev/hardening-test-disk1; }
     lsblk() {
       if [[ "$1" == "-no" && "$2" == "PKNAME" ]]; then
-        echo vda
+        echo hardening-test-disk
       elif [[ "$1" == "-dn" && "$2" == "-o" && "$3" == "PTTYPE" ]]; then
         echo dos
       else
         return 0
       fi
     }
-    ensure_bootloader_embed_safety || true
+    ensure_bootloader_embed_safety
+    rm /dev/hardening-test-disk
   '
   assert_success
 }
@@ -1849,15 +1885,15 @@ EOF
 @test "retry_apt_noninteractive: retries until apt command succeeds" {
   run bash -c '
     source "'"${SCRIPT}"'"
-    attempts=0
+    mocked_attempts=0
     sleep() { :; }
     run_apt_command() {
-      attempts=$((attempts + 1))
-      (( attempts < 3 )) && return 1
+      mocked_attempts=$((mocked_attempts + 1))
+      (( mocked_attempts < 3 )) && return 1
       return 0
     }
     retry_apt_noninteractive "apt-get full-upgrade" full-upgrade
-    [[ "${attempts}" -eq 3 ]]
+    [[ "${mocked_attempts}" -eq 3 ]]
   '
   assert_success
 }

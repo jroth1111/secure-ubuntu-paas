@@ -324,14 +324,15 @@ cf_delete_dns_records_by_type() {
   local type existing record_id resp
 
   for type in "$@"; do
-    existing="$(cf_api GET "/zones/${CF_ZONE_ID}/dns_records?type=${type}&name=${name}")"
+    existing="$(cf_api GET "/zones/${CF_ZONE_ID}/dns_records?type=${type}&name=${name}")" || return 1
     while IFS= read -r record_id; do
       [[ -n "${record_id}" ]] || continue
-      resp="$(cf_api DELETE "/zones/${CF_ZONE_ID}/dns_records/${record_id}")"
-      cf_expect_success "Cloudflare ${type} record delete (${name})" "${resp}"
+      resp="$(cf_api DELETE "/zones/${CF_ZONE_ID}/dns_records/${record_id}")" || return 1
+      cf_expect_success "Cloudflare ${type} record delete (${name})" "${resp}" || return 1
       log "Deleted conflicting ${type} record: ${name} (${record_id})"
     done < <(printf '%s' "${existing}" | jq -r '.result[]?.id // empty')
   done
+  return 0
 }
 
 cf_upsert_a_record() {

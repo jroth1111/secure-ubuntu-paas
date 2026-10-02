@@ -261,6 +261,7 @@ RULES
     if [[ "${1:-}" == "-t" && "${2:-}" == "filter" && "${3:-}" == "-S" && "${4:-}" == "SECURE-DOCKER-USER" ]]; then
       cat <<'RULES'
 -N SECURE-DOCKER-USER
+-A SECURE-DOCKER-USER -i eth0 -p tcp -m multiport --dports 80,443 -m comment --comment coolify-hardening-wan-web -j ACCEPT
 -A SECURE-DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment coolify-hardening-estab -j RETURN
 -A SECURE-DOCKER-USER -i docker0 -m comment --comment coolify-hardening-bridge-docker0 -j RETURN
 -A SECURE-DOCKER-USER -i eth0 -m comment --comment coolify-hardening-wan-drop -j DROP
@@ -357,7 +358,7 @@ STATUS
   rm -f "${tmp_auditd_conf}"
 }
 
-@test "auditd_check: fails when queue loss exceeds threshold" {
+@test "auditd_check: fails on any nonzero queue loss" {
   IS_CONTAINER="false"
   local tmp_auditd_conf
   tmp_auditd_conf="$(mktemp)"
@@ -388,7 +389,7 @@ RULES
     fi
     if [[ "${1:-}" == "-s" ]]; then
       cat <<'STATUS'
-lost 101
+lost 1
 backlog 7
 STATUS
       return 0
@@ -401,6 +402,18 @@ STATUS
   json="$(emit_validate_results_json)"
   assert_json_check_status "${json}" "auditd: queue loss" "FAIL"
   rm -f "${tmp_auditd_conf}"
+}
+
+@test "tailscale_check: missing CLI fails outside a container" {
+  IS_CONTAINER=false
+  ip() { return 0; }
+  unit_available() { return 1; }
+  command() {
+    if [[ "$1" == -v && "$2" == tailscale ]]; then return 1; fi
+    builtin command "$@"
+  }
+  tailscale_check
+  assert_json_check_status "$(emit_validate_results_json)" 'tailscale: CLI' FAIL
 }
 
 @test "auditd_check: fails when loginuid attribution is mutable" {
@@ -608,6 +621,7 @@ STATUS
 }
 
 @test "docker_user_lifecycle_check: fails when docker-user-hardening unit is missing" {
+  DOCKER_USER_UNIT_FILE="${BATS_TEST_TMPDIR}/absent-unit"
   command() {
     if [[ "${1:-}" == "-v" && "${2:-}" == "docker" ]]; then
       return 0
@@ -712,8 +726,7 @@ STATUS
 
 @test "networkd_wait_online_check: fails when ifupdown is authoritative but systemd-networkd remains active" {
   local apt_helper_mock
-  apt_helper_mock="$(mktemp)"
-  trap 'rm -f "${apt_helper_mock}"' RETURN
+  apt_helper_mock="${BATS_TEST_TMPDIR}/apt-helper"
   cat > "${apt_helper_mock}" <<'EOF'
 #!/usr/bin/env bash
 exit 1

@@ -65,8 +65,8 @@ docker_user_check() {
   local -a expected_bridge_ifaces=(docker0 docker_gwbridge)
   policy_rules="$(iptables -t filter -S "${policy_chain}" 2>/dev/null)" || policy_rules=""
   first_rule="$(awk '$1 == "-A" { print; exit }' <<< "${rules}")"
-  drop_line="$(grep -n "coolify-hardening-wan-drop" <<< "${policy_rules}" | head -1 | cut -d: -f1)"
-  unmatched_drop_line="$(grep -n "coolify-hardening-unmatched-drop" <<< "${policy_rules}" | head -1 | cut -d: -f1)"
+  drop_line="$(grep -n "coolify-hardening-wan-drop" <<< "${policy_rules}" | grep -E -- ' -j DROP([[:space:]]|$)' | head -1 | cut -d: -f1)"
+  unmatched_drop_line="$(grep -n "coolify-hardening-unmatched-drop" <<< "${policy_rules}" | grep -E -- ' -j DROP([[:space:]]|$)' | head -1 | cut -d: -f1)"
   if [[ -z "${management_port}" && -r /etc/default/docker-user-hardening ]]; then
     management_port="$(awk -F= '$1 == "DOCKER_USER_MANAGEMENT_PORT" { print substr($0, index($0, "=") + 1); exit }' /etc/default/docker-user-hardening)"
   fi
@@ -75,7 +75,7 @@ docker_user_check() {
   fi
   if [[ "${management_port}" =~ ^[1-9][0-9]*$ ]] \
     && (( management_port <= 65535 )); then
-    management_drop_line="$(grep -n -F -- "coolify-hardening-management-container-drop" <<< "${policy_rules}" | head -1 | cut -d: -f1 || true)"
+    management_drop_line="$(grep -n -F -- "coolify-hardening-management-container-drop" <<< "${policy_rules}" | grep -E -- ' -j DROP([[:space:]]|$)' | head -1 | cut -d: -f1 || true)"
   else
     management_port=""
   fi
@@ -134,7 +134,7 @@ docker_user_check() {
       "managed jump is not first, policy chain is missing, or terminal drops are not before the unconditional return"
   fi
 
-  if grep -q "coolify-hardening-wan-drop" <<< "${policy_rules}"; then
+  if grep -Eq -- '--comment "?coolify-hardening-wan-drop"?[[:space:]].*-j DROP([[:space:]]|$)' <<< "${policy_rules}"; then
     record "PASS" "docker-user: IPv4 wan-drop"
   else
     record "FAIL" "docker-user: IPv4 wan-drop" "rule missing from ${policy_chain}"
@@ -177,10 +177,10 @@ docker_user_check() {
     }
     policy_rules6="$(ip6tables -t filter -S SECURE-DOCKER-USER6 2>/dev/null)" || policy_rules6=""
     first_rule6="$(awk '$1 == "-A" { print; exit }' <<< "${rules6}")"
-    drop_line6="$(grep -n "coolify-hardening-wan-drop6" <<< "${policy_rules6}" | head -1 | cut -d: -f1)"
-    unmatched_drop_line6="$(grep -n "coolify-hardening-unmatched-drop6" <<< "${policy_rules6}" | head -1 | cut -d: -f1)"
+    drop_line6="$(grep -n "coolify-hardening-wan-drop6" <<< "${policy_rules6}" | grep -E -- ' -j DROP([[:space:]]|$)' | head -1 | cut -d: -f1)"
+    unmatched_drop_line6="$(grep -n "coolify-hardening-unmatched-drop6" <<< "${policy_rules6}" | grep -E -- ' -j DROP([[:space:]]|$)' | head -1 | cut -d: -f1)"
     if [[ -n "${management_port}" ]]; then
-      management_drop_line6="$(grep -n -F -- "coolify-hardening-management-container-drop6" <<< "${policy_rules6}" | head -1 | cut -d: -f1 || true)"
+      management_drop_line6="$(grep -n -F -- "coolify-hardening-management-container-drop6" <<< "${policy_rules6}" | grep -E -- ' -j DROP([[:space:]]|$)' | head -1 | cut -d: -f1 || true)"
     fi
     final_return_line6="$(awk -v chain="SECURE-DOCKER-USER6" \
       '$1 == "-A" && $2 == chain && $0 !~ /--ctstate/ && $0 !~ / -i / && $0 ~ / -j RETURN$/ { print NR; exit }' \
@@ -218,7 +218,7 @@ docker_user_check() {
       record "FAIL" "docker-user: IPv6 control-flow" "managed jump/policy order is unsafe"
     fi
 
-    if grep -q "coolify-hardening-wan-drop6" <<< "${policy_rules6}"; then
+    if grep -Eq -- '--comment "?coolify-hardening-wan-drop6"?[[:space:]].*-j DROP([[:space:]]|$)' <<< "${policy_rules6}"; then
       record "PASS" "docker-user: IPv6 wan-drop6"
     else
       record "FAIL" "docker-user: IPv6 wan-drop6" "rule missing from SECURE-DOCKER-USER6"

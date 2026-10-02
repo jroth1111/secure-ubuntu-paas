@@ -12,7 +12,7 @@ ufw_check() {
       [[ -n "${line}" ]] || continue
       [[ "${line}" == *"on ${TAILSCALE_IFACE}"* ]] && continue
       return 0
-    done < <(grep -E "(^|[[:space:]])${port}/${proto}([[:space:]]|$).*ALLOW IN" <<< "${ufw_out}" || true)
+    done < <(grep -E "(^|[[:space:]])${port}(/${proto})?([[:space:]]|$).*ALLOW IN" <<< "${ufw_out}" || true)
     return 1
   }
   ufw_has_port_non_tailscale_non_docker() {
@@ -26,7 +26,7 @@ ufw_check() {
       done < <(load_docker_ssh_cidrs)
       [[ "${docker_line}" == "true" ]] && continue
       return 0
-    done < <(grep -E "(^|[[:space:]])${port}/${proto}([[:space:]]|$).*ALLOW IN" <<< "${ufw_out}" || true)
+    done < <(grep -E "(^|[[:space:]])${port}(/${proto})?([[:space:]]|$).*ALLOW IN" <<< "${ufw_out}" || true)
     return 1
   }
 

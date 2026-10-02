@@ -39,8 +39,9 @@ configure_coolify_binding() {
       ufw_ok=false
     }
     is_true "${ufw_ok}" && log "UFW rules verified for ports 8000, 6001, and 6002 on ${TAILSCALE_IFACE}."
+    is_true "${ufw_ok}" || die "UFW dashboard restriction could not be verified; refusing acceptance."
   else
-    warn "ufw not found — skipping UFW rule verification."
+    die "UFW not found — cannot verify dashboard restriction."
   fi
 
   # Wait for Coolify to bind port 8000 (up to 30s)
@@ -64,4 +65,3 @@ configure_coolify_binding() {
 
   log "Coolify dashboard UFW restriction verified. External exposure is validated from off-host."
 }
-

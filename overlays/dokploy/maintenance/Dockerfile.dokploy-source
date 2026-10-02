@@ -1,10 +1,25 @@
 ARG NODE_IMAGE=node:24-bookworm
 ARG BASE_IMAGE=dokploy/dokploy:latest
+ARG GO_IMAGE=golang:bookworm
+FROM ${GO_IMAGE} AS build_helpers
+ARG PACK_VERSION
+ARG RAILPACK_VERSION
+ENV CGO_ENABLED=0 GOMAXPROCS=2
+RUN git clone --depth 1 --branch "v${PACK_VERSION}" https://github.com/buildpacks/pack.git /src/pack \
+ && cd /src/pack \
+ && go build -trimpath -ldflags="-s -w -X github.com/buildpacks/pack/pkg/client.Version=${PACK_VERSION}" -o /out/pack . \
+ && /out/pack --version && /out/pack --help >/dev/null
+RUN git clone --depth 1 --branch "v${RAILPACK_VERSION}" https://github.com/railwayapp/railpack.git /src/railpack \
+ && cd /src/railpack \
+ && go build -trimpath -ldflags="-s -w -X main.version=${RAILPACK_VERSION}" -o /out/railpack ./cmd/cli \
+ && /out/railpack --version && /out/railpack --help >/dev/null \
+ && /out/railpack schema >/dev/null
 FROM ${NODE_IMAGE} AS builder
+ARG PNPM_VERSION=10.22.0
 ENV PNPM_HOME=/pnpm
 ENV PATH=/pnpm:$PATH
 ENV NODE_OPTIONS=--max-old-space-size=3072
-RUN corepack enable && corepack prepare pnpm@10.22.0 --activate
+RUN corepack enable && corepack prepare "pnpm@${PNPM_VERSION}" --activate
 RUN apt-get update && apt-get install -y python3 make g++ git pkg-config libsecret-1-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /usr/src/app
 COPY source .
@@ -23,8 +38,13 @@ LABEL local.paas.security-layer="20261002-v2"
 LABEL local.paas.source.commit=${SOURCE_COMMIT}
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get upgrade -y && apt-get remove -y docker-ce docker-ce-rootless-extras containerd.io && apt-get clean && rm -rf /var/lib/apt/lists/*
-RUN rm -rf /app/node_modules /app/.next /app/dist
+RUN rm -rf /app/node_modules /app/.next /app/dist /usr/local/lib/node_modules /root/.cache/node/corepack
 COPY --from=builder /usr/local/bin/node /usr/local/bin/node
+COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
+COPY --from=builder /root/.cache/node/corepack /root/.cache/node/corepack
+COPY --from=builder /usr/src/app/pnpm-lock.yaml /usr/local/lib/paas-source-lock.yaml
+COPY --from=build_helpers /out/pack /usr/local/bin/pack
+COPY --from=build_helpers /out/railpack /usr/local/bin/railpack
 COPY --from=builder /prod/dokploy/.next /app/.next
 COPY --from=builder /prod/dokploy/dist /app/dist
 COPY --from=builder /prod/dokploy/package.json /app/package.json

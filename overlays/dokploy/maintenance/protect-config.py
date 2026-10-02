@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Close the permission window for all app deployment logs, without reading them."""
-import os,pathlib,stat
+import itertools,os,pathlib,stat
 for folder in ['/etc/dokploy/logs','/etc/dokploy/compose','/etc/dokploy/paas-hardening']:
     root=pathlib.Path(folder)
     if not root.exists():continue
     if root.is_symlink() or not root.is_dir():raise SystemExit('Unsafe config root')
-    for path in [root,*root.rglob('*')]:
+    for path in itertools.chain([root],root.rglob('*')):
         s=path.lstat()
         if stat.S_ISLNK(s.st_mode):raise SystemExit('Config symlink refused')
         if not (stat.S_ISDIR(s.st_mode) or stat.S_ISREG(s.st_mode)):raise SystemExit('Unexpected config file type')

@@ -5,7 +5,7 @@ load '../../helpers/helpers'
 
 start_fake_unix_socket() {
   local sock_path="$1"
-  python3 - "${sock_path}" <<'PY' &
+  python3 - "${sock_path}" >/dev/null 2>&1 <<'PY' &
 import os
 import socket
 import sys
@@ -113,7 +113,7 @@ STATE
 }
 
 @test "regex_escape: escapes regex metacharacters" {
-  run regex_escape 'a.b[c]\\d+$'
+  run regex_escape 'a.b[c]\d+$'
   assert_success
   assert_output 'a\.b\[c\]\\d\+\$'
 }
@@ -260,7 +260,22 @@ UFW
   local json
   json="$(emit_validate_results_json)"
   assert_json_check_status "${json}" "ufw: SSH from Docker bridge (10.0.0.0/8)" "FAIL"
-  assert_json_fail_count "${json}" "1"
+  assert_json_check_status "${json}" "ufw: orphaned non-tcp SSH rule (10.0.0.0/8)" "FAIL"
+  assert_json_fail_count "${json}" "3"
+}
+
+@test "ufw_check: protocol-unspecified WAN allow cannot bypass SSH exposure detection" {
+  SSH_PORT=22
+  WAN_IFACE=eth0
+  TAILSCALE_IFACE=tailscale0
+  DOCKER_SSH_CIDRS="172.20.0.0/16"
+  ufw() {
+    printf '%s\n' 'Status: active' 'Default: deny (incoming), allow (outgoing), deny (routed)' \
+      '22/tcp on tailscale0 ALLOW IN Anywhere' '22 ALLOW IN Anywhere' \
+      '22/tcp ALLOW IN 172.20.0.0/16'
+  }
+  ufw_check
+  assert_json_check_status "$(emit_validate_results_json)" 'ufw: SSH NOT on WAN' FAIL
 }
 
 @test "swap_check: reports disabled swap when swap_size is 0" {
@@ -338,6 +353,8 @@ SS
 }
 
 @test "coolify_ssh_check: records FAIL when key directory exists without ssh_key entries" {
+  COOLIFY_ENV_FILE="${BATS_TEST_TMPDIR}/coolify.env"
+  touch "${COOLIFY_ENV_FILE}"
   local key_dir="/data/coolify/ssh/keys"
   if [[ -d "${key_dir}" ]] && compgen -G "${key_dir}/ssh_key@*" >/dev/null; then
     skip "existing Coolify ssh keys present"
@@ -357,6 +374,8 @@ SS
 }
 
 @test "coolify_ssh_check: records PASS when host key path is usable" {
+  COOLIFY_ENV_FILE="${BATS_TEST_TMPDIR}/coolify.env"
+  touch "${COOLIFY_ENV_FILE}"
   local key_dir="/data/coolify/ssh/keys"
   local key_file="${key_dir}/ssh_key@test-$$"
   local auth_file="/root/.ssh/authorized_keys"
@@ -467,6 +486,8 @@ SS
 }
 
 @test "coolify_container_check: records PASS when required containers are healthy" {
+  COOLIFY_ENV_FILE="${BATS_TEST_TMPDIR}/coolify.env"
+  touch "${COOLIFY_ENV_FILE}"
   if [[ ! -d "/data/coolify" ]]; then
     mkdir -p "/data/coolify" 2>/dev/null || skip "unable to create /data/coolify"
   fi
@@ -634,7 +655,7 @@ EOF
   cat > "${tmp_auditd_conf}" <<'EOF'
 max_log_file = 50
 num_logs = 10
-rate_limit = 1000
+rate_limit = 10000
 max_log_file_action = rotate
 disk_full_action = suspend
 disk_error_action = suspend
@@ -662,7 +683,7 @@ RULES
       cat <<'STATUS'
 enabled 2
 loginuid_immutable 1 unlocked
-rate_limit 1000
+rate_limit 10000
 lost 0
 backlog 5
 STATUS
@@ -769,9 +790,9 @@ UFW
   disabled_services_check
   local json
   json="$(emit_validate_results_json)"
-  assert_json_check_status "${json}" "disabled: rpcbind.service (masked)" "PASS"
-  assert_json_check_status "${json}" "disabled: avahi-daemon.service (masked)" "PASS"
-  assert_json_check_status "${json}" "disabled: cups.service (masked)" "PASS"
+  assert_json_check_status "${json}" "disabled: rpcbind (masked)" "PASS"
+  assert_json_check_status "${json}" "disabled: avahi-daemon (masked)" "PASS"
+  assert_json_check_status "${json}" "disabled: cups (masked)" "PASS"
   assert_json_fail_count "${json}" "0"
 }
 
@@ -1186,8 +1207,8 @@ EOF
   local json
   json="$(emit_validate_results_json)"
   assert_json_check_status "${json}" "coolify: registration disabled" "FAIL"
-  assert_json_check_status "${json}" "coolify: instance fqdn" "FAIL"
-  assert_json_fail_count "${json}" "2"
+  assert_json_check_status "${json}" "coolify: instance fqdn" "PASS"
+  assert_json_fail_count "${json}" "1"
 
   rm -rf "${tempdir}"
 }
@@ -1279,7 +1300,7 @@ EOF
       return 0
     fi
     if [[ "${1:-}" == "inspect" ]]; then
-      printf '/coolify-proxy\n/rogue-service\n'
+      if [[ "${@: -1}" == cid-1 ]]; then echo /coolify-proxy; else echo /rogue-service; fi
       return 0
     fi
     return 0
@@ -1294,6 +1315,21 @@ EOF
 
   stop_fake_unix_socket "${sock_pid}"
   rm -rf "${sock_dir}"
+}
+
+@test "docker_trust_boundary_check: Docker inspection failure is fail-closed" {
+  DOCKER_SOCK="${BATS_TEST_TMPDIR}/docker.sock"
+  local sock_pid
+  sock_pid="$(start_fake_unix_socket "${DOCKER_SOCK}")"
+  docker() {
+    if [[ "$1" == ps ]]; then echo abcdef123456; else return 1; fi
+  }
+  docker_trust_boundary_check
+  local json
+  json="$(emit_validate_results_json)"
+  stop_fake_unix_socket "${sock_pid}"
+  assert_json_check_status "${json}" "docker-trust: privileged container inspection" "FAIL"
+  [ "$(json_check_status "${json}" "docker-trust: privileged containers allowlist")" != PASS ]
 }
 
 @test "cloudflared_check: fails when tunnel proxy still references public letsencrypt" {
@@ -1411,7 +1447,7 @@ EOF
     if [[ "${1:-}" == "-v" ]]; then
       case "${2:-}" in
         cloudflared|sysctl) return 0 ;;
-        getent|dig) return 1 ;;
+        getent|dig|openssl|curl) return 1 ;;
       esac
     fi
     builtin command "$@"
@@ -1433,7 +1469,7 @@ EOF
   assert_json_check_status "${json}" "cloudflared: public letsencrypt resolver removed" "FAIL"
   assert_json_check_status "${json}" "cloudflared: catchall route avoids public letsencrypt" "FAIL"
   assert_json_check_status "${json}" "cloudflared: generated Coolify HTTPS routers disabled" "FAIL"
-  assert_json_fail_count "${json}" "3"
+  assert_json_fail_count "${json}" "4"
 
   rm -rf "${tempdir}"
 }
@@ -1670,6 +1706,8 @@ EOF
   cat > "${compose_file}" <<'EOF'
 services:
   traefik:
+    env_file:
+      - .env
     command:
       - '--certificatesresolvers.privatedns.acme.dnschallenge=true'
       - '--certificatesresolvers.privatedns.acme.dnschallenge.provider=cloudflare'
@@ -1983,14 +2021,20 @@ EOF
 }
 
 @test "docker_user_check: records PASS when managed rules are present and tunnel mode has no wan-web bypass" {
+  ip6tables() {
+    local -a args=("$@")
+    args[3]="${args[3]%6}"
+    iptables "${args[@]}" | sed -e 's/DOCKER-USER/DOCKER-USER6/g' \
+      -e 's/secure-ubuntu-paas-docker-user-jump/&6/g' \
+      -e 's/coolify-hardening-[a-z0-9-]*/&6/g'
+  }
   TUNNEL_MODE="true"
   DOCKER_RULES_APPLIED="true"
 
   command() {
     if [[ "${1:-}" == "-v" ]]; then
       case "${2:-}" in
-        iptables|docker|systemctl) return 0 ;;
-        ip6tables) return 1 ;;
+        iptables|ip6tables|docker|systemctl) return 0 ;;
       esac
     fi
     builtin command "$@"
@@ -2159,7 +2203,8 @@ WantedBy=docker.service
 UNIT
   cat > "${DOCKER_USER_SCRIPT}" <<'SCRIPT'
 #!/usr/bin/env bash
-exec 9>/run/lock/docker-user-hardening.lock
+DOCKER_USER_LOCK_FILE="${DOCKER_USER_LOCK_FILE:-/run/lock/docker-user-hardening.lock}"
+exec 9>"${DOCKER_USER_LOCK_FILE}"
 flock -x 9
 SCRIPT
   chmod +x "${DOCKER_USER_SCRIPT}"
@@ -2179,6 +2224,14 @@ SCRIPT
 }
 
 @test "docker_user_lifecycle_check: records PASS when unit wiring and lifecycle are valid" {
+  DOCKER_USER_SCRIPT="${BATS_TEST_TMPDIR}/docker-user-hardening.sh"
+  cat > "${DOCKER_USER_SCRIPT}" <<'SCRIPT'
+#!/usr/bin/env bash
+DOCKER_USER_LOCK_FILE="${DOCKER_USER_LOCK_FILE:-/run/lock/docker-user-hardening.lock}"
+exec 9>"${DOCKER_USER_LOCK_FILE}"
+flock -x 9
+SCRIPT
+  chmod +x "${DOCKER_USER_SCRIPT}"
   local unit_file="/etc/systemd/system/docker-user-hardening.service"
   local backup=""
   local had_unit="false"
@@ -2233,6 +2286,7 @@ Unit=docker-user-hardening-refresh.service
 EOF
 
   systemctl() {
+    if [[ "$*" == 'is-enabled docker-user-hardening.service' ]]; then echo enabled; return 0; fi
     if [[ "${1:-}" == "show" && "${2:-}" == "--property=LoadState" ]]; then
       echo loaded
       return 0
@@ -2312,6 +2366,7 @@ EOF
   docker() { return 0; }
 
   systemctl() {
+    if [[ "$*" == 'is-active --quiet docker.service' ]]; then return 0; fi
     if [[ "${1:-}" == "is-active" && "${2:-}" == "--quiet" && "${3:-}" == "docker-ssh-cidr-sync.timer" ]]; then
       return 0
     fi
@@ -2363,6 +2418,7 @@ EOF
   docker() { return 0; }
 
   systemctl() {
+    if [[ "$*" == 'is-active --quiet docker.service' ]]; then return 0; fi
     if [[ "${1:-}" == "is-active" && "${2:-}" == "--quiet" && "${3:-}" == "docker-ssh-cidr-sync.timer" ]]; then
       return 0
     fi
@@ -2431,6 +2487,7 @@ EOF
 }
 
 @test "docker_user_lifecycle_check: records info in gate-c mode when Docker hardening was not expected" {
+  DOCKER_USER_UNIT_FILE="${BATS_TEST_TMPDIR}/absent-unit"
   GATE_C_MODE="true"
   DOCKER_PRESENT="false"
   DOCKER_RULES_APPLIED="false"
@@ -2531,7 +2588,7 @@ EOF
   docker_ssh_cidr_sync_check
   local json
   json="$(emit_validate_results_json)"
-  assert_json_check_missing "${json}" "docker-ssh-cidr-sync: compatibility fallback cleared"
+  [ -z "$(json_check_status "${json}" "docker-ssh-cidr-sync: compatibility fallback cleared")" ]
   assert_json_fail_count "${json}" "0"
 
   rm -f "${sync_script}"
@@ -2547,6 +2604,8 @@ EOF
 }
 
 @test "fail2ban_check: records PASS when service, jail, ignoreip, and backend are healthy" {
+  FAIL2BAN_LOCAL_FILE="${BATS_TEST_TMPDIR}/fail2ban.local"
+  printf '[Definition]\nallowipv6 = auto\n' > "${FAIL2BAN_LOCAL_FILE}"
   local jail_file="/etc/fail2ban/jail.d/coolify-hardening.local"
   local jail_backup=""
   local had_jail="false"
@@ -2675,17 +2734,27 @@ EOF
 }
 
 @test "rsyslog_check: records PASS when log targets are writable and runtime is healthy" {
+  RSYSLOG_LOGROTATE_FILE="${BATS_TEST_TMPDIR}/rsyslog.rotate"
+  UFW_LOGROTATE_FILE="${BATS_TEST_TMPDIR}/ufw.rotate"
+  printf 'create 640 root adm\n' | tee "${RSYSLOG_LOGROTATE_FILE}" > "${UFW_LOGROTATE_FILE}"
+  local target="${BATS_TEST_TMPDIR}/ufw.log"
+  touch "${target}"
   stat() {
+    if [[ "${3:-}" == "${target}" ]]; then
+      case "$2" in '%U') echo root;; '%G') echo adm;; '%a') echo 640;; esac
+      return 0
+    fi
     if [[ "${1:-}" == "-c" && "${2:-}" == "%U" ]]; then echo root; return 0; fi
     if [[ "${1:-}" == "-c" && "${2:-}" == "%G" ]]; then echo root; return 0; fi
     if [[ "${1:-}" == "-c" && "${2:-}" == "%a" ]]; then echo 755; return 0; fi
     command stat "$@"
   }
   rsyslog_collect_log_targets() {
-    printf '%s\n' "/var/log/ufw.log"
+    printf '%s\n' "${target}"
   }
   su() { return 0; }
   systemctl() {
+    if [[ "$*" == 'show -p LoadState --value rsyslog' ]]; then echo loaded; return 0; fi
     if [[ "${1:-}" == "is-active" && "${2:-}" == "--quiet" && "${3:-}" == "rsyslog" ]]; then
       return 0
     fi
@@ -2714,6 +2783,9 @@ EOF
 }
 
 @test "rsyslog_check: records FAIL when /var/log mode is unsafe and targets are missing" {
+  RSYSLOG_LOGROTATE_FILE="${BATS_TEST_TMPDIR}/rsyslog.rotate"
+  UFW_LOGROTATE_FILE="${BATS_TEST_TMPDIR}/ufw.rotate"
+  touch "${RSYSLOG_LOGROTATE_FILE}" "${UFW_LOGROTATE_FILE}"
   stat() {
     if [[ "${1:-}" == "-c" && "${2:-}" == "%U" ]]; then echo root; return 0; fi
     if [[ "${1:-}" == "-c" && "${2:-}" == "%G" ]]; then echo root; return 0; fi
@@ -2723,8 +2795,11 @@ EOF
   rsyslog_collect_log_targets() {
     printf '%s\n' "/var/log/missing.log"
   }
-  systemctl() { return 1; }
-  grep() { return 1; }
+  systemctl() { if [[ "$*" == 'show -p LoadState --value rsyslog' ]]; then echo loaded; else return 1; fi; }
+  grep() {
+    if [[ "$*" == *"${RSYSLOG_LOGROTATE_FILE}"* || "$*" == *"${UFW_LOGROTATE_FILE}"* ]]; then return 1; fi
+    command grep "$@"
+  }
 
   rsyslog_check
   local json
@@ -2972,8 +3047,7 @@ SSHD
 
 @test "networkd_wait_online_check: passes when ifupdown is authoritative and apt-helper wait-online succeeds" {
   local apt_helper_mock
-  apt_helper_mock="$(mktemp)"
-  trap 'rm -f "${apt_helper_mock}"' RETURN
+  apt_helper_mock="${BATS_TEST_TMPDIR}/apt-helper"
   cat > "${apt_helper_mock}" <<'EOF'
 #!/usr/bin/env bash
 exit 0
@@ -3025,18 +3099,10 @@ EOF
 
 @test "networkd_wait_online_check: fails when tuned networkd provider still fails apt-helper wait-online" {
   local apt_helper_mock
-  apt_helper_mock="$(mktemp)"
+  apt_helper_mock="${BATS_TEST_TMPDIR}/apt-helper"
+  NETWORKD_WAIT_ONLINE_DROPIN="${BATS_TEST_TMPDIR}/wait-online.conf"
   local dropin_backup=""
   local had_dropin="false"
-  trap '
-    if [[ "${had_dropin}" == "true" ]]; then
-      cp "${dropin_backup}" "${NETWORKD_WAIT_ONLINE_DROPIN}" >/dev/null 2>&1 || true
-      rm -f "${dropin_backup}"
-    else
-      rm -f "${NETWORKD_WAIT_ONLINE_DROPIN}"
-    fi
-    rm -f "${apt_helper_mock}"
-  ' RETURN
   cat > "${apt_helper_mock}" <<'EOF'
 #!/usr/bin/env bash
 exit 1
@@ -3128,7 +3194,7 @@ EOF
       return 0
     fi
     if [[ "${1:-}" == "debug" && "${2:-}" == "prefs" ]]; then
-      echo '{"RunSSH":false}'
+      echo '{"RunSSH":false,"AutoUpdate":{"Apply":true}}'
       return 0
     fi
     return 0
@@ -3182,7 +3248,7 @@ if [[ "${1:-}" == "debug" && "${2:-}" == "prefs" ]]; then
   if (( count < 3 )); then
     echo '{}'
   else
-    echo '{"RunSSH":false}'
+    echo '{"RunSSH":false,"AutoUpdate":{"Apply":true}}'
   fi
   exit 0
 fi
@@ -3250,7 +3316,7 @@ EOF
       return 0
     fi
     if [[ "${1:-}" == "debug" && "${2:-}" == "prefs" ]]; then
-      echo '{"RunSSH":false}'
+      echo '{"RunSSH":false,"AutoUpdate":{"Apply":true}}'
       return 0
     fi
     return 0
@@ -3380,6 +3446,9 @@ EOF
 }
 
 @test "main: runs check pipeline and emits JSON summary" {
+  kernel_modules_check() { record "PASS" "modules: ok"; }
+  rsyslog_check() { record "PASS" "rsyslog: ok"; }
+  unattended_upgrades_check() { record "PASS" "updates: ok"; }
   parse_cli_args() { JSON_MODE="true"; }
   detect_container_runtime() { :; }
   load_state_context() { :; }
@@ -3414,6 +3483,7 @@ EOF
 }
 
 @test "main: skips cloudflared runtime checks in gate-c mode" {
+  kernel_modules_check() { record "PASS" "modules: ok"; }
   parse_cli_args() { JSON_MODE="true"; GATE_C_MODE="true"; }
   detect_container_runtime() { :; }
   load_state_context() { :; }
@@ -3555,7 +3625,7 @@ EOF
 @test "tailscale_runssh_pref_value: returns parsed RunSSH preference" {
   tailscale() {
     if [[ "$1" == "debug" && "$2" == "prefs" ]]; then
-      echo '{"RunSSH":false}'
+      echo '{"RunSSH":false,"AutoUpdate":{"Apply":true}}'
       return 0
     fi
     return 1

@@ -18,7 +18,7 @@ setup() {
 
   run validate_inputs
   assert_failure
-  assert_output --partial "requires a protected TAILSCALE_AUTH_KEY_FILE"
+  assert_output --partial "requires a protected TAILSCALE_AUTH_KEY or TAILSCALE_AUTH_KEY_FILE"
 }
 
 @test "validate_inputs: accepts INSTALL_TAILSCALE with auth key" {

@@ -34,7 +34,8 @@ done
   && "$(stat -c '%a:%U:%G' /var/lib/server-hardening/backup-recipient)" == '600:root:root' ]] \
   || { echo 'Provision the protected operator backup recipient first.' >&2; exit 1; }
 install -d -m 0700 /usr/local/lib/paas-hardening /var/lib/server-hardening/paas-images \
-  /var/lib/server-hardening/controlplane-backups /etc/dokploy/paas-hardening
+  /var/lib/server-hardening/controlplane-backups /etc/dokploy/paas-hardening \
+  /var/lib/server-hardening/paas-images/docker-config
 for file in Dockerfile.dokploy-source Dockerfile.postgres security-overrides.json apply-overrides.cjs test-pair.py .dockerignore; do
   install -m 0600 "${source_dir}/${file}" "/usr/local/lib/paas-hardening/${file}"
 done

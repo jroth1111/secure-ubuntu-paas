@@ -1,5 +1,110 @@
 version: 2
 entries:
+- id: LS-RECOVERY-001
+  script_path: deploy.sh
+  function: capture_dokploy_swarm_unlock_handoff_remote
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Dokploy remote handoff and unlock helpers use root-only files and protected stdin'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Dokploy remote handoff and unlock helpers use root-only files and protected stdin'
+- id: LS-RECOVERY-002
+  script_path: deploy.sh
+  function: unlock_dokploy_swarm_remote
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Dokploy remote handoff and unlock helpers use root-only files and protected stdin'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Dokploy remote handoff and unlock helpers use root-only files and protected stdin'
+- id: LS-RECOVERY-003
+  script_path: deploy.sh
+  function: load_dokploy_swarm_unlock_key
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Dokploy Keychain helpers store and load the Swarm key without argv exposure'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Dokploy Keychain helpers store and load the Swarm key without argv exposure'
+- id: LS-RECOVERY-004
+  script_path: deploy.sh
+  function: dokploy_swarm_state_remote
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Dokploy Swarm state and recovery helpers unlock a locked resume'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Dokploy Swarm state and recovery helpers unlock a locked resume'
+- id: LS-RECOVERY-005
+  script_path: deploy.sh
+  function: ensure_dokploy_swarm_unlocked_remote
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Dokploy Swarm state and recovery helpers unlock a locked resume'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Dokploy Swarm state and recovery helpers unlock a locked resume'
+- id: LS-RECOVERY-006
+  script_path: deploy.sh
+  function: docker_audit_runtime_state_remote
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Docker audit remote helpers reconcile and perform a verified reboot'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Docker audit remote helpers reconcile and perform a verified reboot'
+- id: LS-RECOVERY-007
+  script_path: deploy.sh
+  function: reboot_for_docker_audit_remote
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Docker audit remote helpers reconcile and perform a verified reboot'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Docker audit remote helpers reconcile and perform a verified reboot'
+- id: LS-RECOVERY-008
+  script_path: deploy.sh
+  function: reconcile_docker_audit_runtime_remote
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Docker audit remote helpers reconcile and perform a verified reboot'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Docker audit remote helpers reconcile and perform a verified reboot'
+- id: LS-RECOVERY-009
+  script_path: setup.sh
+  function: docker_audit_runtime_state_local
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::setup Docker audit and Swarm helpers fail closed at operator-owned reboot boundaries'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::setup Docker audit and Swarm helpers fail closed at operator-owned reboot boundaries'
+- id: LS-RECOVERY-010
+  script_path: setup.sh
+  function: ensure_dokploy_swarm_unlocked_local
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::setup Docker audit and Swarm helpers fail closed at operator-owned reboot boundaries'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::setup Docker audit and Swarm helpers fail closed at operator-owned reboot boundaries'
+- id: LS-RECOVERY-011
+  script_path: setup.sh
+  function: reconcile_docker_audit_runtime_local
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::setup Docker audit and Swarm helpers fail closed at operator-owned reboot boundaries'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::setup Docker audit and Swarm helpers fail closed at operator-owned reboot boundaries'
+- id: LS-RECOVERY-012
+  script_path: base/modules/services.sh
+  function: repair_netplan_offlink_ipv6_default_route
+  criticality: security
+  behavior_test: 'tests/base/unit/test_bootstrap_additional_behavior.bats::repair_netplan_offlink_ipv6_default_route: literal IPv6 default route is not a local prefix and repair is idempotent'
+  checks:
+  - 'tests/base/unit/test_bootstrap_additional_behavior.bats::repair_netplan_offlink_ipv6_default_route: literal IPv6 default route is not a local prefix and repair is idempotent'
+- id: LS-RECOVERY-013
+  script_path: base/modules/services.sh
+  function: restore_netplan_file
+  criticality: security
+  behavior_test: 'tests/base/unit/test_bootstrap_additional_behavior.bats::restore_netplan_file: restores backup and regenerates network state'
+  checks:
+  - 'tests/base/unit/test_bootstrap_additional_behavior.bats::restore_netplan_file: restores backup and regenerates network state'
+- id: LS-RECOVERY-014
+  script_path: base/modules/kernel_sysctl.sh
+  function: configure_ufw_sysctl_martian_logging
+  criticality: security
+  behavior_test: 'tests/base/unit/test_bootstrap_additional_behavior.bats::configure_ufw_sysctl_martian_logging: prevents UFW from undoing the boot baseline'
+  checks:
+  - 'tests/base/unit/test_bootstrap_additional_behavior.bats::configure_ufw_sysctl_martian_logging: prevents UFW from undoing the boot baseline'
+- id: LS-RECOVERY-015
+  script_path: base/modules/rsyslog.sh
+  function: install_rsyslog_tmpfiles_override
+  criticality: security
+  behavior_test: 'tests/base/unit/test_bootstrap_additional_behavior.bats::install_rsyslog_tmpfiles_override: preserves root-owned non-writable var log across boots'
+  checks:
+  - 'tests/base/unit/test_bootstrap_additional_behavior.bats::install_rsyslog_tmpfiles_override: preserves root-owned non-writable var log across boots'
 - id: LS-DOCKER-001
   script_path: overlays/docker-host/modules/cidrs.sh
   function: add_docker_ssh_cidr
@@ -97,10 +202,10 @@ entries:
   function: configure_coolify_binding
   criticality: security
   behavior_test: 'tests/overlays/coolify/unit/test_dashboard_binding.bats::configure_coolify_binding:
-    fails when Tailscale IP not detected'
+    missing UFW cannot claim verified restriction'
   checks:
-  - 'tests/overlays/coolify/unit/test_dashboard_binding.bats::configure_coolify_binding: fails when
-    Tailscale IP not detected'
+  - 'tests/overlays/coolify/unit/test_dashboard_binding.bats::configure_coolify_binding: missing
+    UFW cannot claim verified restriction'
   - 'tests/overlays/coolify/unit/test_dashboard_binding.bats::configure_coolify_binding: dry-run shows
     planned changes'
 - id: LS-COOLIFY-002
@@ -811,7 +916,7 @@ entries:
     tailscale interface is missing'
   - 'tests/base/unit/test_validate_check_outcomes_robust.bats::tailscale_check: fails when
     BackendState is not Running'
-  - 'tests/base/unit/test_validate_check_outcomes_robust.bats::tailscale_check: only explicit
+  - 'tests/base/unit/test_validate_tailnet_receipt.bats::tailscale_check: only explicit
     disabled node-key expiry passes'
   - 'tests/base/unit/test_validate_check_outcomes_robust.bats::tailscale_check: missing CLI
     fails outside a container'
@@ -2920,20 +3025,16 @@ entries:
   script_path: deploy.sh
   function: dokploy_swarm_unlock_keychain_service
   criticality: security
-  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::dokploy_swarm_unlock_keychain_service
-    and store_dokploy_swarm_unlock_key: keep the handoff external'
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Dokploy Keychain helpers store and load the Swarm key without argv exposure'
   checks:
-  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::dokploy_swarm_unlock_keychain_service
-    and store_dokploy_swarm_unlock_key: keep the handoff external'
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Dokploy Keychain helpers store and load the Swarm key without argv exposure'
 - id: LS-DEP-052
   script_path: deploy.sh
   function: store_dokploy_swarm_unlock_key
   criticality: security
-  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::dokploy_swarm_unlock_keychain_service
-    and store_dokploy_swarm_unlock_key: keep the handoff external'
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Dokploy Keychain helpers store and load the Swarm key without argv exposure'
   checks:
-  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::dokploy_swarm_unlock_keychain_service
-    and store_dokploy_swarm_unlock_key: keep the handoff external'
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::Dokploy Keychain helpers store and load the Swarm key without argv exposure'
 - id: LS-DEP-053
   script_path: deploy.sh
   function: recover_interrupted_phase1_dokploy_remote

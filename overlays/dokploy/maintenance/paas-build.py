@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Scoped, source-rebuilt security images; fail closed on any acceptance error."""
-import fcntl,hashlib,json,os,pathlib,re,secrets,shutil,subprocess,sys,tempfile,time
+import fcntl,hashlib,json,os,pathlib,re,secrets,shutil,subprocess,sys,tempfile,time,urllib.request
 os.umask(0o077)
 component,base=sys.argv[1:3]
 prefix={'dokploy':'dokploy/dokploy:latest@','postgres':'postgres:16@'}
@@ -8,8 +8,18 @@ if component not in prefix or not re.fullmatch(re.escape(prefix[component])+r'sh
 lock=open('/run/lock/paas-image-build.lock','w');fcntl.flock(lock,fcntl.LOCK_EX)
 root=pathlib.Path('/var/lib/server-hardening/paas-images');root.mkdir(mode=0o700,parents=True,exist_ok=True)
 template=pathlib.Path('/usr/local/lib/paas-hardening');statefile=root/(component+'.json')
-def output(*args):return subprocess.check_output(args,text=True,stderr=subprocess.DEVNULL).strip()
-def call(*args,**kwargs):return subprocess.run(args,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,**kwargs)
+def output(*args):
+    try:return subprocess.check_output(args,text=True,stderr=subprocess.DEVNULL).strip()
+    except subprocess.CalledProcessError as error:
+        operation=args[1] if len(args)>1 and re.fullmatch(r'[a-z][a-z0-9-]{0,30}',args[1]) else 'arguments-redacted'
+        (root/(component+'-failed-command.json')).write_text(json.dumps({'program':pathlib.Path(args[0]).name,'operation':operation,'returnCode':error.returncode,'at':int(time.time())}))
+        raise
+def call(*args,**kwargs):
+    try:return subprocess.run(args,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,**kwargs)
+    except subprocess.CalledProcessError as error:
+        operation=args[1] if len(args)>1 and re.fullmatch(r'[a-z][a-z0-9-]{0,30}',args[1]) else 'arguments-redacted'
+        (root/(component+'-failed-command.json')).write_text(json.dumps({'program':pathlib.Path(args[0]).name,'operation':operation,'returnCode':error.returncode,'at':int(time.time())}))
+        raise
 def save(data):
     fd,name=tempfile.mkstemp(prefix='.receipt-',dir=root)
     with os.fdopen(fd,'w') as f:json.dump(data,f);f.flush();os.fsync(f.fileno())
@@ -51,11 +61,12 @@ def bound_keepers(image_id):
     for _,name,candidate_id in sorted(candidates)[:-3]:
         if candidate_id not in protected:call('docker','rm','-f','-v',name)
 files=['Dockerfile.dokploy-source','Dockerfile.postgres','security-overrides.json','apply-overrides.cjs','test-pair.py','.dockerignore']
+recipe_files=['Dockerfile.postgres'] if component=='postgres' else ['Dockerfile.dokploy-source','security-overrides.json','apply-overrides.cjs']
 digest=hashlib.sha256()
 for name in files:
     path=template/name;s=path.lstat()
     if path.is_symlink() or not path.is_file() or s.st_uid!=0 or s.st_mode&0o022:raise RuntimeError('Unsafe image recipe')
-    digest.update(name.encode());digest.update(path.read_bytes())
+    if name in recipe_files:digest.update(name.encode());digest.update(path.read_bytes())
 recipe=digest.hexdigest();day=time.strftime('%Y-%m-%d',time.gmtime())
 old=json.loads(statefile.read_text()) if statefile.exists() else {}
 if old.get('base')==base and old.get('recipe')==recipe and old.get('day')==day:
@@ -86,6 +97,16 @@ if component=='dokploy':
     node_channel='node:'+node_major+'-bookworm';call('docker','pull','-q',node_channel)
     runtime_image=output('docker','image','inspect','--format','{{index .RepoDigests 0}}',node_channel)
     arguments+=['--build-arg','NODE_IMAGE='+runtime_image,'--build-arg','SOURCE_COMMIT='+source_commit]
+    pack_version=output('docker','run','--rm','--network=none','--entrypoint','pack',base,'--version').split('+')[0]
+    railpack_version=output('docker','run','--rm','--network=none','--entrypoint','railpack',base,'--version').split()[-1]
+    if not all(re.fullmatch(r'\d+\.\d+\.\d+',v) for v in [pack_version,railpack_version]):raise RuntimeError('Non-stable build helper version')
+    call('docker','pull','-q','golang:bookworm')
+    go_image=output('docker','image','inspect','--format','{{index .RepoDigests 0}}','golang:bookworm')
+    with urllib.request.urlopen('https://registry.npmjs.org/pnpm',timeout=30) as response:pnpm=json.load(response)
+    versions=[v for v in pnpm['versions'] if re.fullmatch(r'10\.\d+\.\d+',v)]
+    if not versions:raise RuntimeError('No approved stable package-manager version')
+    pnpm_version=max(versions,key=lambda v:tuple(map(int,v.split('.'))))
+    arguments+=['--build-arg','GO_IMAGE='+go_image,'--build-arg','PACK_VERSION='+pack_version,'--build-arg','RAILPACK_VERSION='+railpack_version,'--build-arg','PNPM_VERSION='+pnpm_version]
     dockerfile='Dockerfile.dokploy-source'
 else:
     gosu_version=output('docker','run','--rm','--network=none','--entrypoint','gosu',base,'--version').split()[0]
@@ -105,7 +126,7 @@ if component=='postgres':
 else:
     panel=image;pg=output('docker','service','inspect','--format','{{.Spec.TaskTemplate.ContainerSpec.Image}}','dokploy-postgres')
 call('python3',str(template/'test-pair.py'),panel,pg,timeout=360)
-manifest=output('docker','run','--rm','--network=none','--entrypoint','sh',image,'-c','dpkg-query -W; if command -v node >/dev/null; then node --version; sha256sum /app/dist/server.mjs; fi; if command -v gosu >/dev/null; then gosu --version; fi')
+manifest=output('docker','run','--rm','--network=none','--entrypoint','sh',image,'-c','set -e; dpkg-query -W; if command -v node >/dev/null; then node --version; sha256sum /app/dist/server.mjs /usr/local/bin/pack /usr/local/bin/railpack /usr/local/lib/paas-source-lock.yaml; npm --version; corepack pnpm --version; fi; if command -v gosu >/dev/null; then gosu --version; sha256sum /usr/local/bin/gosu; fi')
 fingerprint=hashlib.sha256((base+recipe+(source_commit or '')+manifest).encode()).hexdigest()
 if old.get('fingerprint')==fingerprint:
     try:

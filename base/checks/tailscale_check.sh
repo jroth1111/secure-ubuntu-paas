@@ -46,6 +46,29 @@ tailscale_check() {
       record "FAIL" "tailscale: IPv4 address" "no Tailscale IPv4 — check auth key and login state"
     fi
 
+    # The CLI does not expose keyExpiryDisabled. Require a protected, fresh
+    # administrator-API receipt bound to this exact node; never infer disabled
+    # expiry from a missing/null expiry timestamp or an online interface.
+    local expiry_receipt="${TAILSCALE_EXPIRY_RECEIPT:-/var/lib/server-hardening/tailscale-key-expiry.json}"
+    local node_id now expiry_disabled
+    node_id="$(tailscale status --json 2>/dev/null | jq -r '.Self.ID // empty' 2>/dev/null || true)"
+    now="$(date +%s)"
+    if [[ -f "${expiry_receipt}" && ! -L "${expiry_receipt}" \
+      && "$(stat -c '%a:%U:%G' "${expiry_receipt}" 2>/dev/null)" == '600:root:root' ]] \
+      && jq -e --arg node "${node_id}" --arg ip "${ts_ip}" --argjson now "${now}" \
+        '.nodeId == $node and ($node|length)>0 and .tailscaleIp == $ip and
+         (.checkedAt|type)=="number" and .checkedAt <= ($now+300) and .checkedAt >= ($now-2592000) and
+         (.keyExpiryDisabled|type)=="boolean"' "${expiry_receipt}" >/dev/null 2>&1; then
+      expiry_disabled="$(jq -r '.keyExpiryDisabled' "${expiry_receipt}")"
+      if [[ "${expiry_disabled}" == true ]]; then
+        record "PASS" "tailscale: node-key expiry disabled" "fresh administrator-API receipt matches the local node"
+      else
+        record "FAIL" "tailscale: node-key expiry disabled" "administrator API reports expiry enabled; unattended access can expire"
+      fi
+    else
+      record "INFO" "tailscale: node-key expiry verification" "no fresh protected administrator-API receipt; CLI absence is not proof"
+    fi
+
     local run_ssh_pref expected_run_ssh="false" expected_label="false"
     run_ssh_pref="$(tailscale_runssh_pref_value 5 1)"
     local auto_update_apply
@@ -89,6 +112,10 @@ tailscale_check() {
       fi
     fi
   else
-    record "INFO" "tailscale: CLI" "tailscale binary not found; skipping state/IP checks"
+    if [[ "${IS_CONTAINER}" == true ]]; then
+      record "INFO" "tailscale: CLI" "tailscale binary not found in container test environment"
+    else
+      record "FAIL" "tailscale: CLI" "tailscale binary not found; cannot prove the management access path"
+    fi
   fi
 }

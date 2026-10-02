@@ -57,7 +57,8 @@ eval "$(declare -f run | sed '1s/^run /_bats_native_run /')"
 restore_test_run_dispatcher() {
   run() {
     case "${BASH_SOURCE[1]:-}" in
-      "${PROJECT_ROOT}/base/"*)
+      "${PROJECT_ROOT}/tests/"*) _bats_native_run "$@" ;;
+      "${PROJECT_ROOT}/"*)
         if declare -F script_run >/dev/null; then script_run "$@"; else _bats_native_run "$@"; fi
         ;;
       *) _bats_native_run "$@" ;;
@@ -247,7 +248,11 @@ assert_json_fail_count() {
   local expected="$2"
   local actual
   actual="$(jq -r '.fail' <<< "${json}")"
-  [[ "${actual}" == "${expected}" ]]
+  if [[ "${actual}" != "${expected}" ]]; then
+    printf 'Expected %s failures, observed %s\n' "${expected}" "${actual}" >&2
+    jq -r '.checks[] | select(.status=="FAIL") | [.check,.detail] | @tsv' <<< "${json}" >&2
+    return 1
+  fi
 }
 
 assert_json_check_status() {
@@ -256,7 +261,11 @@ assert_json_check_status() {
   local expected="$3"
   local actual
   actual="$(json_check_status "${json}" "${check}")"
-  [[ "${actual}" == "${expected}" ]]
+  if [[ "${actual}" != "${expected}" ]]; then
+    printf 'Check %s: expected %s, observed %s\n' "${check}" "${expected}" "${actual:-missing}" >&2
+    jq -r '.checks[] | [.check,.status,.detail] | @tsv' <<< "${json}" >&2
+    return 1
+  fi
 }
 
 assert_json_check_detail_contains() {

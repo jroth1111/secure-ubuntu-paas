@@ -371,7 +371,7 @@ print_private_tls_ca_notice() {
 # Uses globals: SERVER_IP, TS_IP, ADMIN_USER, DEPLOY_MODE, DOMAIN, CF_ZONE_NAME, APP_DOMAIN, TUNNEL_ID, SERVER_TIMEZONE
 summary_box_print_prefixed_text() {
   local first_prefix="$1" continuation_prefix="$2" text="$3"
-  local width=59 prefix available chunk
+  local width=60 prefix available chunk
   prefix="${first_prefix}"
 
   while :; do

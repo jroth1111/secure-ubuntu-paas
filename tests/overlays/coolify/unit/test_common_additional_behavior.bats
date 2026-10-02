@@ -133,7 +133,7 @@ setup() {
 @test "prompt_secret: reads secret from stdin and sets variable" {
   run bash -c '
     source "'"${COMMON_LIB}"'"
-    printf "s3cr3t\n" | prompt_secret TOKEN "Token"
+    prompt_secret TOKEN "Token" <<< "s3cr3t"
     [[ "${TOKEN}" == "s3cr3t" ]]
   '
   assert_success
@@ -242,7 +242,7 @@ setup() {
   assert_output --partial "cdn.coollabs.io/coolify/install.sh"
   assert_output --partial "installer_sha256=\"58132d98fe956d1a16df378fd22250153b6fbc08a84e044d80da3324450a0ca3\""
   assert_output --partial "sha256sum -c -"
-  assert_output --partial "bash \"${tmp}\""
+  assert_output --partial 'bash "${tmp}"'
 }
 
 @test "coolify_reconcile_docker_daemon_script: emits daemon hardening merge logic" {
@@ -284,7 +284,7 @@ setup() {
   assert_output --partial "coolify-private-realtime-https:"
   assert_output --partial "coolify-private-terminal-http:"
   assert_output --partial "coolify-private-terminal-https:"
-  assert_output --partial 'rule: "Host(`ws.${DOMAIN}`)"'
+  assert_output --partial 'rule: "Host(\`ws.${DOMAIN}\`)"'
   assert_output --partial "http://coolify:8080"
   assert_output --partial "http://coolify-realtime:6001"
   assert_output --partial "http://coolify-realtime:6002"
@@ -531,8 +531,8 @@ setup() {
   run bash -c '
     source "'"${COMMON_LIB}"'"
     CF_ZONE_ID="zone-123"
-    deleted=""
-    posted=""
+    deleted="$(mktemp)"
+    posted="$(mktemp)"
     cf_expect_success() { :; }
     log() { :; }
     cf_api() {
@@ -548,11 +548,11 @@ setup() {
           echo "{\"success\":true,\"result\":[]}"
           ;;
         DELETE*)
-          deleted+="${endpoint}"$'\''\n'\''
+          printf "%s\\n" "${endpoint}" >> "${deleted}"
           echo "{\"success\":true}"
           ;;
         POST*)
-          posted="${body}"
+          printf "%s" "${body}" > "${posted}"
           echo "{\"success\":true}"
           ;;
         *)
@@ -561,10 +561,10 @@ setup() {
       esac
     }
     cf_upsert_a_record "app.example.com" "203.0.113.10" "true"
-    grep -q "/zones/zone-123/dns_records/aaaa-1" <<< "${deleted}"
-    grep -q "/zones/zone-123/dns_records/cname-1" <<< "${deleted}"
-    grep -q '"'"'"type":"A"'"'"' <<< "${posted}"
-    grep -q '"'"'"content":"203.0.113.10"'"'"' <<< "${posted}"
+    grep -q "/zones/zone-123/dns_records/aaaa-1" "${deleted}"
+    grep -q "/zones/zone-123/dns_records/cname-1" "${deleted}"
+    grep -q '"'"'"type":"A"'"'"' <<< "$(jq -c . "${posted}")"
+    grep -q '"'"'"content":"203.0.113.10"'"'"' <<< "$(jq -c . "${posted}")"
   '
   assert_success
 }
@@ -573,8 +573,8 @@ setup() {
   run bash -c '
     source "'"${COMMON_LIB}"'"
     CF_ZONE_ID="zone-123"
-    deleted=""
-    posted=""
+    deleted="$(mktemp)"
+    posted="$(mktemp)"
     cf_expect_success() { :; }
     log() { :; }
     cf_api() {
@@ -590,11 +590,11 @@ setup() {
           echo "{\"success\":true,\"result\":[]}"
           ;;
         DELETE*)
-          deleted+="${endpoint}"$'\''\n'\''
+          printf "%s\\n" "${endpoint}" >> "${deleted}"
           echo "{\"success\":true}"
           ;;
         POST*)
-          posted="${body}"
+          printf "%s" "${body}" > "${posted}"
           echo "{\"success\":true}"
           ;;
         *)
@@ -603,10 +603,10 @@ setup() {
       esac
     }
     cf_upsert_cname "*.example.com" "tunnel.example.com"
-    grep -q "/zones/zone-123/dns_records/a-1" <<< "${deleted}"
-    grep -q "/zones/zone-123/dns_records/aaaa-1" <<< "${deleted}"
-    grep -q '"'"'"type":"CNAME"'"'"' <<< "${posted}"
-    grep -q '"'"'"content":"tunnel.example.com"'"'"' <<< "${posted}"
+    grep -q "/zones/zone-123/dns_records/a-1" "${deleted}"
+    grep -q "/zones/zone-123/dns_records/aaaa-1" "${deleted}"
+    grep -q '"'"'"type":"CNAME"'"'"' <<< "$(jq -c . "${posted}")"
+    grep -q '"'"'"content":"tunnel.example.com"'"'"' <<< "$(jq -c . "${posted}")"
   '
   assert_success
 }
@@ -615,7 +615,7 @@ setup() {
   run bash -c '
     source "'"${COMMON_LIB}"'"
     CF_ZONE_ID="zone-123"
-    deleted=""
+    deleted="$(mktemp)"
     cf_expect_success() { :; }
     cf_api() {
       local method="$1" endpoint="$2"
@@ -624,7 +624,7 @@ setup() {
           echo "{\"success\":true,\"result\":[{\"id\":\"rec-1\"},{\"id\":\"rec-2\"}]}"
           ;;
         DELETE*)
-          deleted+="${endpoint}"$'\''\n'\''
+          printf "%s\\n" "${endpoint}" >> "${deleted}"
           echo "{\"success\":true}"
           ;;
         *)
@@ -633,8 +633,8 @@ setup() {
       esac
     }
     cf_delete_dns_records_by_type "app.example.com" AAAA CNAME
-    grep -q "/zones/zone-123/dns_records/rec-1" <<< "${deleted}"
-    grep -q "/zones/zone-123/dns_records/rec-2" <<< "${deleted}"
+    grep -q "/zones/zone-123/dns_records/rec-1" "${deleted}"
+    grep -q "/zones/zone-123/dns_records/rec-2" "${deleted}"
   '
   assert_success
 }
@@ -665,7 +665,7 @@ setup() {
   assert_output --partial ': "${DOMAIN:?DOMAIN is required}"'
   assert_output --partial ': "${DEPLOY_MODE:?DEPLOY_MODE is required}"'
   assert_output --partial "is_registration_enabled = false"
-  assert_output --partial 'if [[ "${DEPLOY_MODE}" == "tunnel" ]]; then'
+  assert_output --partial 'sql_fqdn=""'
   assert_output --partial "SELECT COUNT(*) INTO total_rows FROM instance_settings;"
   assert_output --partial "Expected exactly one instance_settings row"
   assert_output --partial "WHERE id = (SELECT id FROM instance_settings ORDER BY id LIMIT 1);"
@@ -752,7 +752,7 @@ PY
   assert_success
   assert_output --partial "0 failures"
 
-  run report_validation_result "Gate X" '{"fail":2,"checks":[{\"status\":\"FAIL\"}]}' "boom"
+  run report_validation_result "Gate X" '{"fail":2,"checks":[{"status":"FAIL"}]}' "boom"
   assert_failure
   assert_output --partial "reported 2 failures"
 }
@@ -997,7 +997,7 @@ PY
     SERVER_IP="203.0.113.10"
     DOMAIN="vps.example.com"
     sleep() { :; }
-    curl() { echo "200"; }
+    curl() { if [[ "$*" == *"https://vps.example.com"* ]]; then echo 000; else echo 200; fi; }
     coolify_phase5_fetch_pusher_app_key() { echo "pusher-key"; }
     coolify_phase5_probe_websocket_code() { echo "101"; }
     fetch_validate_json() { echo "{\"fail\":0,\"checks\":[]}"; }
@@ -1194,9 +1194,9 @@ EOF
     print_deployment_summary
   '
   assert_success
-  assert_output --partial "Dashboard URL    : https://vps.example.com"
+  assert_output --partial "Dashboard URL   : https://vps.example.com"
   assert_output --partial "Open https://vps.example.com and create your Coolify admin account."
-  assert_output --partial "Private dashboard/websocket TLS is already configured for https://vps.example.com and wss://ws.vps.example.com."
+  assert_output --partial "Private dashboard/websocket TLS is already configured for https://vps.example.com and wss://ws.vps.example.com using letsencrypt."
   assert_output --partial "For each app deployment behind the wildcard route:"
   assert_output --partial "Use http:// for the app's Coolify domain entry; Cloudflare adds TLS at the edge."
   refute_output --partial "New apps will get  http://appname.example.com"
@@ -1214,8 +1214,8 @@ EOF
     print_private_tls_ca_notice
   '
   assert_success
-  assert_output --partial "WARN Private TLS fallback selected: ZeroSSL"
-  assert_output --partial "use ZeroSSL instead of Let'\''s Encrypt for vps.example.com and ws.vps.example.com"
+  assert_output --partial "WARN: Private TLS fallback selected: ZeroSSL"
+  assert_output --partial "use ZeroSSL instead of Let's Encrypt for vps.example.com and ws.vps.example.com"
   assert_output --partial "Required secrets: ZeroSSL EAB kid + ZeroSSL EAB hmac"
   assert_output --partial "CAA records exist, they must authorize sectigo.com"
 }
@@ -1235,8 +1235,8 @@ EOF
       cat <<EOF
 APP_ENV=production
 
-PUSHER_APP_KEY=old-key
-PUSHER_APP_KEY=new-key
+old-key
+new-key
 EOF
     }
     coolify_phase5_fetch_pusher_app_key
@@ -1311,9 +1311,9 @@ EOF
   assert_output --partial 'coolify-private-tls-renew.timer'
   assert_output --partial 'certFile: ${traefik_certificate_dir}/fullchain.pem'
   assert_output --partial 'private_tls_dir = Path(sys.argv[2])'
-  assert_output --partial 'mount_line = f"      - {private_tls_dir}:/etc/traefik/private-tls:ro\\n"'
-  assert_output --partial '/data/coolify/proxy/dynamic/.coolify-private-dashboard.backup'
-  assert_output --partial '/data/coolify/proxy/dynamic/.coolify-private-dashboard.absent'
+  assert_output --partial 'mount_line = f"      - {private_tls_dir}:/etc/traefik/private-tls:ro\n"'
+  assert_output --partial '${dynamic_dir}/.coolify-private-dashboard.backup'
+  assert_output --partial '${dynamic_dir}/.coolify-private-dashboard.absent'
   assert_output --partial "reconcile_private_tls_compose() {"
   assert_output --partial 'service_start = next((idx for idx, line in enumerate(lines) if re.match(r"^  traefik:\s*$", line)), None)'
   assert_output --partial 'resolver_flag_pattern = re.compile(r"^ {6}- '\''?--certificatesresolvers\.privatedns\..*'\''?\s*$")'
@@ -1328,7 +1328,8 @@ EOF
   assert_output --partial 'for _ in $(seq 1 30); do'
   assert_output --partial 'Public Coolify HTTPS routers remained in ${coolify_dynamic_file}'
   assert_output --partial 'Public Traefik HTTPS routes/resolvers remained in ${dynamic_dir}'
-  assert_output --partial 'dashboard_code_insecure="$(curl -k -s -o /dev/null -w '\''%{http_code}'\'' --max-time 10 \'
+  assert_output --partial 'insecure_code="$(curl'
+  assert_output --partial '--noproxy'
   assert_output --partial 'probe_private_tls_host() {'
   assert_output --partial "Private TLS certificates ready for \${host} and \${ws_host}"
   assert_output --partial 'Waiting for trusted private TLS on ${host}: route is up behind untrusted cert'
@@ -1349,7 +1350,7 @@ EOF
   assert_output --partial 'reconcile_public_tls_compose() {'
   assert_output --partial '--certificatesresolvers.letsencrypt.acme.httpchallenge=true'
   assert_output --partial '--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=http'
-  assert_output --partial 'Public app TLS restored; management routes remain private'
+  assert_output --partial 'Public app TLS restored; Coolify management routes remain private'
   assert_output --partial 'rm -f "${private_route_file}" "${private_route_backup_file}" "${private_route_absent_marker}" "${env_file}"'
-  assert_output --partial 'Public dashboard TLS restored for ${DOMAIN}'
+  refute_output --partial 'Public dashboard TLS restored for ${DOMAIN}'
 }

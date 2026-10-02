@@ -1,5 +1,25 @@
 # Ubuntu / Dokploy / Hermes audit handoff
 
+## 2026-10-03 native compiler continuation
+
+Rebuilt esbuild from the exact installed stable upstream version with the
+current stable Go compiler. Native discovery refuses prereleases and does not
+follow symlinks. Upstream logger/helper tests passed; JavaScript, TypeScript and
+JSX transform output matched the original binaries byte for byte. The compiled
+replacement keeps the same JavaScript/API version, and its source commit,
+compiler version and hash are recorded in the candidate image/fingerprint.
+
+The real hardened updater passed the candidate build, dependency-floor checks,
+isolated database restore and authenticated API acceptance, encrypted backup and
+production rollout. Latest Dokploy scan: **271 HIGH/CRITICAL occurrences, 19
+critical, 108 with listed upstream fixes** (previously 296/21/133). PostgreSQL
+remained unchanged. Host and other component totals are unchanged.
+Live validation: **234 PASS, 0 FAIL, 9 INFO**, no failed systemd units. Hermes
+authenticated config/session, 14 frontend assets and blocked public port passed.
+Two native-discovery regression tests passed; Python compile, shell syntax and
+active-credential source comparison passed. Remaining compiler/Go dependency
+and application-major/prerelease findings have not been declared fixed.
+
 ## 2026-10-03 package-manager continuation
 
 Corrected an upstream project pin that was reactivating pnpm 10.22 despite a

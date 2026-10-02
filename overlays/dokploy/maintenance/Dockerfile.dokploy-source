@@ -31,6 +31,12 @@ ENV NODE_ENV=production
 RUN pnpm --filter=@dokploy/server build && pnpm --filter=./apps/dokploy run build
 RUN pnpm --filter=./apps/dokploy --prod deploy --legacy /prod/dokploy
 RUN cp -R apps/dokploy/.next /prod/dokploy/.next && cp -R apps/dokploy/dist /prod/dokploy/dist
+FROM ${GO_IMAGE} AS native_compilers
+ENV CGO_ENABLED=0 GOMAXPROCS=2
+RUN apt-get update && apt-get install -y python3 && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /prod/dokploy/node_modules /modules
+COPY rebuild-esbuild.py /usr/local/lib/rebuild-esbuild.py
+RUN python3 /usr/local/lib/rebuild-esbuild.py
 FROM ${BASE_IMAGE} AS hardened
 ARG BASE_IMAGE
 ARG SOURCE_COMMIT
@@ -53,6 +59,8 @@ COPY --from=builder /prod/dokploy/drizzle /app/drizzle
 COPY --from=builder /prod/dokploy/public /app/public
 COPY --from=builder /prod/dokploy/next.config.mjs /app/next.config.mjs
 COPY --from=builder /prod/dokploy/node_modules /app/node_modules
+COPY --from=native_compilers /patched/ /app/node_modules/
+COPY --from=native_compilers /out/native-compilers.json /usr/local/lib/native-compilers.json
 COPY verify-floors.cjs /usr/local/lib/verify-floors.cjs
 COPY security-overrides.json /usr/local/lib/security-overrides.json
 RUN node /usr/local/lib/verify-floors.cjs /app/node_modules /usr/local/lib/security-overrides.json

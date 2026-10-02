@@ -5,3 +5,4 @@
 !security-overrides.json
 !apply-overrides.cjs
 !verify-floors.cjs
+!rebuild-esbuild.py

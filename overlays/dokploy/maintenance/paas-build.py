@@ -60,8 +60,8 @@ def bound_keepers(image_id):
         candidates.append((created,name,candidate_id))
     for _,name,candidate_id in sorted(candidates)[:-3]:
         if candidate_id not in protected:call('docker','rm','-f','-v',name)
-files=['Dockerfile.dokploy-source','Dockerfile.postgres','security-overrides.json','apply-overrides.cjs','verify-floors.cjs','test-pair.py','.dockerignore']
-recipe_files=['Dockerfile.postgres'] if component=='postgres' else ['Dockerfile.dokploy-source','security-overrides.json','apply-overrides.cjs','verify-floors.cjs']
+files=['Dockerfile.dokploy-source','Dockerfile.postgres','security-overrides.json','apply-overrides.cjs','verify-floors.cjs','rebuild-esbuild.py','test-pair.py','.dockerignore']
+recipe_files=['Dockerfile.postgres'] if component=='postgres' else ['Dockerfile.dokploy-source','security-overrides.json','apply-overrides.cjs','verify-floors.cjs','rebuild-esbuild.py']
 digest=hashlib.sha256()
 for name in files:
     path=template/name;s=path.lstat()
@@ -133,7 +133,7 @@ if component=='postgres':
 else:
     panel=image;pg=output('docker','service','inspect','--format','{{.Spec.TaskTemplate.ContainerSpec.Image}}','dokploy-postgres')
 call('python3',str(template/'test-pair.py'),panel,pg,timeout=360)
-manifest=output('docker','run','--rm','--network=none','--entrypoint','sh',image,'-c','set -e; dpkg-query -W; if command -v node >/dev/null; then node --version; sha256sum /app/dist/server.mjs /usr/local/bin/pack /usr/local/bin/railpack /usr/local/lib/paas-source-lock.yaml; npm --version; corepack pnpm --version; fi; if command -v gosu >/dev/null; then gosu --version; sha256sum /usr/local/bin/gosu; fi')
+manifest=output('docker','run','--rm','--network=none','--entrypoint','sh',image,'-c','set -e; dpkg-query -W; if command -v node >/dev/null; then node --version; sha256sum /app/dist/server.mjs /usr/local/bin/pack /usr/local/bin/railpack /usr/local/lib/paas-source-lock.yaml /usr/local/lib/native-compilers.json; npm --version; corepack pnpm --version; fi; if command -v gosu >/dev/null; then gosu --version; sha256sum /usr/local/bin/gosu; fi')
 fingerprint=hashlib.sha256((base+recipe+(source_commit or '')+manifest).encode()).hexdigest()
 if old.get('fingerprint')==fingerprint:
     try:

@@ -74,6 +74,14 @@ Database major migrations and data restores remain explicit decisions. Archive
 size/headroom guards fail closed rather than fill the disk.
 Unfixed and major/prerelease-only vulnerability findings remain reportable.
 
+Native esbuild binaries are discovered from the installed application modules,
+rebuilt from their exact stable upstream tags with the current stable Go
+compiler, and replaced without changing the JavaScript/API version. Upstream
+logger/helper unit tests and byte-for-byte JS/TS/JSX transform comparisons must
+pass. Symbolic links are not followed during discovery. Compiler version, source
+commits and replacement hashes are recorded in the immutable candidate image
+and included in its software fingerprint.
+
 The builder updates both root/workspace package-manager pins and authoritative
 workspace overrides. It preserves other workspace settings. An image-level
 dependency-floor check refuses candidates that still contain stable package

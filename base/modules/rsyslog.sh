@@ -1,9 +1,10 @@
 rsyslog_collect_log_targets() {
   local cfg
   local -a cfgs=()
+  local config_root="${RSYSLOG_CONFIG_ROOT:-/etc}"
 
-  [[ -f /etc/rsyslog.conf ]] && cfgs+=("/etc/rsyslog.conf")
-  for cfg in /etc/rsyslog.d/*.conf; do
+  [[ -f "${config_root}/rsyslog.conf" ]] && cfgs+=("${config_root}/rsyslog.conf")
+  for cfg in "${config_root}"/rsyslog.d/*.conf; do
     [[ -f "${cfg}" ]] || continue
     cfgs+=("${cfg}")
   done
@@ -13,16 +14,30 @@ rsyslog_collect_log_targets() {
   awk '
     /^[[:space:]]*#/ { next }
     {
-      for (i = 1; i <= NF; i++) {
-        tok = $i
-        if (tok ~ /^-?\/var\/log\//) {
-          sub(/^-/, "", tok)
-          sub(/[;,]+$/, "", tok)
-          print tok
-        }
+      line = $0
+      while (match(line, /-?\/var\/log\/[A-Za-z0-9_.\/-]+/)) {
+        target = substr(line, RSTART, RLENGTH)
+        sub(/^-/, "", target)
+        print target
+        line = substr(line, RSTART + RLENGTH)
       }
     }
   ' "${cfgs[@]}" | sort -u
+}
+
+install_rsyslog_tmpfiles_override() {
+  local override="${RSYSLOG_TMPFILES_OVERRIDE:-/etc/tmpfiles.d/00rsyslog.conf}"
+  if [[ -L "${override}" || ( -e "${override}" && ! -f "${override}" ) ]]; then
+    die "Refusing unsafe rsyslog tmpfiles override path: ${override}"
+  fi
+  # Ubuntu's /usr/lib/tmpfiles.d/00rsyslog.conf changes /var/log to
+  # root:syslog 0775 on every boot. A same-basename /etc override has higher
+  # precedence and keeps the parent non-writable by service groups; rsyslog's
+  # individual files remain writable through their explicit ownership.
+  cat <<'EOF' | write_file "${override}" "0644" "root" "root"
+# Managed by secure-ubuntu-paas; overrides /usr/lib/tmpfiles.d/00rsyslog.conf.
+z /var/log 0755 root root -
+EOF
 }
 
 ensure_logrotate_create_directive() {
@@ -72,6 +87,8 @@ configure_rsyslog_targets() {
   local log_owner="syslog"
   local log_group="adm"
 
+  install_rsyslog_tmpfiles_override
+
   if ! getent passwd "${log_owner}" >/dev/null 2>&1; then
     warn "User '${log_owner}' not found; using fallback owner root for managed log files."
     log_owner="root"
@@ -88,14 +105,19 @@ configure_rsyslog_targets() {
 
   if getent group syslog >/dev/null 2>&1; then
     if is_true "${DRY_RUN}"; then
-      log "DRY-RUN: ensure /var/log is root:syslog mode 0770"
+      log "DRY-RUN: ensure /var/log is root:root mode 0755"
     else
-      install -d -m 0770 -o root -g syslog /var/log
-      chown root:syslog /var/log
-      chmod 0770 /var/log
+      install -d -m 0755 -o root -g root /var/log
+      chown root:root /var/log
+      chmod 0755 /var/log
     fi
   else
-    warn "Group 'syslog' not found; skipping /var/log ownership enforcement."
+    if ! is_true "${DRY_RUN}"; then
+      install -d -m 0755 -o root -g root /var/log
+      chown root:root /var/log
+      chmod 0755 /var/log
+    fi
+    warn "Group 'syslog' not found; using root-owned /var/log."
   fi
 
   while IFS= read -r target; do
@@ -106,12 +128,25 @@ configure_rsyslog_targets() {
     fi
     local target_dir
     target_dir="$(dirname "${target}")"
-    if [[ ! -d "${target_dir}" ]]; then
-      install -d -m 0755 "${target_dir}"
+    if [[ -L "${target_dir}" ]]; then
+      rm -f -- "${target_dir}" || return 1
     fi
-    touch "${target}"
-    chown "${log_owner}:${log_group}" "${target}"
-    chmod 0640 "${target}"
+    if [[ -e "${target_dir}" && ! -d "${target_dir}" ]]; then
+      warn "Refusing non-directory rsyslog target parent: ${target_dir}"
+      return 1
+    fi
+    install -d -m 0755 -o root -g root "${target_dir}"
+    if [[ -L "${target}" || ( -e "${target}" && ! -f "${target}" ) ]]; then
+      # Remove only the directory entry; never follow a symlink to its target.
+      rm -f -- "${target}" || return 1
+    fi
+    if [[ ! -e "${target}" ]]; then
+      install -m 0640 -o "${log_owner}" -g "${log_group}" /dev/null "${target}"
+    else
+      [[ -f "${target}" && ! -L "${target}" ]] || return 1
+      chown "${log_owner}:${log_group}" "${target}"
+      chmod 0640 "${target}"
+    fi
   done < <(rsyslog_collect_log_targets)
 
   ensure_logrotate_create_directive "/etc/logrotate.d/ufw" "${log_owner}" "${log_group}"

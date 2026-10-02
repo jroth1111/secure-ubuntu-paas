@@ -1,5 +1,5 @@
 kernel_modules_check() {
-  local dropin="${KERNEL_MODULES_DROPIN_FILE:-/etc/modprobe.d/99-zzz-hardening-modules.conf}"
+  local dropin="${KERNEL_MODULES_DROPIN_FILE:-/etc/modprobe.d/zzzz-hardening-modules.conf}"
   local -a expected=(
     dccp sctp rds tipc
     cramfs freevxfs jffs2 hfs hfsplus

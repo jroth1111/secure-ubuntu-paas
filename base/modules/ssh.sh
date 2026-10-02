@@ -9,65 +9,252 @@ criminal and civil penalties.
 EOF
 }
 
+install_admin_authorized_keys_no_follow() {
+  local home_dir="$1"
+  local admin_user="$2"
+  local admin_pubkey="$3"
+
+  # Keep every pathname operation below on already-open directory descriptors.
+  # The administrator owns (or can influence) its home tree, so pathname-based
+  # cat/redirection would allow a symlink swap to turn this root operation into
+  # a disclosure or write primitive.
+  python3 - "${home_dir}" "${admin_user}" "${admin_pubkey}" <<'PY'
+import os
+import pwd
+import secrets
+import stat
+
+home_path, username, public_key = os.sys.argv[1:]
+if not public_key or "\x00" in public_key or "\n" in public_key or "\r" in public_key:
+    raise SystemExit("invalid administrator public key")
+
+no_follow = getattr(os, "O_NOFOLLOW", 0)
+if not no_follow:
+    raise SystemExit("O_NOFOLLOW is unavailable")
+directory_flags = os.O_RDONLY | os.O_DIRECTORY | no_follow | os.O_CLOEXEC
+file_flags = os.O_RDONLY | no_follow | os.O_CLOEXEC
+account = pwd.getpwnam(username)
+uid, gid = account.pw_uid, account.pw_gid
+
+def check_directory(fd, label, allowed_uids):
+    info = os.fstat(fd)
+    if not stat.S_ISDIR(info.st_mode):
+        raise SystemExit(f"{label} is not a directory")
+    if info.st_uid not in allowed_uids or (info.st_mode & 0o022):
+        raise SystemExit(f"{label} has unsafe ownership or permissions")
+
+def close_quietly(fd):
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+home_fd = ssh_fd = None
+temp_name = None
+try:
+    home_fd = os.open(home_path, directory_flags)
+    check_directory(home_fd, home_path, {0, uid})
+    try:
+        os.mkdir(".ssh", 0o700, dir_fd=home_fd)
+    except FileExistsError:
+        pass
+    ssh_fd = os.open(".ssh", directory_flags, dir_fd=home_fd)
+    check_directory(ssh_fd, f"{home_path}/.ssh", {0, uid})
+    os.fchown(ssh_fd, uid, gid)
+    os.fchmod(ssh_fd, 0o700)
+
+    existing = b""
+    try:
+        source_fd = os.open("authorized_keys", file_flags, dir_fd=ssh_fd)
+    except FileNotFoundError:
+        source_fd = None
+    if source_fd is not None:
+        try:
+            source_info = os.fstat(source_fd)
+            if not stat.S_ISREG(source_info.st_mode):
+                raise SystemExit("administrator authorized_keys is not a regular file")
+            if source_info.st_uid not in {0, uid} or (source_info.st_mode & 0o022):
+                raise SystemExit("administrator authorized_keys has unsafe ownership or permissions")
+            chunks = []
+            while True:
+                chunk = os.read(source_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            existing = b"".join(chunks)
+        finally:
+            close_quietly(source_fd)
+
+    if existing and not existing.endswith(b"\n"):
+        existing += b"\n"
+    key_bytes = public_key.encode("utf-8")
+    if key_bytes not in existing.splitlines():
+        existing += key_bytes + b"\n"
+
+    # Create the temporary file inside the already-open destination directory.
+    # /run is commonly tmpfs while /home is not, so staging there and renaming
+    # into .ssh can raise EXDEV and abort hardening on a normal Ubuntu host.
+    # O_EXCL + O_NOFOLLOW keeps the temporary creation race-safe.
+    temp_fd = None
+    temp_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | no_follow | os.O_CLOEXEC
+    for _ in range(64):
+        candidate = ".authorized_keys." + secrets.token_hex(12)
+        try:
+            temp_fd = os.open(candidate, temp_flags, 0o600, dir_fd=ssh_fd)
+            temp_name = candidate
+            break
+        except FileExistsError:
+            continue
+    if temp_fd is None or temp_name is None:
+        raise SystemExit("unable to create a unique authorized_keys temporary file")
+    try:
+        temp_info = os.fstat(temp_fd)
+        if not stat.S_ISREG(temp_info.st_mode) or temp_info.st_uid != 0:
+            raise SystemExit("authorized_keys temporary file is not root-owned")
+        os.fchmod(temp_fd, 0o600)
+        view = memoryview(existing)
+        while view:
+            written = os.write(temp_fd, view)
+            if written <= 0:
+                raise SystemExit("unable to write authorized_keys staging file")
+            view = view[written:]
+        os.fsync(temp_fd)
+    finally:
+        close_quietly(temp_fd)
+
+    # Both names are in the same open directory, so this atomic replacement
+    # cannot fail with EXDEV and does not follow an attacker-created target.
+    os.rename(temp_name, "authorized_keys", src_dir_fd=ssh_fd, dst_dir_fd=ssh_fd)
+    temp_name = None
+    final_fd = os.open("authorized_keys", file_flags, dir_fd=ssh_fd)
+    try:
+        final_info = os.fstat(final_fd)
+        if not stat.S_ISREG(final_info.st_mode) or final_info.st_uid != 0:
+            raise SystemExit("installed authorized_keys is not the root-owned staged file")
+        os.fchown(final_fd, uid, gid)
+        os.fchmod(final_fd, 0o600)
+        os.fsync(final_fd)
+    finally:
+        close_quietly(final_fd)
+finally:
+    if temp_name is not None and ssh_fd is not None:
+        try:
+            os.unlink(temp_name, dir_fd=ssh_fd)
+        except OSError:
+            pass
+    close_quietly(ssh_fd)
+    close_quietly(home_fd)
+PY
+}
+
 ensure_admin_access() {
   local home_dir
-  local ssh_dir
-  local auth_file
   local user_exists="false"
 
   if id "${ADMIN_USER}" >/dev/null 2>&1; then
     user_exists="true"
     log "Admin user exists: ${ADMIN_USER}"
   else
-    run useradd -m -s /bin/bash -G sudo "${ADMIN_USER}"
+    if [[ "${PAAS}" == "dokploy" ]]; then
+      run useradd -m -s /usr/sbin/nologin "${ADMIN_USER}"
+    else
+      run useradd -m -s /bin/bash -G sudo "${ADMIN_USER}"
+    fi
   fi
 
-  if [[ "${user_exists}" == "true" ]] && ! id -nG "${ADMIN_USER}" | tr ' ' '\n' | grep -qx "sudo"; then
+  if [[ "${PAAS}" != "dokploy" ]] \
+    && [[ "${user_exists}" == "true" ]] \
+    && ! id -nG "${ADMIN_USER}" | tr ' ' '\n' | grep -qx "sudo"; then
     run usermod -aG sudo "${ADMIN_USER}"
   fi
 
-  # Configure passwordless sudo for admin user
-  # This is required because the admin user has no password set,
-  # but sudo requires password by default, blocking all admin operations.
   local sudoers_file="/etc/sudoers.d/${ADMIN_USER}"
-  if is_true "${DRY_RUN}"; then
-    log "DRY-RUN: would create ${sudoers_file} with passwordless sudo for ${ADMIN_USER}"
+  if [[ "${PAAS}" == "dokploy" ]]; then
+    # Dokploy privileged orchestration uses the dedicated root key over the
+    # Tailscale address. Keep the named metadata account non-privileged and
+    # non-login: root is the only SSH principal for this PaaS mode.
+    if id -nG "${ADMIN_USER}" 2>/dev/null | tr ' ' '\n' | grep -qx "sudo"; then
+      if is_true "${DRY_RUN}"; then
+        log "DRY-RUN: would remove ${ADMIN_USER} from the sudo group"
+      elif command -v gpasswd >/dev/null 2>&1; then
+        run gpasswd -d "${ADMIN_USER}" sudo >/dev/null
+      else
+        run deluser "${ADMIN_USER}" sudo >/dev/null
+      fi
+    fi
+    if is_true "${DRY_RUN}"; then
+      log "DRY-RUN: would remove ${sudoers_file} (Dokploy root operations use Tailscale-only root SSH)"
+    else
+      run rm -f "${sudoers_file}"
+      local sudo_state_rc
+      if sudo_effective_grant_state "${ADMIN_USER}"; then
+        die "Dokploy admin ${ADMIN_USER} retains an effective sudo grant; refusing non-privileged setup."
+      else
+        sudo_state_rc=$?
+        (( sudo_state_rc == 1 )) || die "Unable to prove that Dokploy admin ${ADMIN_USER} has no effective sudo grant; refusing setup."
+      fi
+      run usermod -s /usr/sbin/nologin "${ADMIN_USER}"
+      passwd -l "${ADMIN_USER}" >/dev/null 2>&1 || true
+    fi
   else
-    cat > "${sudoers_file}" <<EOF
+    # Configure passwordless sudo for non-Dokploy workflows. Those legacy
+    # orchestrators still execute remote scripts through admin@TS_IP sudo;
+    # Dokploy uses the root Tailscale transport above instead.
+    if is_true "${DRY_RUN}"; then
+      log "DRY-RUN: would create ${sudoers_file} with passwordless sudo for ${ADMIN_USER}"
+    else
+      cat > "${sudoers_file}" <<EOF
 Defaults:${ADMIN_USER} timestamp_timeout=0
 ${ADMIN_USER} ALL=(ALL) NOPASSWD: ALL
 EOF
-    chmod 440 "${sudoers_file}"
-    # Validate sudoers syntax before committing
-    if ! visudo -c -f "${sudoers_file}" >/dev/null 2>&1; then
-      rm -f "${sudoers_file}"
-      die "Failed to create valid sudoers file for ${ADMIN_USER}"
+      chmod 440 "${sudoers_file}"
+      # Validate sudoers syntax before committing
+      if ! visudo -c -f "${sudoers_file}" >/dev/null 2>&1; then
+        rm -f "${sudoers_file}"
+        die "Failed to create valid sudoers file for ${ADMIN_USER}"
+      fi
+      log "Configured passwordless sudo for ${ADMIN_USER}"
     fi
-    log "Configured passwordless sudo for ${ADMIN_USER}"
   fi
 
   if is_true "${DRY_RUN}" && [[ "${user_exists}" == "false" ]]; then
-    log "DRY-RUN: would create /home/${ADMIN_USER}/.ssh/authorized_keys with provided key."
-    return 0
+    # useradd is not executed in dry-run mode, so NSS cannot yet resolve the
+    # account that would be created.
+    home_dir="/home/${ADMIN_USER}"
+  else
+    home_dir="$(getent passwd "${ADMIN_USER}" | cut -d: -f6)"
   fi
-
-  home_dir="$(getent passwd "${ADMIN_USER}" | cut -d: -f6)"
   [[ -n "${home_dir}" ]] || die "Unable to resolve home directory for ${ADMIN_USER}."
-  ssh_dir="${home_dir}/.ssh"
-  auth_file="${ssh_dir}/authorized_keys"
 
-  if is_true "${DRY_RUN}"; then
-    log "DRY-RUN: ensure ${auth_file} contains provided key."
-    return 0
-  fi
-
-  install -d -m 0700 -o "${ADMIN_USER}" -g "${ADMIN_USER}" "${ssh_dir}"
-  touch "${auth_file}"
-  chown "${ADMIN_USER}:${ADMIN_USER}" "${auth_file}"
-  chmod 0600 "${auth_file}"
-
-  if ! grep -qxF "${ADMIN_PUBKEY}" "${auth_file}"; then
-    printf '%s\n' "${ADMIN_PUBKEY}" >> "${auth_file}"
+  if [[ "${PAAS}" == "dokploy" ]]; then
+    if is_true "${DRY_RUN}"; then
+      log "DRY-RUN: would disable SSH login for ${ADMIN_USER} and remove its authorized_keys."
+    else
+      local admin_ssh_dir="${home_dir}/.ssh"
+      local admin_auth_file="${admin_ssh_dir}/authorized_keys"
+      if [[ -L "${home_dir}" || ! -d "${home_dir}" ]]; then
+        die "Dokploy metadata account home is missing or unsafe: ${home_dir}"
+      fi
+      if [[ -L "${admin_ssh_dir}" || ( -e "${admin_ssh_dir}" && ! -d "${admin_ssh_dir}" ) ]]; then
+        die "Dokploy metadata account SSH directory is unsafe: ${admin_ssh_dir}"
+      fi
+      if [[ -e "${admin_auth_file}" || -L "${admin_auth_file}" ]]; then
+        if [[ -L "${admin_auth_file}" || -f "${admin_auth_file}" ]]; then
+          rm -f -- "${admin_auth_file}"
+        else
+          die "Dokploy metadata account authorized_keys is an unsupported file type: ${admin_auth_file}"
+        fi
+      fi
+      log "Disabled SSH login for Dokploy metadata account ${ADMIN_USER}."
+    fi
+  elif is_true "${DRY_RUN}" && [[ "${user_exists}" == "false" ]]; then
+    log "DRY-RUN: would create /home/${ADMIN_USER}/.ssh/authorized_keys with provided key."
+  elif is_true "${DRY_RUN}"; then
+    log "DRY-RUN: ensure ${home_dir}/.ssh/authorized_keys contains provided key."
+  else
+    install_admin_authorized_keys_no_follow "${home_dir}" "${ADMIN_USER}" "${ADMIN_PUBKEY}" \
+      || die "Unable to install administrator authorized_keys safely."
   fi
 
   # Lock root password — root login is blocked by sshd config but a set
@@ -84,14 +271,45 @@ EOF
     log "DRY-RUN: would lock root password."
   fi
 
-  # Clear root authorized_keys — provisioning systems often inject keys
-  # into /root/.ssh/authorized_keys that are unrelated to the admin user.
-  # Root login is already blocked from external addresses, but stale keys
-  # are a credential that should not persist.
-  if ! is_true "${DRY_RUN}"; then
-    local root_auth_keys="/root/.ssh/authorized_keys"
-    if [[ -f "${root_auth_keys}" ]] && [[ -s "${root_auth_keys}" ]]; then
-      : > "${root_auth_keys}"
+  # Dokploy operators may need emergency root access, but only through the
+  # Tailscale-only SSH listener and the key supplied for this deployment. Keep
+  # exactly that key; never preserve provider-injected root credentials.
+  if [[ "${PAAS}" == "dokploy" ]]; then
+    if is_true "${DRY_RUN}"; then
+      log "DRY-RUN: would install the admin public key as the sole root authorized key for Tailscale-only Dokploy access."
+    else
+      [[ -n "${ADMIN_PUBKEY}" ]] || die "Dokploy root Tailscale policy requires a non-empty admin public key."
+      if [[ -L /root/.ssh || ( -e /root/.ssh && ! -d /root/.ssh ) ]]; then
+        die "Root SSH directory is a symlink or unexpected file: /root/.ssh"
+      fi
+      install -d -m 0700 -o root -g root /root/.ssh
+      local root_auth_file=/root/.ssh/authorized_keys
+      if [[ -L "${root_auth_file}" || ( -e "${root_auth_file}" && ! -f "${root_auth_file}" ) ]]; then
+        die "Root authorized_keys is a symlink or unexpected file: ${root_auth_file}"
+      fi
+      local root_auth_tmp
+      root_auth_tmp="$(mktemp /root/.ssh/.authorized_keys.XXXXXX)" \
+        || die "Unable to stage root authorized_keys safely."
+      printf '%s\n' "${ADMIN_PUBKEY}" > "${root_auth_tmp}"
+      chown root:root "${root_auth_tmp}"
+      chmod 0600 "${root_auth_tmp}"
+      mv -f "${root_auth_tmp}" "${root_auth_file}" \
+        || { rm -f "${root_auth_tmp}"; die "Unable to install root authorized_keys atomically."; }
+      chown root:root "${root_auth_file}"
+      chmod 0600 "${root_auth_file}"
+      log "Installed the admin public key as the sole root key for Tailscale-only Dokploy access."
+    fi
+  elif ! is_true "${DRY_RUN}"; then
+    # Clear root authorized_keys — provisioning systems often inject keys
+    # into /root/.ssh/authorized_keys that are unrelated to the admin user.
+    if [[ -L /root/.ssh || ( -e /root/.ssh && ! -d /root/.ssh ) ]]; then
+      die "Root SSH directory is a symlink or unexpected file: /root/.ssh"
+    fi
+    if [[ -f /root/.ssh/authorized_keys ]] && [[ -s /root/.ssh/authorized_keys ]]; then
+      if [[ -L /root/.ssh/authorized_keys ]]; then
+        die "Root authorized_keys is a symlink: /root/.ssh/authorized_keys"
+      fi
+      : > /root/.ssh/authorized_keys
       log "Cleared root authorized_keys."
     fi
   else
@@ -120,7 +338,12 @@ assert_sshd_effective() {
   grep -q "^kbdinteractiveauthentication no$" <<< "${effective}" || return 1
   grep -q "^pubkeyauthentication yes$" <<< "${effective}" || return 1
   grep -q "^authenticationmethods publickey$" <<< "${effective}" || return 1
-  grep -qE "^allowusers .*\\b${ADMIN_USER}\\b" <<< "${effective}" || return 1
+  if [[ "${PAAS}" == "dokploy" ]]; then
+    grep -qE '^allowusers .*\broot\b' <<< "${effective}" || return 1
+    ! grep -qE "^allowusers .*\\b${ADMIN_USER}\\b" <<< "${effective}" || return 1
+  else
+    grep -qE "^allowusers .*\\b${ADMIN_USER}\\b" <<< "${effective}" || return 1
+  fi
   grep -q "^permitemptypasswords no$" <<< "${effective}" || return 1
   grep -q "^compression no$" <<< "${effective}" || return 1
   grep -q "chacha20-poly1305@openssh.com" <<< "${effective}" || return 1
@@ -136,6 +359,18 @@ assert_sshd_match_localhost() {
   grep -qE "^permitrootlogin (prohibit-password|without-password)$" <<< "${effective}" || return 1
   grep -qE "^allowusers .*\\broot\\b" <<< "${effective}" || return 1
   grep -qE "^allowusers .*\\b${ADMIN_USER}\\b" <<< "${effective}" || return 1
+}
+
+assert_sshd_match_tailscale() {
+  local effective="$1"
+
+  # OpenSSH outputs "prohibit-password" or its legacy synonym "without-password".
+  grep -qE "^permitrootlogin (prohibit-password|without-password)$" <<< "${effective}" || return 1
+  grep -qE "^allowusers .*\\broot\\b" <<< "${effective}" || return 1
+  ! grep -qE "^allowusers .*\\b${ADMIN_USER}\\b" <<< "${effective}" || return 1
+  grep -q "^passwordauthentication no$" <<< "${effective}" || return 1
+  grep -q "^kbdinteractiveauthentication no$" <<< "${effective}" || return 1
+  grep -q "^authenticationmethods publickey$" <<< "${effective}" || return 1
 }
 
 reload_ssh_service() {
@@ -204,7 +439,20 @@ ifupdown_is_authoritative() {
 configure_ssh() {
   local backup=""
   local effective=""
-  local match_addresses="127.0.0.1,::1"
+  local match_addresses="${TAILSCALE_CIDR:-100.64.0.0/10}"
+  if [[ "${PAAS}" == "coolify" ]]; then
+    local docker_match_addresses=""
+    if declare -p DOCKER_SSH_CIDRS >/dev/null 2>&1 && (( ${#DOCKER_SSH_CIDRS[@]} > 0 )); then
+      docker_match_addresses="$(IFS=,; printf '%s' "${DOCKER_SSH_CIDRS[*]}")"
+    else
+      docker_match_addresses="10.0.0.0/8,172.16.0.0/12"
+    fi
+    # Coolify's container-to-host SSH path is intentionally localhost plus
+    # discovered Docker bridges.  The old implementation used only the
+    # Tailscale CIDR, so its own localhost assertion validated a carve-out that
+    # the generated sshd config never actually installed.
+    match_addresses="127.0.0.1,::1,${docker_match_addresses}"
+  fi
 
   if ! is_true "${DRY_RUN}" && [[ ! -d /run/sshd ]]; then
     install -d -m 0755 /run/sshd
@@ -242,6 +490,7 @@ configure_ssh() {
   fi
 
   local match_block=""
+  local global_allow_users="${ADMIN_USER}"
   if [[ "${PAAS}" == "coolify" ]]; then
     # Coolify connects to its own host as root via localhost / Docker bridge.
     # Compatibility mode uses broad RFC1918 ranges; strict mode uses discovered
@@ -255,6 +504,16 @@ configure_ssh() {
 Match Address ${match_addresses}
     PermitRootLogin prohibit-password
     AllowUsers ${ADMIN_USER} root"
+  elif [[ "${PAAS}" == "dokploy" ]]; then
+    # Dokploy does not need host SSH from containers, but the operator wants
+    # an emergency root path. Permit root key auth only from the Tailscale
+    # source range; the socket binding and UFW both keep WAN SSH closed.
+    match_block="
+# Dokploy root emergency access is Tailscale-only and key-only.
+Match Address ${match_addresses}
+    PermitRootLogin prohibit-password
+    AllowUsers root"
+    global_allow_users="root"
   fi
 
   write_file "${SSH_DROPIN_FILE}" "0644" "root" "root" <<EOF
@@ -266,7 +525,7 @@ PermitEmptyPasswords no
 KbdInteractiveAuthentication no
 PubkeyAuthentication yes
 AuthenticationMethods publickey
-AllowUsers ${ADMIN_USER}
+AllowUsers ${global_allow_users}
 X11Forwarding no
 AllowAgentForwarding no
 AllowTcpForwarding no
@@ -324,8 +583,19 @@ EOF
       restore_ssh_dropin "${backup}"
       die "sshd -T -C (localhost Match block) did not match expected values."
     fi
+  elif [[ "${PAAS}" == "dokploy" ]]; then
+    local tailscale_probe_ip="${DETECTED_TAILSCALE_IP:-}"
+    if [[ -z "${tailscale_probe_ip}" ]] && command -v tailscale >/dev/null 2>&1; then
+      tailscale_probe_ip="$(tailscale ip -4 2>/dev/null || true)"
+    fi
+    local match_tailscale
+    match_tailscale="$(sshd -T -C "addr=${tailscale_probe_ip:-100.64.0.1},user=root,host=localhost,laddr=${tailscale_probe_ip:-100.64.0.1}" 2>/dev/null || true)"
+    if ! assert_sshd_match_tailscale "${match_tailscale}"; then
+      restore_ssh_dropin "${backup}"
+      die "sshd -T -C (Tailscale Match block) did not match expected root-only-over-Tailscale values."
+    fi
   else
-    # Non-Coolify PaaS must NOT allow root from localhost/bridges.
+    # dFlow and other non-Coolify/Dokploy PaaS must NOT allow root from localhost/bridges.
     if grep -qE "^permitrootlogin (prohibit-password|without-password|yes)$" <<< "${match_effective}"; then
       restore_ssh_dropin "${backup}"
       die "sshd -T -C (localhost) still permits root login — root Match carve-out must not exist for PAAS=${PAAS}."

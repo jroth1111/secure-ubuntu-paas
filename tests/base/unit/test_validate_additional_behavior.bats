@@ -83,6 +83,7 @@ setup() {
 @test "load_state_context: imports state values into runtime vars" {
   local state
   state="$(mktemp)"
+  STATE_LOCK_FILE="${state}.lock"
   cat > "${state}" <<STATE
 admin_user=alice
 ssh_port=2222
@@ -151,6 +152,7 @@ STATE
     if [[ "$1" == "status" ]]; then
       cat <<UFW
 Status: active
+Default: deny (incoming), allow (outgoing), deny (routed), disabled (forwarded)
 22/tcp                     ALLOW IN    on tailscale0
 22/tcp                     ALLOW IN    10.0.0.0/8
 8000/tcp                   ALLOW IN    on tailscale0
@@ -182,6 +184,7 @@ UFW
     if [[ "$1" == "status" ]]; then
       cat <<UFW
 Status: active
+Default: deny (incoming), allow (outgoing), deny (routed), disabled (forwarded)
 2222/tcp                   ALLOW IN    on tailscale0
 22/tcp                     ALLOW IN    10.0.0.0/8
 8000/tcp                   ALLOW IN    on tailscale0
@@ -199,6 +202,36 @@ UFW
   assert_json_check_status "${json}" "ufw: SSH on tailscale0" "FAIL"
 }
 
+@test "ufw_check: fails when UFW default incoming or routed policy is permissive" {
+  SSH_PORT="22"
+  TAILSCALE_IFACE="tailscale0"
+  WAN_IFACE="eth0"
+  TUNNEL_MODE="false"
+  TAILSCALE_DIRECT_WAN="false"
+  DOCKER_SSH_CIDRS='10.0.0.0/8'
+
+  ufw() {
+    if [[ "$1" == "status" ]]; then
+      cat <<UFW
+Status: active
+Default: allow (incoming), allow (outgoing), allow (routed), disabled (forwarded)
+22/tcp                     ALLOW IN    on tailscale0
+22/tcp                     ALLOW IN    10.0.0.0/8
+8000/tcp                   ALLOW IN    on tailscale0
+6001/tcp                   ALLOW IN    on tailscale0
+6002/tcp                   ALLOW IN    on tailscale0
+UFW
+      return 0
+    fi
+    return 0
+  }
+
+  ufw_check
+  local json
+  json="$(emit_validate_results_json)"
+  assert_json_check_status "${json}" "ufw: default policy" "FAIL"
+}
+
 @test "ufw_check: fails when docker bridge SSH rule is not tcp-only" {
   SSH_PORT="22"
   TAILSCALE_IFACE="tailscale0"
@@ -211,6 +244,7 @@ UFW
     if [[ "$1" == "status" ]]; then
       cat <<UFW
 Status: active
+Default: deny (incoming), allow (outgoing), deny (routed), disabled (forwarded)
 22/tcp                     ALLOW IN    on tailscale0
 22                         ALLOW IN    10.0.0.0/8
 8000/tcp                   ALLOW IN    on tailscale0
@@ -524,6 +558,63 @@ EOF
   rm -rf "${tmphome}"
 }
 
+@test "admin_sudo_check: Dokploy accepts only a locked non-login metadata account without keys" {
+  local tmphome
+  tmphome="$(mktemp -d)"
+  mkdir -p "${tmphome}/.ssh"
+
+  ADMIN_USER="dokployadmin_check_${BATS_TEST_NUMBER}_$$"
+  PAAS="dokploy"
+
+  id() {
+    if [[ "${1:-}" == "${ADMIN_USER}" ]]; then
+      return 0
+    fi
+    if [[ "${1:-}" == "-nG" && "${2:-}" == "${ADMIN_USER}" ]]; then
+      echo "${ADMIN_USER} users"
+      return 0
+    fi
+    command id "$@"
+  }
+
+  getent() {
+    if [[ "${1:-}" == "passwd" && "${2:-}" == "${ADMIN_USER}" ]]; then
+      echo "${ADMIN_USER}:x:1000:1000:Admin:${tmphome}:/usr/sbin/nologin"
+      return 0
+    fi
+    command getent "$@"
+  }
+
+  passwd() {
+    if [[ "${1:-}" == "-S" && "${2:-}" == "${ADMIN_USER}" ]]; then
+      echo "${ADMIN_USER} L 2026-08-05 0 99999 7 -1"
+      return 0
+    fi
+    command passwd "$@"
+  }
+
+  sudo() {
+    if [[ "${1:-}" == "-n" && "${2:-}" == "-l" && "${3:-}" == "-U" && "${4:-}" == "${ADMIN_USER}" ]]; then
+      echo "User ${ADMIN_USER} is not allowed to run sudo on host."
+      # sudo returns 0 for root's query of another user's denied policy on
+      # this Ubuntu/sudo behavior; the denial text must take precedence.
+      return 0
+    fi
+    return 1
+  }
+
+  admin_sudo_check
+  local json
+  json="$(emit_validate_results_json)"
+  rm -rf "${tmphome}"
+
+  assert_json_check_status "${json}" "admin: no privileged sudo" "PASS"
+  assert_json_check_status "${json}" "admin: Dokploy metadata account shell disabled" "PASS"
+  assert_json_check_status "${json}" "admin: Dokploy metadata account password locked" "PASS"
+  assert_json_check_status "${json}" "admin: Dokploy metadata account has no SSH keys" "PASS"
+  assert_json_fail_count "${json}" "0"
+}
+
 @test "auditd_check: executes and records audit status outcomes" {
   IS_CONTAINER="true"
   systemctl() { return 1; }
@@ -541,13 +632,16 @@ EOF
   local tmp_auditd_conf
   tmp_auditd_conf="$(mktemp)"
   cat > "${tmp_auditd_conf}" <<'EOF'
-max_log_file_action = keep_logs
+max_log_file = 50
+num_logs = 10
+rate_limit = 1000
+max_log_file_action = rotate
 disk_full_action = suspend
 disk_error_action = suspend
 space_left = 100
 space_left_action = syslog
 admin_space_left = 50
-admin_space_left_action = suspend
+admin_space_left_action = syslog
 EOF
 
   IS_CONTAINER="false"
@@ -566,6 +660,9 @@ RULES
     fi
     if [[ "${1:-}" == "-s" ]]; then
       cat <<'STATUS'
+enabled 2
+loginuid_immutable 1 unlocked
+rate_limit 1000
 lost 0
 backlog 5
 STATUS
@@ -578,7 +675,8 @@ STATUS
   local json
   json="$(emit_validate_results_json)"
   assert_json_check_status "${json}" "auditd: active" "PASS"
-  assert_json_check_status "${json}" "auditd: max_log_file_action=keep_logs" "PASS"
+  assert_json_check_status "${json}" "auditd: rule configuration immutable" "PASS"
+  assert_json_check_status "${json}" "auditd: max_log_file_action=rotate" "PASS"
   assert_json_check_status "${json}" "auditd: queue loss (lost=0)" "PASS"
   assert_json_fail_count "${json}" "0"
 
@@ -923,6 +1021,69 @@ EOF
   getent() {
     if [[ "${1:-}" == "group" && "${2:-}" == "docker" ]]; then
       echo "docker:x:999:alice,bob"
+      return 0
+    fi
+    command getent "$@"
+  }
+
+  docker() {
+    if [[ "${1:-}" == "ps" && "${2:-}" == "-q" ]]; then
+      return 0
+    fi
+    if [[ "${1:-}" == "inspect" ]]; then
+      return 0
+    fi
+    return 0
+  }
+
+  docker_trust_boundary_check
+  local json
+  json="$(emit_validate_results_json)"
+  assert_json_check_status "${json}" "docker-trust: docker group has no named members" "FAIL"
+  assert_json_check_status "${json}" "docker-trust: admin user not in docker group" "FAIL"
+  assert_json_fail_count "${json}" "2"
+
+  stop_fake_unix_socket "${sock_pid}"
+  rm -rf "${sock_dir}"
+}
+
+@test "docker_trust_boundary_check: catches primary-GID docker members" {
+  local sock_dir sock_pid
+  sock_dir="$(mktemp -d)"
+  DOCKER_SOCK="${sock_dir}/docker.sock"
+  sock_pid="$(start_fake_unix_socket "${DOCKER_SOCK}")"
+  ADMIN_USER="primarydocker"
+
+  command() {
+    if [[ "${1:-}" == "-v" && "${2:-}" == "docker" ]]; then
+      return 0
+    fi
+    builtin command "$@"
+  }
+
+  stat() {
+    if [[ "${2:-}" == "${DOCKER_SOCK}" ]]; then
+      case "${1:-}" in
+        -c)
+          case "${3:-}" in
+            %a) echo 660 ;;
+            %U) echo root ;;
+            %G) echo docker ;;
+          esac
+          return 0
+          ;;
+      esac
+    fi
+    command stat "$@"
+  }
+
+  getent() {
+    if [[ "${1:-}" == "group" && "${2:-}" == "docker" ]]; then
+      echo "docker:x:999:"
+      return 0
+    fi
+    if [[ "${1:-}" == "passwd" ]]; then
+      printf 'primarydocker:x:1001:999:Primary Docker:/home/primarydocker:/bin/bash\n'
       return 0
     fi
     command getent "$@"
@@ -1338,6 +1499,8 @@ EOF
   cat > "${compose_file}" <<'EOF'
 services:
   traefik:
+    env_file:
+      - /data/coolify/proxy/.env
     command:
       - '--certificatesresolvers.privatedns.acme.dnschallenge=true'
       - '--certificatesresolvers.privatedns.acme.dnschallenge.provider=cloudflare'
@@ -1514,8 +1677,11 @@ services:
       - '--certificatesresolvers.privatedns.acme.email=coolify-admin@example.com'
       - '--certificatesresolvers.privatedns.acme.storage=/traefik/acme.json'
       - '--certificatesresolvers.privatedns.acme.caserver=https://acme.zerossl.com/v2/DV90'
-      - '--certificatesresolvers.privatedns.acme.eab.kid=test-kid'
-      - '--certificatesresolvers.privatedns.acme.eab.hmacencoded=test-hmac'
+EOF
+
+  cat > "${tempdir}/.env" <<'EOF'
+TRAEFIK_CERTIFICATESRESOLVERS_PRIVATEDNS_ACME_EAB_KID=test-kid
+TRAEFIK_CERTIFICATESRESOLVERS_PRIVATEDNS_ACME_EAB_HMACENCODED=test-hmac
 EOF
 
   cat > "${redirect_file}" <<'EOF'
@@ -1791,7 +1957,12 @@ EOF
     fi
     builtin command "$@"
   }
-  docker() { return 0; }
+  docker() {
+    if [[ "${1:-}" == "info" ]]; then
+      echo " Firewall Backend: iptables"
+    fi
+    return 0
+  }
   systemctl() {
     if [[ "$1" == "list-unit-files" ]]; then
       printf 'UNIT FILE STATE\n'
@@ -1845,8 +2016,19 @@ EOF
     if [[ "${1:-}" == "-t" && "${2:-}" == "filter" && "${3:-}" == "-S" && "${4:-}" == "DOCKER-USER" ]]; then
       cat <<'EOF'
 -N DOCKER-USER
--A DOCKER-USER -m comment --comment coolify-hardening-wan-drop -j DROP
--A DOCKER-USER -m comment --comment coolify-hardening-bridge-docker0 -j RETURN
+-A DOCKER-USER -m comment --comment secure-ubuntu-paas-docker-user-jump -j SECURE-DOCKER-USER
+EOF
+      return 0
+    fi
+    if [[ "${1:-}" == "-t" && "${2:-}" == "filter" && "${3:-}" == "-S" && "${4:-}" == "SECURE-DOCKER-USER" ]]; then
+      cat <<'EOF'
+-N SECURE-DOCKER-USER
+-A SECURE-DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment coolify-hardening-estab -j RETURN
+-A SECURE-DOCKER-USER -i eth0 -m comment --comment coolify-hardening-wan-drop -j DROP
+-A SECURE-DOCKER-USER -i docker_gwbridge -m comment --comment coolify-hardening-bridge-docker-gw -j RETURN
+-A SECURE-DOCKER-USER -i docker0 -m comment --comment coolify-hardening-bridge-docker0 -j RETURN
+-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-unmatched-drop -j DROP
+-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-return -j RETURN
 EOF
       return 0
     fi
@@ -1858,8 +2040,95 @@ EOF
   json="$(emit_validate_results_json)"
   assert_json_check_status "${json}" "docker-user: IPv4 wan-drop" "PASS"
   assert_json_check_status "${json}" "docker-user: IPv4 bridge-docker0" "PASS"
+  assert_json_check_status "${json}" "docker-user: IPv4 bridge-docker-gw" "PASS"
   assert_json_check_status "${json}" "docker-user: tunnel-mode no wan-web" "PASS"
   assert_json_fail_count "${json}" "0"
+}
+
+@test "docker_user_check: rejects an unclassified br-prefixed ingress return" {
+  TUNNEL_MODE="true"
+  DOCKER_RULES_APPLIED="true"
+
+  command() {
+    if [[ "${1:-}" == "-v" ]]; then
+      case "${2:-}" in
+        iptables|docker|systemctl) return 0 ;;
+        ip6tables) return 1 ;;
+      esac
+    fi
+    builtin command "$@"
+  }
+
+  docker() {
+    if [[ "${1:-}" == "info" ]]; then
+      echo "iptables: true"
+      return 0
+    fi
+    return 0
+  }
+
+  systemctl() { return 0; }
+
+  iptables() {
+    if [[ "${1:-}" == "-t" && "${2:-}" == "filter" && "${3:-}" == "-S" && "${4:-}" == "DOCKER-USER" ]]; then
+      cat <<'EOF'
+-N DOCKER-USER
+-A DOCKER-USER -m comment --comment secure-ubuntu-paas-docker-user-jump -j SECURE-DOCKER-USER
+EOF
+      return 0
+    fi
+    if [[ "${1:-}" == "-t" && "${2:-}" == "filter" && "${3:-}" == "-S" && "${4:-}" == "SECURE-DOCKER-USER" ]]; then
+      cat <<'EOF'
+-N SECURE-DOCKER-USER
+-A SECURE-DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment coolify-hardening-estab -j RETURN
+-A SECURE-DOCKER-USER -i eth0 -m comment --comment coolify-hardening-wan-drop -j DROP
+-A SECURE-DOCKER-USER -i docker0 -m comment --comment coolify-hardening-bridge-docker0 -j RETURN
+-A SECURE-DOCKER-USER -i docker_gwbridge -m comment --comment coolify-hardening-bridge-docker-gw -j RETURN
+-A SECURE-DOCKER-USER -i br+ -m comment --comment legacy-unclassified-bridge -j RETURN
+-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-unmatched-drop -j DROP
+-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-return -j RETURN
+EOF
+      return 0
+    fi
+    return 0
+  }
+
+  docker_user_check
+  local json
+  json="$(emit_validate_results_json)"
+  assert_json_check_status "${json}" "docker-user: IPv4 control-flow" "FAIL"
+}
+
+@test "docker_user_check: comment markers cannot spoof terminal DROP actions" {
+  TUNNEL_MODE="true"
+  DOCKER_RULES_APPLIED="true"
+  command() {
+    if [[ "${1:-}" == "-v" ]]; then
+      case "${2:-}" in iptables|docker|systemctl) return 0;; ip6tables) return 1;; esac
+    fi
+    builtin command "$@"
+  }
+  docker() { [[ "${1:-}" == "info" ]] && echo "iptables: true"; return 0; }
+  systemctl() { return 0; }
+  iptables() {
+    if [[ "${4:-}" == "DOCKER-USER" ]]; then
+      printf '%s\n' '-A DOCKER-USER -m comment --comment secure-ubuntu-paas-docker-user-jump -j SECURE-DOCKER-USER'
+    else
+      cat <<'RULES'
+-A SECURE-DOCKER-USER -i eth0 -m comment --comment coolify-hardening-wan-drop -j RETURN
+-A SECURE-DOCKER-USER -i docker0 -m comment --comment coolify-hardening-bridge-docker0 -j RETURN
+-A SECURE-DOCKER-USER -i docker_gwbridge -m comment --comment coolify-hardening-bridge-docker-gw -j RETURN
+-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-unmatched-drop -j RETURN
+-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-return -j RETURN
+RULES
+    fi
+  }
+
+  docker_user_check
+  local json
+  json="$(emit_validate_results_json)"
+  assert_json_check_status "${json}" "docker-user: IPv4 control-flow" "FAIL"
+  assert_json_check_status "${json}" "docker-user: IPv4 wan-drop" "FAIL"
 }
 
 @test "docker_user_lifecycle_check: records info when Docker is not installed" {
@@ -1877,16 +2146,64 @@ EOF
   assert_json_fail_count "${json}" "0"
 }
 
+@test "docker_user_lifecycle_check: requires serialized firewall reconciliation" {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  DOCKER_USER_UNIT_FILE="${tmpdir}/docker-user-hardening.service"
+  DOCKER_USER_SCRIPT="${tmpdir}/docker-user-hardening.sh"
+  cat > "${DOCKER_USER_UNIT_FILE}" <<'UNIT'
+[Unit]
+PartOf=docker.service
+[Install]
+WantedBy=docker.service
+UNIT
+  cat > "${DOCKER_USER_SCRIPT}" <<'SCRIPT'
+#!/usr/bin/env bash
+exec 9>/run/lock/docker-user-hardening.lock
+flock -x 9
+SCRIPT
+  chmod +x "${DOCKER_USER_SCRIPT}"
+  unit_available() { return 1; }
+
+  docker_user_lifecycle_check
+  local json
+  json="$(emit_validate_results_json)"
+  assert_json_check_status "${json}" "docker-user: reconciliation mutex" "PASS"
+
+  sed -i.bak '/flock -x 9/d' "${DOCKER_USER_SCRIPT}"
+  reset_validate_runtime
+  docker_user_lifecycle_check
+  json="$(emit_validate_results_json)"
+  assert_json_check_status "${json}" "docker-user: reconciliation mutex" "FAIL"
+  rm -rf "${tmpdir}"
+}
+
 @test "docker_user_lifecycle_check: records PASS when unit wiring and lifecycle are valid" {
   local unit_file="/etc/systemd/system/docker-user-hardening.service"
   local backup=""
   local had_unit="false"
+  local refresh_service_file="/etc/systemd/system/docker-user-hardening-refresh.service"
+  local refresh_timer_file="/etc/systemd/system/docker-user-hardening-refresh.timer"
+  local refresh_service_backup=""
+  local refresh_timer_backup=""
+  local had_refresh_service="false"
+  local had_refresh_timer="false"
 
   mkdir -p "/etc/systemd/system" 2>/dev/null || skip "unable to create /etc/systemd/system"
   if [[ -f "${unit_file}" ]]; then
     had_unit="true"
     backup="$(mktemp)"
     cp "${unit_file}" "${backup}"
+  fi
+  if [[ -f "${refresh_service_file}" ]]; then
+    had_refresh_service="true"
+    refresh_service_backup="$(mktemp)"
+    cp "${refresh_service_file}" "${refresh_service_backup}"
+  fi
+  if [[ -f "${refresh_timer_file}" ]]; then
+    had_refresh_timer="true"
+    refresh_timer_backup="$(mktemp)"
+    cp "${refresh_timer_file}" "${refresh_timer_backup}"
   fi
 
   cat > "${unit_file}" <<'EOF'
@@ -1902,7 +2219,24 @@ ExecStart=/bin/true
 WantedBy=docker.service
 EOF
 
+  cat > "${refresh_service_file}" <<'EOF'
+[Unit]
+After=docker.service docker-user-hardening.service
+
+[Service]
+ExecStart=/usr/local/sbin/docker-user-hardening.sh
+EOF
+  cat > "${refresh_timer_file}" <<'EOF'
+[Timer]
+OnUnitActiveSec=60s
+Unit=docker-user-hardening-refresh.service
+EOF
+
   systemctl() {
+    if [[ "${1:-}" == "show" && "${2:-}" == "--property=LoadState" ]]; then
+      echo loaded
+      return 0
+    fi
     if [[ "${1:-}" == "show" && "${2:-}" == "docker-user-hardening.service" ]]; then
       case "${3:-}" in
         --property=ActiveState)
@@ -1913,7 +2247,15 @@ EOF
           echo success
           return 0
           ;;
-      esac
+        esac
+    fi
+    if [[ "${1:-}" == "is-enabled" && "${2:-}" == "docker-user-hardening-refresh.timer" ]]; then
+      echo enabled
+      return 0
+    fi
+    if [[ "${1:-}" == "is-active" && "${2:-}" == "docker-user-hardening-refresh.timer" ]]; then
+      echo active
+      return 0
     fi
     return 0
   }
@@ -1932,6 +2274,17 @@ EOF
     rm -f "${unit_file}"
   fi
   rm -f "${backup}"
+  if [[ "${had_refresh_service}" == "true" ]]; then
+    cp "${refresh_service_backup}" "${refresh_service_file}"
+  else
+    rm -f "${refresh_service_file}"
+  fi
+  if [[ "${had_refresh_timer}" == "true" ]]; then
+    cp "${refresh_timer_backup}" "${refresh_timer_file}"
+  else
+    rm -f "${refresh_timer_file}"
+  fi
+  rm -f "${refresh_service_backup}" "${refresh_timer_backup}"
 }
 
 @test "docker_ssh_cidr_sync_check: records PASS when strict mode timer/service are healthy" {
@@ -2324,8 +2677,8 @@ EOF
 @test "rsyslog_check: records PASS when log targets are writable and runtime is healthy" {
   stat() {
     if [[ "${1:-}" == "-c" && "${2:-}" == "%U" ]]; then echo root; return 0; fi
-    if [[ "${1:-}" == "-c" && "${2:-}" == "%G" ]]; then echo syslog; return 0; fi
-    if [[ "${1:-}" == "-c" && "${2:-}" == "%a" ]]; then echo 770; return 0; fi
+    if [[ "${1:-}" == "-c" && "${2:-}" == "%G" ]]; then echo root; return 0; fi
+    if [[ "${1:-}" == "-c" && "${2:-}" == "%a" ]]; then echo 755; return 0; fi
     command stat "$@"
   }
   rsyslog_collect_log_targets() {
@@ -2354,17 +2707,17 @@ EOF
   local json
   json="$(emit_validate_results_json)"
   assert_json_check_status "${json}" "rsyslog: /var/log owner/group" "PASS"
-  assert_json_check_status "${json}" "rsyslog: /var/log group-write enabled" "PASS"
+  assert_json_check_status "${json}" "rsyslog: /var/log mode" "PASS"
   assert_json_check_status "${json}" "rsyslog: logrotate create directive" "PASS"
   assert_json_check_status "${json}" "rsyslog: ufw logrotate create directive" "PASS"
   assert_json_check_status "${json}" "rsyslog: runtime log-write health" "PASS"
 }
 
-@test "rsyslog_check: records FAIL when /var/log is not group-writable and targets are missing" {
+@test "rsyslog_check: records FAIL when /var/log mode is unsafe and targets are missing" {
   stat() {
     if [[ "${1:-}" == "-c" && "${2:-}" == "%U" ]]; then echo root; return 0; fi
-    if [[ "${1:-}" == "-c" && "${2:-}" == "%G" ]]; then echo syslog; return 0; fi
-    if [[ "${1:-}" == "-c" && "${2:-}" == "%a" ]]; then echo 750; return 0; fi
+    if [[ "${1:-}" == "-c" && "${2:-}" == "%G" ]]; then echo root; return 0; fi
+    if [[ "${1:-}" == "-c" && "${2:-}" == "%a" ]]; then echo 770; return 0; fi
     command stat "$@"
   }
   rsyslog_collect_log_targets() {
@@ -2376,7 +2729,7 @@ EOF
   rsyslog_check
   local json
   json="$(emit_validate_results_json)"
-  assert_json_check_status "${json}" "rsyslog: /var/log group-write" "FAIL"
+  assert_json_check_status "${json}" "rsyslog: /var/log mode" "FAIL"
   assert_json_check_status "${json}" "rsyslog: target exists (/var/log/missing.log)" "FAIL"
   assert_json_check_status "${json}" "rsyslog: logrotate create directive" "FAIL"
   assert_json_check_status "${json}" "rsyslog: ufw logrotate create directive" "FAIL"
@@ -2389,7 +2742,9 @@ EOF
       cat <<SSHD
 permitrootlogin no
 passwordauthentication no
+kbdinteractiveauthentication no
 pubkeyauthentication yes
+authenticationmethods publickey
 permitemptypasswords no
 compression no
 ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
@@ -2411,12 +2766,77 @@ SSHD
   assert_json_check_status "${json}" "ssh: passwordauthentication=no" "PASS"
 }
 
+@test "ssh_check: derives Tailscale IP when Dokploy state does not persist it" {
+  local socket_dropin
+  socket_dropin="$(mktemp)"
+  cat > "${socket_dropin}" <<'DROPIN'
+ListenStream=
+ListenStream=100.72.228.23:22
+ListenStream=127.0.0.1:22
+ListenStream=[::1]:22
+DROPIN
+
+  sshd() {
+    if [[ "${1:-}" == "-T" && "${2:-}" != "-C" ]]; then
+      cat <<SSHD
+permitrootlogin no
+passwordauthentication no
+kbdinteractiveauthentication no
+pubkeyauthentication yes
+authenticationmethods publickey
+permitemptypasswords no
+compression no
+ciphers chacha20-poly1305@openssh.com
+macs hmac-sha2-512-etm@openssh.com
+kexalgorithms sntrup761x25519-sha512@openssh.com
+hostkeyalgorithms ssh-ed25519
+allowusers root
+SSHD
+      return 0
+    fi
+    if [[ "${1:-}" == "-T" && "${2:-}" == "-C" && "${3:-}" == addr=100.72.228.23,* ]]; then
+      cat <<'SSHD'
+permitrootlogin prohibit-password
+passwordauthentication no
+kbdinteractiveauthentication no
+authenticationmethods publickey
+allowusers root
+SSHD
+      return 0
+    fi
+    if [[ "${1:-}" == "-T" && "${2:-}" == "-C" ]]; then
+      printf '%s\n' 'permitrootlogin no' 'allowusers root'
+      return 0
+    fi
+    return 0
+  }
+  tailscale() {
+    [[ "${1:-}" == "ip" && "${2:-}" == "-4" ]] && printf '%s\n' '100.72.228.23'
+  }
+
+  PAAS="dokploy"
+  ADMIN_USER="dokployadmin"
+  SSH_PORT="22"
+  TAILSCALE_IP=""
+  SSH_SOCKET_DROPIN="${socket_dropin}"
+  ssh_check
+  local json
+  json="$(emit_validate_results_json)"
+  rm -f "${socket_dropin}"
+
+  assert_json_check_status "${json}" "ssh: Dokploy AllowUsers is root-only" "PASS"
+  assert_json_check_status "${json}" "ssh: Dokploy root key access is Tailscale-only" "PASS"
+  assert_json_check_status "${json}" "ssh: socket listener port and binding" "PASS"
+}
+
 @test "sysctl_check: records PASS when expected values are present" {
   sysctl() {
     if [[ "$1" == "-n" ]]; then
       case "$2" in
         net.ipv4.tcp_syncookies|net.ipv4.ip_forward|fs.protected_hardlinks|fs.protected_symlinks|kernel.kptr_restrict|kernel.dmesg_restrict|kernel.unprivileged_bpf_disabled|net.ipv4.conf.all.accept_source_route|net.ipv4.conf.default.accept_source_route|net.ipv4.conf.all.accept_redirects|net.ipv4.conf.default.accept_redirects|net.ipv4.conf.all.secure_redirects|net.ipv4.conf.default.secure_redirects|net.ipv4.conf.all.send_redirects|net.ipv4.conf.default.send_redirects|net.ipv4.icmp_echo_ignore_broadcasts|net.ipv4.icmp_ignore_bogus_error_responses)
           echo 1 ;;
+        net.ipv6.conf.all.accept_ra|net.ipv6.conf.default.accept_ra)
+          echo 0 ;;
         kernel.perf_event_paranoid)
           echo 3 ;;
         kernel.yama.ptrace_scope)

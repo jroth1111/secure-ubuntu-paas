@@ -246,7 +246,8 @@ cloudflared_check() {
         record "PASS" "cloudflared: public letsencrypt resolver removed"
       fi
 
-      local private_tls_resolver private_tls_ca traefik_command_block private_resolver_flag_fail
+      local private_tls_resolver private_tls_ca traefik_command_block private_resolver_flag_fail proxy_env_file
+      proxy_env_file="$(dirname "${proxy_compose_file}")/.env"
       private_tls_resolver="$(awk '
         $0 ~ /^    coolify-private-(dashboard|realtime|terminal)-https:[[:space:]]*$/ { in_router=1; next }
         in_router && /^[[:space:]]*certResolver:[[:space:]]*/ {
@@ -292,12 +293,16 @@ cloudflared_check() {
         private_tls_ca="zerossl"
       fi
       if [[ "${private_tls_ca}" == "zerossl" ]]; then
-        if grep -Fq -- "--certificatesresolvers.${private_tls_resolver}.acme.eab.kid=" <<< "${traefik_command_block}" \
-          && grep -Fq -- "--certificatesresolvers.${private_tls_resolver}.acme.eab.hmacencoded=" <<< "${traefik_command_block}"; then
+        local private_env_prefix="TRAEFIK_CERTIFICATESRESOLVERS_${private_tls_resolver^^}_ACME_EAB"
+        if { grep -Fq -- "--certificatesresolvers.${private_tls_resolver}.acme.eab.kid=" <<< "${traefik_command_block}" \
+            && grep -Fq -- "--certificatesresolvers.${private_tls_resolver}.acme.eab.hmacencoded=" <<< "${traefik_command_block}"; } \
+          || { grep -Eq "^${private_env_prefix}_KID=[^[:space:]]+$" "${proxy_env_file}" 2>/dev/null \
+            && grep -Eq "^${private_env_prefix}_HMACENCODED=[^[:space:]]+$" "${proxy_env_file}" 2>/dev/null \
+            && grep -Eq '^[[:space:]]*-[[:space:]]*\.env$|/\.env$' "${proxy_compose_file}"; }; then
           record "PASS" "cloudflared: private TLS CA (${private_tls_ca}) flags present"
         else
           record "FAIL" "cloudflared: private TLS CA (${private_tls_ca}) flags present" \
-            "missing ZeroSSL caServer/EAB flags in traefik command block of ${proxy_compose_file}"
+            "missing ZeroSSL caServer/EAB credentials in Traefik command or protected env file"
         fi
       else
         record "PASS" "cloudflared: private TLS CA (${private_tls_ca}) flags present"
@@ -553,4 +558,3 @@ cloudflared_check() {
       "could not determine cloudflared metrics port — manual check needed"
   fi
 }
-

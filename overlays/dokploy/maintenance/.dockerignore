@@ -1,0 +1,6 @@
+*
+!Dockerfile.*
+!source
+!source/**
+!security-overrides.json
+!apply-overrides.cjs

@@ -201,14 +201,27 @@ if command -v ufw >/dev/null 2>&1; then
   for old_cidr in "${old_cidrs[@]}"; do
     old_cidr="${old_cidr//[[:space:]]/}"
     [[ -n "${old_cidr}" ]] || continue
-    # Delete tcp-specific rule
-    ufw --force delete allow in proto tcp from "${old_cidr}" to any port "${ssh_port}" comment "${RULE_COMMENT}" >/dev/null 2>&1 || true
-    # Delete orphaned non-tcp rule (try multiple syntaxes for compatibility)
-    ufw --force delete allow in from "${old_cidr}" to any port "${ssh_port}" comment "${RULE_COMMENT}" >/dev/null 2>&1 || true
-    ufw --force delete allow from "${old_cidr}" to any port "${ssh_port}" comment "${RULE_COMMENT}" >/dev/null 2>&1 || true
+    # Remove every currently numbered managed rule for the old CIDR.  Looking
+    # up the number first keeps reruns idempotent, while a failed deletion is
+    # fatal so stale broad SSH rules cannot survive silently.
+    while true; do
+      ufw_line="$(ufw status numbered 2>/dev/null | awk -v cidr="${old_cidr}" -v comment="${RULE_COMMENT}" 'index($0, cidr) && index($0, comment) { print; exit }')"
+      [[ -n "${ufw_line}" ]] || break
+      ufw_num="$(sed -n 's/^\[[[:space:]]*\([0-9][0-9]*\)[[:space:]]*\].*/\1/p' <<< "${ufw_line}")"
+      [[ -n "${ufw_num}" ]] || { echo "Unable to parse managed UFW rule number: ${ufw_line}" >&2; exit 1; }
+      ufw --force delete "${ufw_num}" >/dev/null 2>&1 \
+        || { echo "Failed to delete managed UFW rule ${ufw_num} for ${old_cidr}" >&2; exit 1; }
+    done
   done
   for cidr in "${cidrs[@]}"; do
-    ufw allow in proto tcp from "${cidr}" to any port "${ssh_port}" comment "${RULE_COMMENT}" >/dev/null 2>&1 || true
+    ufw allow in proto tcp from "${cidr}" to any port "${ssh_port}" comment "${RULE_COMMENT}" >/dev/null 2>&1 \
+      || { echo "Failed to add Docker bridge SSH UFW rule for ${cidr}" >&2; exit 1; }
+  done
+  ufw_status="$(ufw status numbered 2>/dev/null || true)"
+  for cidr in "${cidrs[@]}"; do
+    awk -v cidr="${cidr}" -v comment="${RULE_COMMENT}" \
+      'index($0, cidr) && index($0, comment) { found=1 } END { exit(found ? 0 : 1) }' <<< "${ufw_status}" \
+      || { echo "Docker bridge SSH UFW rule missing after reconciliation for ${cidr}" >&2; exit 1; }
   done
 fi
 

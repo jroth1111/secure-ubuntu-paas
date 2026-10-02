@@ -83,12 +83,15 @@ iptables_usable() {
     local wan_drop_count
     local wan_web_count
     local bridge_count
-    wan_drop_count="$(iptables -t filter -S DOCKER-USER | grep -c 'coolify-hardening-wan-drop')"
-    wan_web_count="$(iptables -t filter -S DOCKER-USER | grep -c 'coolify-hardening-wan-web')"
-    bridge_count="$(iptables -t filter -S DOCKER-USER | grep -c 'coolify-hardening-bridge-docker0')"
+    local gateway_bridge_count
+    wan_drop_count="$(iptables -t filter -S SECURE-DOCKER-USER | grep -c 'coolify-hardening-wan-drop')"
+    wan_web_count="$(iptables -t filter -S SECURE-DOCKER-USER | grep -c 'coolify-hardening-wan-web')"
+    bridge_count="$(iptables -t filter -S SECURE-DOCKER-USER | grep -c 'coolify-hardening-bridge-docker0')"
+    gateway_bridge_count="$(iptables -t filter -S SECURE-DOCKER-USER | grep -c 'coolify-hardening-bridge-docker-gw')"
     [ "${wan_drop_count}" -eq 1 ]
     [ "${wan_web_count}" -eq 1 ]
     [ "${bridge_count}" -eq 1 ]
+    [ "${gateway_bridge_count}" -eq 1 ]
   fi
 
   # Swap fstab idempotency: only one entry after two runs

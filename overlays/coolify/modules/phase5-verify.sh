@@ -279,15 +279,18 @@ coolify_phase5_verify_shared() {
   fi
 
   if [[ "${DEPLOY_MODE}" == "standard" ]]; then
-    # Gate F (standard): external HTTPS endpoint must be reachable.
-    log "Gate F: Checking external HTTPS endpoint..."
+    # Gate F (standard): application ingress may be public, but the Coolify
+    # management hostname must not resolve to a public dashboard router.
+    log "Gate F: Checking public management-host isolation..."
     local https_code
     local gate_f_passed=false
     for (( attempt=1; attempt<=attempts; attempt++ )); do
-      https_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 -L "https://${DOMAIN}" 2>/dev/null)" || https_code=""
+      https_code="$(curl -k -s -o /dev/null -w '%{http_code}' --max-time 10 "https://${DOMAIN}" 2>/dev/null)" || https_code=""
       https_code="${https_code:-000}"
       https_code="${https_code:0:3}"
-      if [[ "${https_code}" =~ ^[23][0-9][0-9]$ ]]; then
+      # A 4xx/5xx still proves that the public management route is reachable;
+      # only a connection-level failure demonstrates public isolation.
+      if [[ "${https_code}" == "000" ]]; then
         gate_f_passed=true
         break
       fi
@@ -298,10 +301,10 @@ coolify_phase5_verify_shared() {
     done
 
     if [[ "${gate_f_passed}" == "true" ]]; then
-      pass "Gate F: https://${DOMAIN} reachable (HTTP ${https_code})"
+      pass "Gate F: public management hostname is unreachable (HTTP ${https_code})"
     else
-      fail "Gate F: https://${DOMAIN} not reachable with success response (last HTTP ${https_code})"
-      die "Gate F failed: external HTTPS endpoint check did not pass."
+      fail "Gate F: public management hostname is reachable (HTTP ${https_code})"
+      die "Gate F failed: Coolify management route is publicly reachable or returning an HTTP error."
     fi
   else
     # Gate F (tunnel/private): private host routes must work on Tailscale-only DNS.

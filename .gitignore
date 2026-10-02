@@ -11,6 +11,9 @@ logs/
 workspace/
 .code-state/
 .tmp_secrets/
+.sol/
+__pycache__/
+*.pyc
 
 # Research notes — potentially sensitive context, not for distribution
 research/

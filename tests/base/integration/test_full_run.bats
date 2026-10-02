@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
 # Tier 2: Full integration tests (standard mode)
-# Requires: --privileged Docker container with systemd as PID 1.
+# Requires: capability-scoped Docker container with systemd as PID 1.
 # setup_file runs the script once; individual tests assert outcomes.
 
 load '../../helpers/helpers'
@@ -282,31 +282,37 @@ ip6tables_usable() {
 
 @test "iptables: DOCKER-USER includes managed comments" {
   iptables_usable || skip "iptables backend unavailable in this kernel"
-  run iptables -t filter -S DOCKER-USER
+  run iptables -t filter -S SECURE-DOCKER-USER
   assert_success
   assert_output --partial "coolify-hardening-bridge-docker0"
+  assert_output --partial "coolify-hardening-bridge-docker-gw"
   assert_output --partial "coolify-hardening-wan-web"
   assert_output --partial "coolify-hardening-wan-drop"
 }
 
 @test "iptables: DOCKER-USER managed rule order is correct" {
   iptables_usable || skip "iptables backend unavailable in this kernel"
-  local rules
+  local shared_rules rules
+  shared_rules="$(iptables -t filter -S DOCKER-USER)"
   local tailscale_n
-  local bridge_n
   local wan_web_n
   local wan_drop_n
-  rules="$(iptables -t filter -S DOCKER-USER)"
+  local bridge_n
+  local gw_bridge_n
+  rules="$(iptables -t filter -S SECURE-DOCKER-USER)"
 
+  [[ "$(awk '$1 == "-A" { print; exit }' <<< "${shared_rules}")" == *"secure-ubuntu-paas-docker-user-jump"* ]]
   tailscale_n="$(grep -n "coolify-hardening-tailscale" <<< "${rules}" | head -1 | cut -d: -f1)"
-  bridge_n="$(grep -n "coolify-hardening-bridge-docker0" <<< "${rules}" | head -1 | cut -d: -f1)"
   wan_web_n="$(grep -n "coolify-hardening-wan-web" <<< "${rules}" | head -1 | cut -d: -f1)"
   wan_drop_n="$(grep -n "coolify-hardening-wan-drop" <<< "${rules}" | head -1 | cut -d: -f1)"
+  bridge_n="$(grep -n "coolify-hardening-bridge-docker0" <<< "${rules}" | head -1 | cut -d: -f1)"
+  gw_bridge_n="$(grep -n "coolify-hardening-bridge-docker-gw" <<< "${rules}" | head -1 | cut -d: -f1)"
 
-  [[ -n "${tailscale_n}" && -n "${bridge_n}" && -n "${wan_web_n}" && -n "${wan_drop_n}" ]]
+  [[ -n "${tailscale_n}" && -n "${bridge_n}" && -n "${gw_bridge_n}" && -n "${wan_web_n}" && -n "${wan_drop_n}" ]]
   (( tailscale_n < bridge_n ))
-  (( bridge_n < wan_web_n ))
   (( wan_web_n < wan_drop_n ))
+  (( wan_drop_n < bridge_n ))
+  (( bridge_n < gw_bridge_n ))
 }
 
 # ── Docker daemon.json ────────────────────────────────────────────────────────
@@ -624,7 +630,7 @@ ip6tables_usable() {
 
 @test "iptables: DOCKER-USER IPv6 chain has wan-drop6 rule" {
   ip6tables_usable || skip "ip6tables backend unavailable in this kernel"
-  run ip6tables -t filter -S DOCKER-USER
+  run ip6tables -t filter -S SECURE-DOCKER-USER6
   assert_success
   assert_output --partial "coolify-hardening-wan-drop6"
 }

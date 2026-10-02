@@ -6,9 +6,28 @@ ufw_check() {
     iface_re="$(regex_escape "${iface}")"
     grep -qE "(^|[[:space:]])${port}/${proto}([[:space:]]|$).*(on[[:space:]]+${iface_re}.*ALLOW IN|ALLOW IN.*on[[:space:]]+${iface_re})([[:space:]]|$)" <<< "${ufw_out}"
   }
-  ufw_has_port_anywhere_unscoped() {
-    local port="$1" proto="${2:-tcp}"
-    grep -qE "(^|[[:space:]])${port}/${proto}([[:space:]]|$)[[:space:]]+ALLOW IN[[:space:]]+Anywhere([[:space:]]+\\(v6\\))?$" <<< "${ufw_out}"
+  ufw_has_port_non_tailscale() {
+    local port="$1" proto="${2:-tcp}" line
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] || continue
+      [[ "${line}" == *"on ${TAILSCALE_IFACE}"* ]] && continue
+      return 0
+    done < <(grep -E "(^|[[:space:]])${port}/${proto}([[:space:]]|$).*ALLOW IN" <<< "${ufw_out}" || true)
+    return 1
+  }
+  ufw_has_port_non_tailscale_non_docker() {
+    local port="$1" proto="${2:-tcp}" line cidr
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] || continue
+      [[ "${line}" == *"on ${TAILSCALE_IFACE}"* ]] && continue
+      local docker_line="false"
+      while IFS= read -r cidr; do
+        [[ -n "${cidr}" && "${line}" == *"${cidr}"* ]] && docker_line="true"
+      done < <(load_docker_ssh_cidrs)
+      [[ "${docker_line}" == "true" ]] && continue
+      return 0
+    done < <(grep -E "(^|[[:space:]])${port}/${proto}([[:space:]]|$).*ALLOW IN" <<< "${ufw_out}" || true)
+    return 1
   }
 
   if grep -q "^Status: active$" <<< "${ufw_out}"; then
@@ -16,6 +35,16 @@ ufw_check() {
   else
     record "FAIL" "ufw: active" "UFW is not active"
     return
+  fi
+
+  # UFW rules are not enough: a permissive default incoming/routed policy can
+  # bypass the intended deny posture when a service or forwarding path is
+  # added later. Keep the recurring check aligned with bootstrap's policy.
+  if grep -qE '^Default:[[:space:]]+deny \(incoming\),[[:space:]]+allow \(outgoing\),[[:space:]]+deny \(routed\)(,|$)' <<< "${ufw_out}"; then
+    record "PASS" "ufw: default policy"
+  else
+    record "FAIL" "ufw: default policy" \
+      "expected deny incoming, allow outgoing, and deny routed in 'ufw status verbose'"
   fi
 
   if ufw_has_port_on_iface "${SSH_PORT}" "${TAILSCALE_IFACE}"; then
@@ -85,7 +114,7 @@ ufw_check() {
   if [[ -n "${WAN_IFACE}" ]]; then
     # SSH must not be on WAN
     if ufw_has_port_on_iface "${SSH_PORT}" "${WAN_IFACE}" \
-      || ufw_has_port_anywhere_unscoped "${SSH_PORT}"; then
+      || ufw_has_port_non_tailscale_non_docker "${SSH_PORT}"; then
       record "FAIL" "ufw: SSH NOT on WAN" "SSH allowed on ${WAN_IFACE}"
     else
       record "PASS" "ufw: SSH NOT on WAN"
@@ -96,7 +125,7 @@ ufw_check() {
       for port_label in "8000:dashboard" "6001:soketi" "6002:terminal"; do
         local port="${port_label%%:*}" label="${port_label##*:}"
         if ufw_has_port_on_iface "${port}" "${WAN_IFACE}" \
-           || ufw_has_port_anywhere_unscoped "${port}"; then
+           || ufw_has_port_non_tailscale "${port}"; then
           record "FAIL" "ufw: ${label} (${port}) NOT on WAN" \
             "port ${port} allowed on WAN — must be tailscale0-only"
         else
@@ -107,13 +136,13 @@ ufw_check() {
 
     if is_true "${TUNNEL_MODE}"; then
       if ufw_has_port_on_iface "80" "${WAN_IFACE}" \
-        || ufw_has_port_anywhere_unscoped "80"; then
+        || ufw_has_port_non_tailscale "80"; then
         record "FAIL" "ufw: tunnel-mode no port 80" "WAN 80 rule exists"
       else
         record "PASS" "ufw: tunnel-mode no port 80"
       fi
       if ufw_has_port_on_iface "443" "${WAN_IFACE}" \
-        || ufw_has_port_anywhere_unscoped "443"; then
+        || ufw_has_port_non_tailscale "443"; then
         record "FAIL" "ufw: tunnel-mode no port 443" "WAN 443 rule exists"
       else
         record "PASS" "ufw: tunnel-mode no port 443"
@@ -123,7 +152,7 @@ ufw_check() {
     case "${TAILSCALE_DIRECT_WAN,,}" in
       true|1|yes|y|on)
         if ufw_has_port_on_iface "41641" "${WAN_IFACE}" "udp" \
-          || ufw_has_port_anywhere_unscoped "41641" "udp"; then
+          || ufw_has_port_non_tailscale "41641" "udp"; then
           record "PASS" "ufw: tailscale direct UDP 41641 on WAN"
         else
           record "FAIL" "ufw: tailscale direct UDP 41641 on WAN" "TAILSCALE_DIRECT_WAN enabled but rule missing"
@@ -131,7 +160,7 @@ ufw_check() {
         ;;
       false|0|no|n|off)
         if ufw_has_port_on_iface "41641" "${WAN_IFACE}" "udp" \
-          || ufw_has_port_anywhere_unscoped "41641" "udp"; then
+          || ufw_has_port_non_tailscale "41641" "udp"; then
           record "FAIL" "ufw: tailscale direct UDP 41641 closed" "TAILSCALE_DIRECT_WAN disabled but WAN rule exists"
         else
           record "PASS" "ufw: tailscale direct UDP 41641 closed"
@@ -139,7 +168,7 @@ ufw_check() {
         ;;
       *)
         if ufw_has_port_on_iface "41641" "${WAN_IFACE}" "udp" \
-          || ufw_has_port_anywhere_unscoped "41641" "udp"; then
+          || ufw_has_port_non_tailscale "41641" "udp"; then
           record "INFO" "ufw: tailscale direct UDP 41641" "rule present (legacy state: tailscale_direct_wan unset)"
         else
           record "INFO" "ufw: tailscale direct UDP 41641" "rule absent (legacy state: tailscale_direct_wan unset)"

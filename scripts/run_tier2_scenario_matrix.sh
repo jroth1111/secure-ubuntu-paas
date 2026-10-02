@@ -4,6 +4,9 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# shellcheck source=scripts/tier2_container_security_args.sh
+source "${SCRIPT_DIR}/tier2_container_security_args.sh"
+
 wait_for_docker() {
   local retries="${DOCKER_WAIT_RETRIES:-90}"
   local delay="${DOCKER_WAIT_DELAY:-2}"
@@ -182,10 +185,11 @@ while IFS=$'\t' read -r scenario_id scenario_title scenario_filter; do
   }
 
   wait_for_docker
-  docker_retry run -d --name "${name}" --privileged \
+  docker_retry run -d --name "${name}" \
+    "${TIER2_CONTAINER_SECURITY_ARGS[@]}" \
     --tmpfs /tmp --tmpfs /run \
-    -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
-    -v "${REPO_ROOT}:${WORKSPACE}" "${IMAGE}" >/dev/null
+    -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+    -v "${REPO_ROOT}:${WORKSPACE}:ro" "${IMAGE}" >/dev/null
   sleep 3
 
   if docker_retry exec "${name}" bats --filter "${scenario_filter}" "${BATS_FILE}" >"${log_file}" 2>&1; then

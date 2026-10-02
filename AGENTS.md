@@ -44,7 +44,7 @@ An LLM can run this project safely only if it tracks this operator model:
    - `base/bootstrap.sh` emits `HARDEN_RESULT_TAILSCALE_IP=<ip>` on stdout.
    - `base/validate.sh --json` emits `{pass,fail,info,checks}` (PaaS-aware: branches on `PAAS=` from state).
    - `PAAS` env var (default `coolify`) is propagated through `deploy.env` into `bootstrap.sh` and `validate.sh` via the bootstrap key allowlist.
-9. **Security invariants**: UFW default-deny, strict SSH posture, DOCKER-USER WAN drop semantics (Coolify only — dFlow defers Docker config to controller, but the substrate's UFW posture stands), fail2ban posture. dFlow adds: Tailscale SSH exclusively for controller attach; no root SSH pubkey or CIDR rules managed by this project.
+9. **Security invariants**: UFW default-deny, strict SSH posture, DOCKER-USER WAN drop semantics (Coolify only — dFlow defers Docker config to controller, but the substrate's UFW posture stands), fail2ban posture, auditd with immutable loginuid attribution (`loginuid_immutable=1`). dFlow adds: Tailscale SSH exclusively for controller attach; no root SSH pubkey or CIDR rules managed by this project.
 10. **Idempotency/resume**: reruns must be safe; `--ts-ip` resumes from phase 2; companion scripts re-sync in phase 2.
 11. **Destructive-op discipline**: deploying is high impact regardless of PaaS. Cloudflare mutations apply only to `--paas coolify`. State command + effect and require explicit confirmation.
 12. **Recovery discipline**: separate real misconfiguration from validation false positives before editing checks. For dFlow, INFO results from `dflow_dokku_check`/`dflow_beszel_check`/`dflow_backups_check` before the controller has attached are expected, not failures.
@@ -69,6 +69,31 @@ command -v ssh && command -v scp && command -v curl && command -v jq && command 
 
 If any prerequisite fails, fix that first.
 
+For a fresh `deploy.sh` run, preferably obtain the VPS provider's verified SSH
+host key/fingerprint out of band and place it in the operator's
+`~/.ssh/known_hosts`, or pass `--server-host-key-file <path>`. The workflow uses
+strict host-key checking from the first root connection and will refuse to send
+a root password or deployment secrets when no matching pin exists.
+
+If the provider console cannot expose or run the host-key fingerprint command,
+an explicit trust-on-first-use (TOFU) fallback is permitted only after the user
+approves that exact risk. Sol must:
+
+1. wait until the rebuilt endpoint is stable and confirm DNS/IP plus the SSH banner;
+2. collect the complete public host-key set at least three times, separated by a
+   short interval, and require byte-identical non-empty observations;
+3. show all resulting SHA-256 fingerprints and obtain explicit approval before
+   collecting or transmitting the root password or Tailscale key;
+4. atomically write the approved key set to a mode-0600 per-run known-hosts file
+   and pass it via `--server-host-key-file`;
+5. discard any incomplete pin and restart the process after every VPS rebuild,
+   reboot-time key change, inconsistent observation, or identity mismatch.
+
+Never call TOFU provider-verified or independently verified. Running
+`ssh-keygen` through the same unverified SSH endpoint is not independent proof.
+The default remains fail-closed, and a single unauthenticated `ssh-keyscan`
+observation is never sufficient.
+
 ### Step 2: Collect Non-Secret Deployment Shape
 
 Always ask first:
@@ -90,7 +115,7 @@ Collect:
 
 - root password (or root password file path for automation) for `deploy.sh` fresh runs (not required for `--ts-ip` resume or `--preflight-only`)
 - Tailscale auth key (`tskey-auth-*`) unless resuming with `--ts-ip` or running `--preflight-only`
-- **Coolify only**: Cloudflare API token (or `--cf-api-token-file`); Cloudflare tunnel token if split-token model is used (`--cf-tunnel-api-token-file`)
+- **Coolify only**: Cloudflare DNS/API token (or `--cf-api-token-file`); a dedicated tunnel token (`--cf-tunnel-api-token-file`) is required in tunnel mode
 - **dFlow only**: no additional credentials required beyond the common set above
 
 ### Step 4: Confirm Defaults
@@ -116,11 +141,11 @@ Use this checklist to avoid over-asking or missing required inputs.
 
 | Workflow | Must be user-provided/decided | Optional overrides (safe defaults exist) | Not required in this workflow |
 |----------|-------------------------------|------------------------------------------|-------------------------------|
-| `deploy.sh` fresh run | `--server-ip`, `--domain`, root password (prompt or `--root-pass-file`), `--tailscale-auth-key`, Cloudflare API token (`CF_API_TOKEN` or `--cf-api-token-file`), server timezone choice (`--server-timezone`; mandatory with `--yes`) | `--admin-user` (`coolifyadmin`), `--pubkey-file` (`~/.ssh/id_ed25519.pub`), `--mode` (`tunnel`), `--app-domain-mode` (`apex`), `--swap-size` (`2G`), `--tailscale-direct-wan` (disabled by default), `--cf-zone`, `--cf-zone-id`, `--cf-account-id`, split tunnel token file (`--cf-tunnel-api-token-file`) | `--ts-ip` |
-| `deploy.sh --preflight-only` | `--server-ip`, `--domain`, Cloudflare API token (`CF_API_TOKEN` or `--cf-api-token-file`), server timezone choice (`--server-timezone`; mandatory with `--yes`) | `--admin-user` (`coolifyadmin`), `--pubkey-file` (`~/.ssh/id_ed25519.pub`), `--mode` (`tunnel`), `--app-domain-mode` (`apex`), `--swap-size` (`2G`), `--tailscale-direct-wan` (disabled by default), `--cf-zone`, `--cf-zone-id`, `--cf-account-id`, split tunnel token file (`--cf-tunnel-api-token-file`) | root password / `--root-pass-file`, `--tailscale-auth-key`, `--ts-ip` |
-| `deploy.sh --ts-ip <ip>` resume | `--server-ip`, `--domain`, `--ts-ip`, Cloudflare API token (`CF_API_TOKEN` or `--cf-api-token-file`), server timezone choice (`--server-timezone`; mandatory with `--yes`) | Same overrides/defaults as fresh run | root password, `--root-pass-file`, `--tailscale-auth-key` |
-| `setup.sh` server-local run | `--server-ip`, `--admin-user`, `--pubkey-file`, `--domain`, Cloudflare API token (`CF_API_TOKEN` or `--cf-api-token-file`), `--tailscale-auth-key` unless `--preflight-only`, server timezone choice (`--server-timezone`; mandatory with `--yes`) | `--mode` (`tunnel`), `--app-domain-mode` (`apex`), `--swap-size` (`2G`), `--tailscale-direct-wan` (disabled by default), `--cf-zone`, `--cf-zone-id`, `--cf-account-id`, split tunnel token file (`--cf-tunnel-api-token-file`) | root password / `--root-pass-file`, `--ts-ip` |
-| `setup.sh --preflight-only` | `--server-ip`, `--admin-user`, `--pubkey-file`, `--domain`, Cloudflare API token (`CF_API_TOKEN` or `--cf-api-token-file`), server timezone choice (`--server-timezone`; mandatory with `--yes`) | `--mode` (`tunnel`), `--app-domain-mode` (`apex`), `--swap-size` (`2G`), `--tailscale-direct-wan` (disabled by default), `--cf-zone`, `--cf-zone-id`, `--cf-account-id`, split tunnel token file (`--cf-tunnel-api-token-file`) | `--tailscale-auth-key`, root password / `--root-pass-file`, `--ts-ip` |
+| `deploy.sh` fresh run | `--server-ip`, `--domain`, root password (prompt or `--root-pass-file`), protected `--tailscale-auth-key-file`, Cloudflare DNS/API token (`CF_API_TOKEN` or `--cf-api-token-file`), dedicated tunnel token in tunnel mode (`CF_TUNNEL_API_TOKEN` or `--cf-tunnel-api-token-file`), server timezone choice (`--server-timezone`; mandatory with `--yes`) | `--admin-user` (`coolifyadmin`), `--pubkey-file` (`~/.ssh/id_ed25519.pub`), `--mode` (`tunnel`), `--app-domain-mode` (`apex`), `--swap-size` (`2G`), `--tailscale-direct-wan` (disabled by default), `--cf-zone`, `--cf-zone-id`, `--cf-account-id` | `--ts-ip` |
+| `deploy.sh --preflight-only` | `--server-ip`, `--domain`, Cloudflare DNS/API token (`CF_API_TOKEN` or `--cf-api-token-file`), dedicated tunnel token in tunnel mode (`CF_TUNNEL_API_TOKEN` or `--cf-tunnel-api-token-file`), server timezone choice (`--server-timezone`; mandatory with `--yes`) | `--admin-user` (`coolifyadmin`), `--pubkey-file` (`~/.ssh/id_ed25519.pub`), `--mode` (`tunnel`), `--app-domain-mode` (`apex`), `--swap-size` (`2G`), `--tailscale-direct-wan` (disabled by default), `--cf-zone`, `--cf-zone-id`, `--cf-account-id` | root password / `--root-pass-file`, `--tailscale-auth-key-file`, `--ts-ip` |
+| `deploy.sh --ts-ip <ip>` resume | `--server-ip`, `--domain`, `--ts-ip`, Cloudflare DNS/API token (`CF_API_TOKEN` or `--cf-api-token-file`), dedicated tunnel token in tunnel mode (`CF_TUNNEL_API_TOKEN` or `--cf-tunnel-api-token-file`), server timezone choice (`--server-timezone`; mandatory with `--yes`) | Same overrides/defaults as fresh run | root password, `--root-pass-file`, `--tailscale-auth-key-file` |
+| `setup.sh` server-local run | `--server-ip`, `--admin-user`, `--pubkey-file`, `--domain`, Cloudflare DNS/API token (`CF_API_TOKEN` or `--cf-api-token-file`), dedicated tunnel token in tunnel mode (`CF_TUNNEL_API_TOKEN` or `--cf-tunnel-api-token-file`), protected `--tailscale-auth-key-file` unless `--preflight-only`, server timezone choice (`--server-timezone`; mandatory with `--yes`) | `--mode` (`tunnel`), `--app-domain-mode` (`apex`), `--swap-size` (`2G`), `--tailscale-direct-wan` (disabled by default), `--cf-zone`, `--cf-zone-id`, `--cf-account-id` | root password / `--root-pass-file`, `--ts-ip` |
+| `setup.sh --preflight-only` | `--server-ip`, `--admin-user`, `--pubkey-file`, `--domain`, Cloudflare DNS/API token (`CF_API_TOKEN` or `--cf-api-token-file`), dedicated tunnel token in tunnel mode (`CF_TUNNEL_API_TOKEN` or `--cf-tunnel-api-token-file`), server timezone choice (`--server-timezone`; mandatory with `--yes`) | `--mode` (`tunnel`), `--app-domain-mode` (`apex`), `--swap-size` (`2G`), `--tailscale-direct-wan` (disabled by default), `--cf-zone`, `--cf-zone-id`, `--cf-account-id` | `--tailscale-auth-key-file`, root password / `--root-pass-file`, `--ts-ip` |
 
 Recommended defaults (when user is undecided):
 - `--mode tunnel`
@@ -135,7 +160,7 @@ Minimal command templates:
 ```bash
 # Coolify: deploy.sh fresh run
 /opt/homebrew/bin/bash deploy.sh --paas coolify --server-ip <ip> --domain <fqdn> --root-pass-file <path> \
-  --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> \
+  --tailscale-auth-key-file <path> --server-timezone <IANA> \
   --cf-api-token-file <path> --yes
 
 # Coolify: deploy.sh resume from phase 2
@@ -148,23 +173,23 @@ Minimal command templates:
 
 # Coolify: setup.sh server-local
 sudo /opt/homebrew/bin/bash setup.sh --paas coolify --server-ip <ip> --admin-user <name> --pubkey-file <path> \
-  --domain <fqdn> --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> \
+  --domain <fqdn> --tailscale-auth-key-file <path> --server-timezone <IANA> \
   --cf-api-token-file <path> --yes
 
 # dFlow: deploy.sh fresh run
 /opt/homebrew/bin/bash deploy.sh --paas dflow --server-ip <ip> --root-pass-file <path> \
   --admin-user dflowadmin --pubkey-file <path> \
-  --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> --yes
+  --tailscale-auth-key-file <path> --server-timezone <IANA> --yes
 
 # dFlow: setup.sh server-local
 sudo /opt/homebrew/bin/bash setup.sh --paas dflow --server-ip <ip> --admin-user <name> --pubkey-file <path> \
-  --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> --yes
+  --tailscale-auth-key-file <path> --server-timezone <IANA> --yes
 ```
 
 Decision tree:
-- Exposure model: choose `tunnel` (private-only dashboard/realtime, no inbound 80/443) or `standard` (public 80/443).
+- Exposure model: choose `tunnel` (private-only dashboard/realtime, no inbound 80/443) or `standard` (public app ingress on 80/443; management remains Tailscale-only).
 - App hostnames: choose `apex` (`appname.<zone>`) or `vps` (`appname.<domain>`).
-- Token model: choose combined token (single API token) or split tokens (DNS token + tunnel token).
+- Token model: use split tokens in tunnel mode (DNS/API token plus a dedicated tunnel token); standard mode needs only the DNS/API token.
 
 Non-interactive caveat:
 - With `--yes`, pass `--server-timezone` (or `SERVER_TIMEZONE`) explicitly. The scripts do not prompt in non-interactive mode.
@@ -258,6 +283,9 @@ Changing these without updating all consumers is a breaking change.
 - **SSH**: global `PermitRootLogin no`; key-only root login only from localhost (`127.0.0.1`, `::1`)
   plus Docker bridge CIDRs via `Match Address`. CIDRs come from strict discovery
   (`STRICT_DOCKER_SSH_CIDRS=true`) with compatibility fallback to `10.0.0.0/8,172.16.0.0/12`.
+- **Dokploy SSH**: the named operator account has no sudo escalation path; privileged
+  deployment operations use the supplied root key only over the Tailscale address, while
+  WAN root login remains disabled.
 - **fail2ban**: ignores Tailscale CIDR (`100.64.0.0/10`); bans WAN brute-force.
 
 ### Idempotency Contract

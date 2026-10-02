@@ -25,8 +25,8 @@ make test-ci-max
 | `make test-orchestrator-smoke` | `deploy.sh`/`setup.sh` orchestrator behavior smoke lane | None |
 | `make test-dry-run` | Dry-run integration (`--dry-run`) | `--cap-add NET_ADMIN` |
 | `make test-validate` | `base/validate.sh` pass/fail behavior | Privileged + systemd |
-| `make test-full-standard` | Full standard-mode integration | Privileged + systemd |
-| `make test-full-tunnel` | Full tunnel-mode integration | Privileged + systemd |
+| `make test-full-standard` | Full standard-mode integration | Capability-scoped systemd container |
+| `make test-full-tunnel` | Full tunnel-mode integration | Capability-scoped systemd container |
 | `make test-idempotency` | Re-run safety / duplicate-prevention checks | Privileged + systemd |
 | `make test-bootstrap-matrix` | Bootstrap scenario matrix | Privileged + systemd |
 | `make test-validate-negative-matrix` | Validator negative/fault-injection matrix | Privileged + systemd |

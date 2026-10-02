@@ -37,6 +37,9 @@ SHELL := /bin/bash
 IMAGE_TIER1 ?= hardening-test-tier1:latest
 IMAGE_TIER2 ?= hardening-test:latest
 BATS_LIB_DIR ?= tests/lib
+BATS_CORE_COMMIT ?= 3bca150ec86275d6d9d5a4fd7d48ab8b6c6f3d87
+BATS_ASSERT_COMMIT ?= f1e9280eaae8f86cbe278a687e6ba755bc802c1a
+BATS_SUPPORT_COMMIT ?= 24a72e14349690bcbf7c151b9d2d1cdd32d36eb1
 ARTIFACTS_DIR ?= artifacts
 CONTAINER_PREFIX ?= ht
 WORKSPACE ?= /workspace
@@ -66,14 +69,20 @@ setup-bats:
 	@command -v bats >/dev/null 2>&1 || { echo "Error: bats not found. Install with: brew install bats-core"; exit 1; }
 	@mkdir -p $(BATS_LIB_DIR)
 	@if [ ! -d "$(BATS_LIB_DIR)/bats-support" ]; then \
-	  git clone --depth 1 https://github.com/bats-core/bats-support.git $(BATS_LIB_DIR)/bats-support; \
+	  git clone --no-checkout --filter=blob:none --depth 1 https://github.com/bats-core/bats-support.git $(BATS_LIB_DIR)/bats-support && \
+	  git -C $(BATS_LIB_DIR)/bats-support fetch --depth 1 origin $(BATS_SUPPORT_COMMIT) && \
+	  git -C $(BATS_LIB_DIR)/bats-support checkout --detach $(BATS_SUPPORT_COMMIT) && \
+	  test "$$(git -C $(BATS_LIB_DIR)/bats-support rev-parse HEAD)" = "$(BATS_SUPPORT_COMMIT)"; \
 	else \
-	  echo "bats-support already installed"; \
+	  test "$$(git -C $(BATS_LIB_DIR)/bats-support rev-parse HEAD)" = "$(BATS_SUPPORT_COMMIT)"; \
 	fi
 	@if [ ! -d "$(BATS_LIB_DIR)/bats-assert" ]; then \
-	  git clone --depth 1 https://github.com/bats-core/bats-assert.git $(BATS_LIB_DIR)/bats-assert; \
+	  git clone --no-checkout --filter=blob:none --depth 1 https://github.com/bats-core/bats-assert.git $(BATS_LIB_DIR)/bats-assert && \
+	  git -C $(BATS_LIB_DIR)/bats-assert fetch --depth 1 origin $(BATS_ASSERT_COMMIT) && \
+	  git -C $(BATS_LIB_DIR)/bats-assert checkout --detach $(BATS_ASSERT_COMMIT) && \
+	  test "$$(git -C $(BATS_LIB_DIR)/bats-assert rev-parse HEAD)" = "$(BATS_ASSERT_COMMIT)"; \
 	else \
-	  echo "bats-assert already installed"; \
+	  test "$$(git -C $(BATS_LIB_DIR)/bats-assert rev-parse HEAD)" = "$(BATS_ASSERT_COMMIT)"; \
 	fi
 
 # ==============================================================================
@@ -91,14 +100,14 @@ test-lint-docker: docker-build-tier1
 
 # Tier 0: Unit tests - local (fastest, no Docker)
 test-unit-local: setup-bats
-	bats tests/base/unit/ tests/overlays/coolify/unit/ tests/overlays/dflow/unit/ tests/overlays/dokploy/unit/ tests/orchestrator/unit/
+	bats tests/base/unit/ tests/lib/unit/ tests/overlays/coolify/unit/ tests/overlays/dflow/unit/ tests/overlays/docker-host/unit/ tests/overlays/dokploy/unit/ tests/orchestrator/unit/
 
 # Tier 1: Unit tests in Docker (for CI consistency)
 test-unit-docker: docker-build-tier1
 	$(RUNNER_BATS_TIER1) \
 	  --image $(IMAGE_TIER1) \
 	  --lane unit \
-	  --target /workspace/tests/base/unit/ /workspace/tests/overlays/coolify/unit/ /workspace/tests/overlays/dflow/unit/ /workspace/tests/overlays/dokploy/unit/ /workspace/tests/orchestrator/unit/ \
+	  --target /workspace/tests/base/unit/ /workspace/tests/lib/unit/ /workspace/tests/overlays/coolify/unit/ /workspace/tests/overlays/dflow/unit/ /workspace/tests/overlays/docker-host/unit/ /workspace/tests/overlays/dokploy/unit/ /workspace/tests/orchestrator/unit/ \
 	  --workspace $(WORKSPACE) \
 	  --artifacts-dir $(ARTIFACTS_DIR)
 
@@ -125,7 +134,7 @@ test-dry-run: docker-build-tier1
 	  --docker-arg --cap-add \
 	  --docker-arg NET_ADMIN
 
-# Tier 2: Full integration tests (privileged systemd container)
+# Tier 2: Full integration tests (capability-scoped systemd container)
 test-full-standard: docker-build-tier2
 	$(RUNNER_BATS_TIER2) \
 	  --image $(IMAGE_TIER2) \

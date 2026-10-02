@@ -31,9 +31,17 @@ finalize_cloudflare_tokens() {
   CF_TUNNEL_API_TOKEN="${CF_TUNNEL_API_TOKEN%$'\n'}"
   CF_TUNNEL_API_TOKEN="${CF_TUNNEL_API_TOKEN%$'\r'}"
 
-  # Single-token mode: if no dedicated tunnel token is provided, reuse CF_API_TOKEN.
-  if [[ -z "${CF_TUNNEL_API_TOKEN:-}" && -n "${CF_API_TOKEN:-}" ]]; then
-    CF_TUNNEL_API_TOKEN="${CF_API_TOKEN}"
+  [[ "${CF_API_TOKEN}" != *$'\n'* && "${CF_API_TOKEN}" != *$'\r'* ]] \
+    || die "Cloudflare API token must be a single line."
+  [[ "${CF_TUNNEL_API_TOKEN}" != *$'\n'* && "${CF_TUNNEL_API_TOKEN}" != *$'\r'* ]] \
+    || die "Cloudflare tunnel API token must be a single line."
+
+  # The tunnel token is placed in Traefik's root-owned env file, and the
+  # public proxy has Docker-socket access. Never put the broader DNS/API token
+  # in that public process: tunnel mode requires a dedicated least-privilege
+  # token with only the account tunnel permissions.
+  if [[ "${DEPLOY_MODE:-}" == "tunnel" && -z "${CF_TUNNEL_API_TOKEN:-}" ]]; then
+    die "Tunnel mode requires a dedicated Cloudflare tunnel API token; do not reuse CF_API_TOKEN."
   fi
 }
 
@@ -47,6 +55,10 @@ finalize_private_tls_ca_inputs() {
   ZEROSSL_EAB_KID="${ZEROSSL_EAB_KID%$'\r'}"
   ZEROSSL_EAB_HMAC="${ZEROSSL_EAB_HMAC%$'\n'}"
   ZEROSSL_EAB_HMAC="${ZEROSSL_EAB_HMAC%$'\r'}"
+  [[ "${ZEROSSL_EAB_KID}" != *$'\n'* && "${ZEROSSL_EAB_KID}" != *$'\r'* ]] \
+    || die "ZeroSSL EAB kid must be a single line."
+  [[ "${ZEROSSL_EAB_HMAC}" != *$'\n'* && "${ZEROSSL_EAB_HMAC}" != *$'\r'* ]] \
+    || die "ZeroSSL EAB hmac must be a single line."
 }
 
 private_tls_resolver_name() {
@@ -107,21 +119,30 @@ cf_api_with_token() {
   local method="$1" endpoint="$2" body="${3:-}" token="${4:-}"
   local url="https://api.cloudflare.com/client/v4${endpoint}"
   local args=(-s -X "${method}" -H "Content-Type: application/json")
-  [[ -n "${body}" ]] && args+=(-d "${body}")
   [[ -n "${token}" ]] || die "Cloudflare API token is empty for ${method} ${endpoint}"
-  # Use a secure temp file instead of pipe to avoid race condition
-  # where the token could be read by other processes
-  local curl_config
+  # Keep both bearer tokens and JSON bodies out of process arguments. Tunnel
+  # creation bodies contain the newly generated tunnel secret.
+  local curl_config body_file="" resp ec
+  umask 077
   curl_config="$(mktemp)" || die "Failed to create temp file for curl config"
   printf -- '-H "Authorization: Bearer %s"\n' "${token}" > "${curl_config}"
   chmod 600 "${curl_config}"
-  local resp ec
-  if ! resp="$(curl --config "${curl_config}" "${args[@]}" "${url}")"; then
+  if [[ -n "${body}" ]]; then
+    body_file="$(mktemp)" || { rm -f "${curl_config}"; die "Failed to create temp file for Cloudflare API body"; }
+    chmod 600 "${body_file}"
+    printf '%s' "${body}" > "${body_file}"
+    args+=(--data-binary "@${body_file}")
+  fi
+  if resp="$(curl --config "${curl_config}" "${args[@]}" "${url}")"; then
+    ec=0
+  else
     ec=$?
     rm -f "${curl_config}"
+    [[ -z "${body_file}" ]] || rm -f "${body_file}"
     return "${ec}"
   fi
   rm -f "${curl_config}"
+  [[ -z "${body_file}" ]] || rm -f "${body_file}"
   printf '%s' "${resp}"
 }
 
@@ -130,7 +151,8 @@ cf_api() {
 }
 
 cf_tunnel_api() {
-  local token="${CF_TUNNEL_API_TOKEN:-${CF_API_TOKEN:-}}"
+  local token="${CF_TUNNEL_API_TOKEN:-}"
+  [[ -n "${token}" ]] || die "Dedicated Cloudflare tunnel API token is required for tunnel operations."
   cf_api_with_token "$1" "$2" "${3-}" "${token}"
 }
 

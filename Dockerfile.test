@@ -1,10 +1,10 @@
-FROM ubuntu:24.04
+FROM ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV container=docker
-ARG BATS_CORE_VERSION=v1.13.0
-ARG BATS_ASSERT_VERSION=v2.2.4
-ARG BATS_SUPPORT_VERSION=v0.3.0
+ARG BATS_CORE_COMMIT=3bca150ec86275d6d9d5a4fd7d48ab8b6c6f3d87
+ARG BATS_ASSERT_COMMIT=f1e9280eaae8f86cbe278a687e6ba755bc802c1a
+ARG BATS_SUPPORT_COMMIT=24a72e14349690bcbf7c151b9d2d1cdd32d36eb1
 
 # Install systemd + script dependencies + BATS tooling
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,11 +24,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -f /lib/systemd/system/basic.target.wants/* \
     && rm -f /lib/systemd/system/anaconda.target.wants/*
 
-# BATS + helpers (pinned for reproducibility)
-RUN git clone --depth 1 --branch ${BATS_CORE_VERSION} https://github.com/bats-core/bats-core.git /opt/bats-core && \
+# BATS + helpers (immutable commits; verify the checked-out revision before use)
+RUN git clone --no-checkout --filter=blob:none --depth 1 https://github.com/bats-core/bats-core.git /opt/bats-core && \
+    git -C /opt/bats-core fetch --depth 1 origin ${BATS_CORE_COMMIT} && \
+    git -C /opt/bats-core checkout --detach ${BATS_CORE_COMMIT} && \
+    test "$(git -C /opt/bats-core rev-parse HEAD)" = "${BATS_CORE_COMMIT}" && \
     /opt/bats-core/install.sh /usr/local && \
-    git clone --depth 1 --branch ${BATS_ASSERT_VERSION} https://github.com/bats-core/bats-assert.git /opt/bats-assert && \
-    git clone --depth 1 --branch ${BATS_SUPPORT_VERSION} https://github.com/bats-core/bats-support.git /opt/bats-support
+    git clone --no-checkout --filter=blob:none --depth 1 https://github.com/bats-core/bats-assert.git /opt/bats-assert && \
+    git -C /opt/bats-assert fetch --depth 1 origin ${BATS_ASSERT_COMMIT} && \
+    git -C /opt/bats-assert checkout --detach ${BATS_ASSERT_COMMIT} && \
+    test "$(git -C /opt/bats-assert rev-parse HEAD)" = "${BATS_ASSERT_COMMIT}" && \
+    git clone --no-checkout --filter=blob:none --depth 1 https://github.com/bats-core/bats-support.git /opt/bats-support && \
+    git -C /opt/bats-support fetch --depth 1 origin ${BATS_SUPPORT_COMMIT} && \
+    git -C /opt/bats-support checkout --detach ${BATS_SUPPORT_COMMIT} && \
+    test "$(git -C /opt/bats-support rev-parse HEAD)" = "${BATS_SUPPORT_COMMIT}"
 
 # Stubs for auditd (kernel audit subsystem unavailable in containers)
 RUN printf '#!/bin/bash\nexit 0\n' > /usr/local/bin/augenrules && chmod +x /usr/local/bin/augenrules

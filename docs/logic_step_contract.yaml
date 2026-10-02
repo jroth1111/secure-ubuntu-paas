@@ -29,6 +29,17 @@ entries:
     no fails'
   - 'tests/base/unit/test_functions.bats::assert_sshd_match_localhost: correct Match config
     passes (prohibit-password)'
+- id: LS-BASE-073
+  script_path: base/modules/ssh.sh
+  function: assert_sshd_match_tailscale
+  criticality: security
+  behavior_test: 'tests/base/unit/test_functions.bats::assert_sshd_match_tailscale: password
+    authentication enabled fails'
+  checks:
+  - 'tests/base/unit/test_functions.bats::assert_sshd_match_tailscale: password authentication
+    enabled fails'
+  - 'tests/base/unit/test_functions.bats::assert_sshd_match_tailscale: Dokploy root key-only
+    match passes'
 - id: LS-BASE-003
   script_path: base/modules/post_checks.sh
   function: bool_cmd
@@ -265,6 +276,15 @@ entries:
   checks:
   - 'tests/base/unit/test_admin.bats::ensure_admin_access: creates user with sudo group
     when user doesn''t exist'
+- id: LS-BASE-021A
+  script_path: base/modules/ssh.sh
+  function: install_admin_authorized_keys_no_follow
+  criticality: security
+  behavior_test: 'tests/base/unit/test_admin.bats::install_admin_authorized_keys_no_follow:
+    stages in destination filesystem'
+  checks:
+  - 'tests/base/unit/test_admin.bats::install_admin_authorized_keys_no_follow: stages in
+    destination filesystem'
 - id: LS-BASE-022
   script_path: base/modules/system.sh
   function: ensure_packages
@@ -416,6 +436,13 @@ entries:
   checks:
   - 'tests/base/unit/test_functions.bats::ssh_session_safety_gate: non-Tailscale IP blocked'
   - 'tests/base/unit/test_functions.bats::ssh_session_safety_gate: no SSH_CONNECTION passes'
+- id: LS-BASE-034A
+  script_path: base/modules/os_detect.sh
+  function: is_tailscale_source_ip
+  criticality: security
+  behavior_test: 'tests/base/unit/test_functions.bats::is_tailscale_source_ip: accepts only exact Tailscale ranges'
+  checks:
+  - 'tests/base/unit/test_functions.bats::is_tailscale_source_ip: accepts only exact Tailscale ranges'
 - id: LS-LIB-TS-003
   script_path: lib/tailscale.sh
   function: verify_tailscale_iface
@@ -482,9 +509,9 @@ entries:
   - 'tests/base/unit/test_validate_additional_behavior.bats::auditd_check: executes and
     records audit status outcomes'
   - 'tests/base/unit/test_validate_check_outcomes_robust.bats::auditd_check: fails when
-    max_log_file_action is not keep_logs'
-  - 'tests/base/unit/test_validate_check_outcomes_robust.bats::auditd_check: fails when
-    queue loss exceeds threshold'
+    max_log_file_action is not rotate'
+  - 'tests/base/unit/test_validate_check_outcomes_robust.bats::auditd_check: fails on any
+    nonzero queue loss'
 - id: LS-BASE-VAL-004
   script_path: base/checks/banner_check.sh
   function: banner_check
@@ -596,6 +623,8 @@ entries:
     records info when Docker is unavailable'
   - 'tests/base/unit/test_validate_check_outcomes_robust.bats::docker_trust_boundary_check:
     records INFO when docker socket is absent'
+  - 'tests/base/unit/test_validate_additional_behavior.bats::docker_trust_boundary_check:
+    Docker inspection failure is fail-closed'
 - id: LS-DOCKER-VAL-003
   script_path: overlays/docker-host/checks/docker_user_check.sh
   function: docker_user_check
@@ -611,6 +640,8 @@ entries:
     when wan-drop rule is missing'
   - 'tests/base/unit/test_validate_check_outcomes_robust.bats::docker_user_check: fails
     in tunnel mode when wan-web rule exists'
+  - 'tests/base/unit/test_validate_additional_behavior.bats::docker_user_check: comment
+    markers cannot spoof terminal DROP actions'
 - id: LS-DOCKER-VAL-004
   script_path: overlays/docker-host/checks/docker_user_lifecycle_check.sh
   function: docker_user_lifecycle_check
@@ -780,6 +811,10 @@ entries:
     tailscale interface is missing'
   - 'tests/base/unit/test_validate_check_outcomes_robust.bats::tailscale_check: fails when
     BackendState is not Running'
+  - 'tests/base/unit/test_validate_check_outcomes_robust.bats::tailscale_check: only explicit
+    disabled node-key expiry passes'
+  - 'tests/base/unit/test_validate_check_outcomes_robust.bats::tailscale_check: missing CLI
+    fails outside a container'
 - id: LS-BASE-VAL-022
   script_path: base/checks/timesync_check.sh
   function: timesync_check
@@ -802,6 +837,8 @@ entries:
     firewall and tailscale-scoped rules'
   - 'tests/base/unit/test_validate_check_outcomes_robust.bats::ufw_check: fails when dashboard
     is exposed on WAN interface'
+  - 'tests/base/unit/test_validate_additional_behavior.bats::ufw_check: protocol-unspecified
+    WAN allow cannot bypass SSH exposure detection'
 - id: LS-COOLIFY-VAL-006
   script_path: overlays/coolify/checks/unattended_upgrades_check.sh
   function: unattended_upgrades_check
@@ -897,8 +934,10 @@ entries:
   checks:
   - 'tests/orchestrator/unit/test_deploy_workflow_contract.bats::deploy: gate B verifies admin
     identity'
-  - 'tests/orchestrator/unit/test_deploy_workflow_contract.bats::deploy: gate A checks admin SSH
-    on tailscale'
+  - 'tests/orchestrator/unit/test_deploy_workflow_contract.bats::deploy: gate A checks PaaS-specific
+    SSH on tailscale'
+  - 'tests/orchestrator/unit/test_deploy_workflow_contract.bats::deploy: Dokploy gate A and B use
+    root over Tailscale'
 - id: LS-DEP-009
   script_path: deploy.sh
   function: phase3_docker_coolify
@@ -972,6 +1011,15 @@ entries:
   checks:
   - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::ssh_admin: uses admin
     key and tailscale destination'
+- id: LS-DEP-016A
+  script_path: deploy.sh
+  function: ssh_root_tailscale
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::ssh_root_tailscale:
+    uses root key and Tailscale destination'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::ssh_root_tailscale: uses
+    root key and Tailscale destination'
 - id: LS-DEP-017
   script_path: deploy.sh
   function: ssh_admin_sudo
@@ -1029,6 +1077,10 @@ entries:
   checks:
   - 'tests/orchestrator/unit/test_deploy_workflow_contract.bats::deploy: gate D validates service
     active and managed rules'
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::verify_docker_user_gate_remote:
+    retries transient SSH after Docker reconciliation'
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::verify_docker_user_gate_remote:
+    retries transient firewall convergence'
 - id: LS-SET-001
   script_path: setup.sh
   function: collect_inputs
@@ -1495,6 +1547,8 @@ entries:
   checks:
   - 'tests/base/unit/test_functions.bats::rsyslog post-check helpers: callable under stubbed
     runtime'
+  - 'tests/base/unit/test_functions.bats::rsyslog_collect_log_targets: extracts legacy and
+    RainerScript omfile paths'
 - id: LS-DOCKER-VAL-007
   script_path: overlays/docker-host/checks/docker_ssh_cidr_sync_check.sh
   function: docker_ssh_cidr_sync_check
@@ -1525,7 +1579,7 @@ entries:
   - 'tests/base/unit/test_validate_additional_behavior.bats::rsyslog_check: records PASS
     when log targets are writable and runtime is healthy'
   - 'tests/base/unit/test_validate_additional_behavior.bats::rsyslog_check: records FAIL
-    when /var/log is not group-writable and targets are missing'
+    when /var/log mode is unsafe and targets are missing'
 - id: LS-BASE-VAL-026
   script_path: base/checks/rsyslog_check.sh
   function: rsyslog_collect_log_targets
@@ -1717,10 +1771,10 @@ entries:
   function: finalize_cloudflare_tokens
   criticality: utility
   behavior_test: 'tests/overlays/coolify/unit/test_common_additional_behavior.bats::finalize_cloudflare_tokens:
-    reuses DNS token when tunnel token is omitted'
+    rejects combined token in tunnel mode'
   checks:
   - 'tests/overlays/coolify/unit/test_common_additional_behavior.bats::finalize_cloudflare_tokens:
-    reuses DNS token when tunnel token is omitted'
+    rejects combined token in tunnel mode'
   - 'tests/overlays/coolify/unit/test_common_additional_behavior.bats::finalize_cloudflare_tokens:
     keeps explicit split tunnel token'
 - id: LS-COOLIFY-LIB-039
@@ -2105,19 +2159,19 @@ entries:
   function: sync_operator_known_host_entries
   criticality: orchestration
   behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::sync_operator_known_host_entries:
-    replaces stale operator known_hosts entries with verified session keys'
+    preserves existing pins and appends verified session keys'
   checks:
   - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::sync_operator_known_host_entries:
-    replaces stale operator known_hosts entries with verified session keys'
+    preserves existing pins and appends verified session keys'
 - id: LS-COOLIFY-LIB-040
   script_path: overlays/coolify/coolify-common.sh
   function: coolify_configure_private_tls_dns_script
   criticality: security
   behavior_test: 'tests/overlays/coolify/unit/test_common_additional_behavior.bats::coolify_configure_private_tls_dns_script:
-    emits private TLS DNS-01 reconciliation'
+    renews certificates on the host without giving Traefik the DNS token'
   checks:
   - 'tests/overlays/coolify/unit/test_common_additional_behavior.bats::coolify_configure_private_tls_dns_script:
-    emits private TLS DNS-01 reconciliation'
+    renews certificates on the host without giving Traefik the DNS token'
 - id: LS-COOLIFY-LIB-041
   script_path: overlays/coolify/coolify-common.sh
   function: coolify_install_binding_guard_script
@@ -2269,8 +2323,17 @@ entries:
   behavior_test: 'tests/base/unit/test_bootstrap_additional_behavior.bats::configure_ssh_socket:
     dry-run logs socket binding without writing dropin'
   checks:
-  - 'tests/base/unit/test_bootstrap_additional_behavior.bats::configure_ssh_socket: skips
-    gracefully when Tailscale IP unavailable'
+  - 'tests/base/unit/test_bootstrap_additional_behavior.bats::configure_ssh_socket: fails
+    closed when Tailscale IP unavailable'
+- id: LS-BASE-055A
+  script_path: base/modules/ssh_socket.sh
+  function: ssh_socket_is_tailscale_ipv4
+  criticality: security
+  behavior_test: 'tests/base/unit/test_bootstrap_additional_behavior.bats::ssh_socket_is_tailscale_ipv4:
+    accepts only exact Tailscale IPv4 range'
+  checks:
+  - 'tests/base/unit/test_bootstrap_additional_behavior.bats::ssh_socket_is_tailscale_ipv4:
+    accepts only exact Tailscale IPv4 range'
 - id: LS-BASE-056
   script_path: base/modules/password_policy.sh
   function: configure_password_policy
@@ -2689,6 +2752,15 @@ entries:
   checks:
   - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::phase4_dokploy_access_policy
     (setup): restricts dashboard and swarm ports to tailscale0'
+- id: LS-DOKPLOY-005
+  script_path: deploy.sh
+  function: phase5_dokploy_operator_confirm
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::phase5_dokploy_operator_confirm
+    (deploy): refuses non-interactive completion before enrollment'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::phase5_dokploy_operator_confirm
+    (deploy): refuses non-interactive completion before enrollment'
 - id: LS-DEP-036
   script_path: deploy.sh
   function: package_deployment_tree
@@ -2716,6 +2788,8 @@ entries:
   checks:
   - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::run_remote_script_via_admin
     (deploy): pipes script to ssh_admin_sudo'
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::run_remote_script_via_admin
+    (deploy): retries transient SSH after network reconcile'
 - id: LS-DEP-039
   script_path: deploy.sh
   function: fetch_phase1_state_line_remote
@@ -2734,3 +2808,185 @@ entries:
   checks:
   - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::reconcile_resume_hardening_remote:
     runs base and dokploy reconciles'
+- id: LS-DEP-041
+  script_path: deploy.sh
+  function: is_tailscale_ipv4
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::deploy security helpers:
+    validate Tailscale addresses, preserve SSH pins, and transport secrets over stdin'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::deploy security helpers:
+    validate Tailscale addresses, preserve SSH pins, and transport secrets over stdin'
+- id: LS-DEP-042
+  script_path: deploy.sh
+  function: known_host_entry_present
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::deploy security helpers:
+    validate Tailscale addresses, preserve SSH pins, and transport secrets over stdin'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::deploy security helpers:
+    validate Tailscale addresses, preserve SSH pins, and transport secrets over stdin'
+- id: LS-DEP-043
+  script_path: deploy.sh
+  function: pin_known_host_alias
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::deploy security helpers:
+    validate Tailscale addresses, preserve SSH pins, and transport secrets over stdin'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::deploy security helpers:
+    validate Tailscale addresses, preserve SSH pins, and transport secrets over stdin'
+- id: LS-DEP-044
+  script_path: deploy.sh
+  function: remote_secret_cleanup_dir
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::deploy security helpers:
+    validate Tailscale addresses, preserve SSH pins, and transport secrets over stdin'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::deploy security helpers:
+    validate Tailscale addresses, preserve SSH pins, and transport secrets over stdin'
+- id: LS-DEP-045
+  script_path: deploy.sh
+  function: remote_secret_dir_create
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::deploy security helpers:
+    validate Tailscale addresses, preserve SSH pins, and transport secrets over stdin'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::deploy security helpers:
+    validate Tailscale addresses, preserve SSH pins, and transport secrets over stdin'
+- id: LS-DEP-046
+  script_path: deploy.sh
+  function: remote_secret_write_file
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::deploy security helpers:
+    validate Tailscale addresses, preserve SSH pins, and transport secrets over stdin'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::deploy security helpers:
+    validate Tailscale addresses, preserve SSH pins, and transport secrets over stdin'
+- id: LS-BASE-074
+  script_path: base/bootstrap.sh
+  function: load_tailscale_auth_key_file
+  criticality: security
+  behavior_test: 'tests/base/unit/test_bootstrap_additional_behavior.bats::load_tailscale_auth_key_file:
+    loads a protected auth-key file without CLI material'
+  checks:
+  - 'tests/base/unit/test_bootstrap_additional_behavior.bats::load_tailscale_auth_key_file:
+    loads a protected auth-key file without CLI material'
+- id: LS-BASE-075
+  script_path: base/bootstrap.sh
+  function: validate_overlay_contract
+  criticality: security
+  behavior_test: 'tests/base/unit/test_bootstrap_additional_behavior.bats::validate_overlay_contract:
+    verifies required dFlow functions before mutation'
+  checks:
+  - 'tests/base/unit/test_bootstrap_additional_behavior.bats::validate_overlay_contract:
+    verifies required dFlow functions before mutation'
+- id: LS-DEP-047
+  script_path: deploy.sh
+  function: remote_tree_dir_create
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::remote_tree_dir_create:
+    requests a protected root deployment staging directory'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::remote_tree_dir_create:
+    requests a protected root deployment staging directory'
+- id: LS-DEP-048
+  script_path: deploy.sh
+  function: remote_tree_cleanup
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::remote_tree_cleanup:
+    only cleans a protected deployment staging directory'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::remote_tree_cleanup:
+    only cleans a protected deployment staging directory'
+- id: LS-DEP-049
+  script_path: deploy.sh
+  function: file_sha256
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::file_sha256:
+    fingerprints deployment archives with an available SHA-256 tool'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::file_sha256:
+    fingerprints deployment archives with an available SHA-256 tool'
+- id: LS-DEP-050
+  script_path: deploy.sh
+  function: known_host_key_material
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::known_host_key_material:
+    extracts the complete pinned key set'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::known_host_key_material:
+    extracts the complete pinned key set'
+- id: LS-DEP-051
+  script_path: deploy.sh
+  function: dokploy_swarm_unlock_keychain_service
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::dokploy_swarm_unlock_keychain_service
+    and store_dokploy_swarm_unlock_key: keep the handoff external'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::dokploy_swarm_unlock_keychain_service
+    and store_dokploy_swarm_unlock_key: keep the handoff external'
+- id: LS-DEP-052
+  script_path: deploy.sh
+  function: store_dokploy_swarm_unlock_key
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::dokploy_swarm_unlock_keychain_service
+    and store_dokploy_swarm_unlock_key: keep the handoff external'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::dokploy_swarm_unlock_keychain_service
+    and store_dokploy_swarm_unlock_key: keep the handoff external'
+- id: LS-DEP-053
+  script_path: deploy.sh
+  function: recover_interrupted_phase1_dokploy_remote
+  criticality: security
+  behavior_test: 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::recover_interrupted_phase1_dokploy_remote:
+    proves partial state, reboots, and reruns bootstrap without Tailscale enrollment'
+  checks:
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::recover_interrupted_phase1_dokploy_remote:
+    proves partial state, reboots, and reruns bootstrap without Tailscale enrollment'
+  - 'tests/orchestrator/unit/test_deploy_setup_additional_behavior.bats::recover_interrupted_phase1_dokploy_remote:
+    refuses when strict partial-state proof fails'
+- id: LS-DOCKER-016
+  script_path: overlays/docker-host/modules/readiness.sh
+  function: docker_ipv6_disabled_without_listeners
+  criticality: security
+  behavior_test: 'tests/base/unit/test_bootstrap_additional_behavior.bats::docker firewall readiness:
+    direct helper assertions'
+  checks:
+  - 'tests/base/unit/test_bootstrap_additional_behavior.bats::docker firewall readiness:
+    direct helper assertions'
+- id: LS-DOCKER-015
+  script_path: overlays/docker-host/modules/readiness.sh
+  function: docker_user_family_rules_present
+  criticality: security
+  behavior_test: 'tests/base/unit/test_bootstrap_additional_behavior.bats::docker firewall readiness:
+    direct helper assertions'
+  checks:
+  - 'tests/base/unit/test_bootstrap_additional_behavior.bats::docker firewall readiness:
+    direct helper assertions'
+- id: LS-BASE-076
+  script_path: base/modules/ufw.sh
+  function: ufw_find_stale_coolify_management_rule
+  criticality: security
+  behavior_test: 'tests/base/unit/test_bootstrap_additional_behavior.bats::ufw reconciliation:
+    finds and removes stale public Coolify management allows'
+  checks:
+  - 'tests/base/unit/test_bootstrap_additional_behavior.bats::ufw reconciliation:
+    finds and removes stale public Coolify management allows'
+- id: LS-BASE-077
+  script_path: base/modules/ufw.sh
+  function: remove_stale_coolify_management_rules
+  criticality: security
+  behavior_test: 'tests/base/unit/test_bootstrap_additional_behavior.bats::ufw reconciliation:
+    finds and removes stale public Coolify management allows'
+  checks:
+  - 'tests/base/unit/test_bootstrap_additional_behavior.bats::ufw reconciliation:
+    finds and removes stale public Coolify management allows'
+- id: LS-BASE-078
+  script_path: base/modules/auditd.sh
+  function: install_auditd_rate_limit_persistence
+  criticality: security
+  behavior_test: 'tests/base/unit/test_bootstrap_additional_behavior.bats::install_auditd_rate_limit_persistence:
+    orders rate before immutable rule load'
+  checks:
+  - 'tests/base/unit/test_bootstrap_additional_behavior.bats::install_auditd_rate_limit_persistence:
+    orders rate before immutable rule load'

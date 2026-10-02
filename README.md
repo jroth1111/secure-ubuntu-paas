@@ -131,9 +131,42 @@ Your laptop
             public internet
 ```
 
-Dokploy mode installs Docker, initializes the Dokploy-managed Swarm path through the official Dokploy installer, and then applies the same Docker host hardening boundary used elsewhere in this project. UFW allows `tailscale0` access to `3000/tcp`; public `3000/tcp`, Docker API ports, Swarm manager/gossip/VXLAN ports, database ports, and private app ports are blocked by the host firewall plus DOCKER-USER policy. Public apps are deliberately exposed only through HTTP/HTTPS on `80/tcp` and `443/tcp`.
+Dokploy mode installs Docker, initializes the Dokploy-managed Swarm path through the official Dokploy installer, and then applies the same Docker host hardening boundary used elsewhere in this project. UFW allows `tailscale0` access to `3000/tcp`; public `3000/tcp`, Docker API ports, Swarm manager/gossip/VXLAN ports, database ports, and private app ports are blocked by the host firewall plus DOCKER-USER policy. The policy also drops container-origin traffic to the published panel port before Docker bridge returns, so a compromised public workload cannot bypass the Tailscale-only dashboard boundary. Public apps are deliberately exposed only through HTTP/HTTPS on `80/tcp` and `443/tcp`; Traefik's UDP/443 HTTP/3 path remains intentionally filtered unless the policy is explicitly changed. Swarm manager autolock is enabled, but its unlock key is handed off to the operator's protected Keychain and never persisted on the VPS; a future Docker restart therefore requires an intentional manual unlock. Docker audit rules are refreshed after the PaaS install, the audit event rate is applied with `auditctl` and persisted through a systemd drop-in, audit rule configuration is locked with final `-e 2`, and both the Dokploy and Traefik privileged service images must be recorded as immutable `tag@sha256` references. The complete `/etc/dokploy` tree is normalized to root ownership and non-writable group/other permissions before Traefik consumes it. The named Dokploy operator account is non-privileged; deployment automation uses the supplied root key only over the Tailscale SSH address. Register the first Dokploy administrator immediately over Tailscale and enable TOTP 2FA before treating the panel as provisioned. The validator also reports when a single-node Swarm advertises the public provider address; never open WAN control ports to compensate, and use the Tailscale endpoint for future approved multi-node setup.
 
 > ⚠️ **Never set a panel domain in Dokploy → Settings → Web Server.** Doing so writes a Traefik route that serves the dashboard on **public 80/443** (any client sending that `Host:` header reaches the login page), silently bypassing the UFW port-3000 lockdown. The validator (`dokploy: panel not on public Traefik`) fails if a panel domain is configured. Access the dashboard only via `http://<tailscale-ip>:3000`.
+
+#### Dokploy updates and recovery
+
+Ubuntu security packages and Tailscale stable updates are automatic. The managed
+six-hour updater resolves Dokploy `latest`, Traefik `v3.7` (security floor
+3.7.13), and PostgreSQL `16` to immutable digests. It does not cross proxy minor
+or database major versions. Applying container patches can cause brief restarts
+on one VPS; this is not a zero-downtime architecture. By default, Docker runtime
+updates and kernel reboots need the operator-held Swarm unlock key. The current
+operator explicitly approved unattended restarts/reboots and disabling autolock;
+the protected [recovery policy](overlays/dokploy/maintenance/README.md) records
+this security/availability tradeoff. Signed Docker stable updates and required
+04:45 Melbourne-time reboots are automatic on that host. Never silently disable
+autolock or store an unlock key beside manager state.
+
+Daily Trivy scans detect new advisories. The patched derivatives rebase on
+official images and refresh OS packages, but application dependency floors are
+still a reviewed manifest: discovering a CVE does not itself guarantee that a
+compatible fix exists or that every dependency is updated automatically.
+
+Before updates, the panel database is streamed through compression and `age`
+encryption to the supplied operator SSH public key. The updater retains the
+newest 28 snapshots under `/var/lib/server-hardening/dokploy-backups`, mode 0600.
+Keep an off-server copy and test restoration; local encrypted snapshots alone
+do not protect against loss of the VPS. The validator checks updater freshness,
+live image receipts, and backup permissions. User application volumes and
+databases need their own backup/restore policy.
+
+Direct root operator sessions are audited with immutable login attribution.
+The bounded audit rate is 10,000 events/sec; any lost event fails validation.
+Changing an already immutable policy requires a reboot under the approved
+maintenance policy, not a runtime reset. On hosts with at least 6 GiB RAM, default control-plane resource
+limits reserve headroom; existing nonzero operator limits are preserved.
 
 ---
 
@@ -194,7 +227,7 @@ cd secure-ubuntu-paas
   --root-pass-file /path/to/root.pass \
   --admin-user myuser \
   --pubkey-file ~/.ssh/id_ed25519.pub \
-  --tailscale-auth-key tskey-auth-... \
+  --tailscale-auth-key-file /path/to/tailscale.auth \
   --server-timezone UTC \
   --domain myapp.example.com \
   --cf-api-token-file /path/to/cf.token \
@@ -202,6 +235,21 @@ cd secure-ubuntu-paas
 ```
 
 `root.pass` is a file containing just your VPS root password (one line, no trailing newline). Never pass passwords as shell arguments.
+
+Before a fresh `deploy.sh` run, preferably add the VPS provider's out-of-band
+verified SSH host key for the public IP to `~/.ssh/known_hosts`, or pass
+`--server-host-key-file <path>`. The orchestrator uses strict host-key checking
+from the first root connection and refuses to transmit the root password or
+deployment secrets without that pin.
+
+When the provider console cannot provide independent verification, the operator
+may explicitly authorize a TOFU bootstrap. Capture the complete public host-key
+set three times after the rebuilt endpoint is stable, require identical non-empty
+observations, display every SHA-256 fingerprint, and obtain explicit approval
+before creating a mode-0600 per-run known-hosts file. Pass that file with
+`--server-host-key-file`. Never reuse a pre-rebuild pin, never describe TOFU as
+provider-verified, and never treat `ssh-keygen` run through that same unverified
+SSH connection as independent evidence.
 
 > `--paas coolify` is the default; you can omit it.
 
@@ -216,7 +264,7 @@ Hardens the VPS, enables Tailscale SSH for the dFlow controller, and stops. The 
   --root-pass-file /path/to/root.pass \
   --admin-user dflowadmin \
   --pubkey-file ~/.ssh/id_ed25519.pub \
-  --tailscale-auth-key tskey-auth-... \
+  --tailscale-auth-key-file /path/to/tailscale.auth \
   --server-timezone UTC \
   --yes
 ```
@@ -234,7 +282,7 @@ Installs Docker + Dokploy, keeps the Dokploy dashboard/API on Tailscale port 300
   --root-pass-file /path/to/root.pass \
   --admin-user dokployadmin \
   --pubkey-file ~/.ssh/id_ed25519.pub \
-  --tailscale-auth-key tskey-auth-... \
+  --tailscale-auth-key-file /path/to/tailscale.auth \
   --server-timezone UTC \
   --domain apps.example.com \
   --yes
@@ -252,7 +300,7 @@ If you've already SSH'd into the VPS, use `setup.sh` instead — same flag surfa
   --paas coolify \
   --admin-user myuser \
   --pubkey-file ~/.ssh/id_ed25519.pub \
-  --tailscale-auth-key tskey-auth-... \
+  --tailscale-auth-key-file /path/to/tailscale.auth \
   --server-timezone UTC \
   --domain myapp.example.com \
   --cf-api-token-file /path/to/cf.token \
@@ -263,7 +311,7 @@ If you've already SSH'd into the VPS, use `setup.sh` instead — same flag surfa
   --paas dflow \
   --admin-user dflowadmin \
   --pubkey-file ~/.ssh/id_ed25519.pub \
-  --tailscale-auth-key tskey-auth-... \
+  --tailscale-auth-key-file /path/to/tailscale.auth \
   --server-timezone UTC \
   --yes
 
@@ -272,7 +320,7 @@ If you've already SSH'd into the VPS, use `setup.sh` instead — same flag surfa
   --paas dokploy \
   --admin-user dokployadmin \
   --pubkey-file ~/.ssh/id_ed25519.pub \
-  --tailscale-auth-key tskey-auth-... \
+  --tailscale-auth-key-file /path/to/tailscale.auth \
   --server-timezone UTC \
   --domain apps.example.com \
   --yes
@@ -287,7 +335,7 @@ sudo ./base/bootstrap.sh \
   --admin-user myuser \
   --admin-pubkey "ssh-ed25519 AAAA... user@host" \
   --install-tailscale \
-  --tailscale-auth-key tskey-auth-...
+  --tailscale-auth-key-file /path/to/tailscale.auth
 ```
 
 ---
@@ -298,13 +346,13 @@ sudo ./base/bootstrap.sh \
 
 Three manual steps in the Cloudflare and Coolify web UIs unlock automatic HTTPS for all your apps:
 
-1. **Cloudflare dashboard → SSL/TLS → Overview** — set mode to **Full** (not Flexible, not Full Strict)
-2. **Coolify → Servers → your server → Wildcard Domain** — set to your zone root, e.g. `example.com`
+1. **Cloudflare dashboard → SSL/TLS → Overview** — set mode to **Full (strict)**; the origin must have a valid hostname-matching certificate.
+2. **Coolify → Servers → your server → Wildcard Domain** — set to the selected app scope (zone root in `apex` mode, or the VPS domain in `vps` mode)
 3. **Coolify → each resource → domain** — use `http://` not `https://` (Traefik handles TLS internally)
 
 After this, every app you deploy in Coolify automatically gets:
-- A subdomain (`appname.example.com`)
-- A wildcard DNS record
+- A subdomain inside the selected scope (`appname.example.com` or `appname.vps.example.com`)
+- A wildcard DNS record inside that scope
 - HTTPS from Cloudflare's Universal SSL
 - Routing through the tunnel to the right container
 
@@ -334,6 +382,7 @@ You then deploy apps through the dFlow UI or via `git push dokku <app> main` fro
 | **Select with** | `--mode tunnel` | `--mode standard` |
 | **Inbound ports open** | None | 80, 443 |
 | **How traffic reaches apps** | Server dials out to Cloudflare | Cloudflare proxies to origin IP |
+| **Management surface** | Tailscale-only | Tailscale-only |
 | **Server IP exposure** | Never directly reachable | Hidden behind Cloudflare (still exposed if proxying bypassed) |
 | **Best for** | Maximum security, typical web apps | Apps with large uploads, streaming, or webhook-heavy workloads |
 
@@ -493,7 +542,7 @@ resync companions before treating gate output as authoritative.
 | `--root-pass-file <path>` | *(required for deploy.sh)* | File containing root password |
 | `--admin-user <name>` | `coolifyadmin` (`dflowadmin` for dFlow) | Admin username to create |
 | `--pubkey-file <path>` | `~/.ssh/id_ed25519.pub` | SSH public key file |
-| `--tailscale-auth-key <key>` | *(required)* | Tailscale auth key |
+| `--tailscale-auth-key-file <path>` | *(required)* | Protected file containing the Tailscale auth key; the key is never accepted as a CLI argument |
 | `--server-timezone <IANA>` | prompted / `UTC` | Server timezone |
 | `--swap-size <size>` | `2G` | Swap file size |
 | `--tailscale-direct-wan` | `false` | Open WAN UDP 41641 for direct Tailscale paths |
@@ -528,7 +577,7 @@ No additional flags are needed — `--paas dflow` enables Tailscale SSH and the 
 | `--timezone <IANA>` | `UTC` | System timezone |
 | `--ssh-port <port>` | `22` | SSH port |
 | `--install-tailscale` | `false` | Install and enroll Tailscale |
-| `--tailscale-auth-key <key>` | — | Auth key (with `--install-tailscale`) |
+| `--tailscale-auth-key-file <path>` | — | Protected auth-key file (with `--install-tailscale`) |
 | `--bind-dashboard-to-tailscale` | `false` | Watchdog to re-enforce Tailscale-only UFW rules for ports 8000/6001/6002 |
 | `--enable-auto-reboot <bool>` | `false` | Auto-reboot after security updates |
 | `--auto-reboot-time <HH:MM>` | `03:30` | Reboot window |

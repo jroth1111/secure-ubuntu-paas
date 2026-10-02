@@ -1,0 +1,10 @@
+[Unit]
+Description=Protect private deployment code and log roots
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/paas-protect-config
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/dokploy/logs /etc/dokploy/compose /etc/dokploy/paas-hardening

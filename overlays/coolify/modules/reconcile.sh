@@ -254,12 +254,9 @@ wait_for_coolify_postgres() {
   exit 1
 }
 wait_for_coolify_postgres
+# The Coolify dashboard is a management surface and remains Tailscale-only in
+# both deployment modes.  Public standard-mode DNS is reserved for app hosts.
 sql_fqdn=""
-if [[ "${DEPLOY_MODE}" == "tunnel" ]]; then
-  sql_fqdn=""
-else
-  sql_fqdn="https://${DOMAIN}"
-fi
 sql="$(cat <<SQL
 DO \$\$
 DECLARE

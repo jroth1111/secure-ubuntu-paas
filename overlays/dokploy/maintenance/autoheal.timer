@@ -1,0 +1,11 @@
+[Unit]
+Description=Check managed runtime health every two minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=2min
+RandomizedDelaySec=15s
+Unit=autoheal.service
+
+[Install]
+WantedBy=timers.target

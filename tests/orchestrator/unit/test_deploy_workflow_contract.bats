@@ -22,6 +22,7 @@ EOF
     resolve_app_domain() { :; }
     ssh_probe=0
     ssh_root() { ssh_probe=1; return 0; }
+    known_host_entry_present() { return 0; }
 
     SKIP_HARDEN="false"
     SERVER_IP="203.0.113.10"
@@ -44,9 +45,14 @@ EOF
     SWAP_SIZE="2G"
     SERVER_TIMEZONE="UTC"
     TAILSCALE_DIRECT_WAN="false"
+    pin_known_host_alias() { :; }
 
     scp_root() { :; }
     ssh_root() {
+      if [[ "$1" == *"mktemp -d -p /run/secure-ubuntu-paas/deploy-trees"* ]]; then
+        echo "/run/secure-ubuntu-paas/deploy-trees/deploy-tree.TEST"
+        return 0
+      fi
       if [[ "$1" == *"/root/base/bootstrap.sh"* ]]; then
         echo "progress"
         echo "HARDEN_RESULT_TAILSCALE_IP=100.64.0.25"
@@ -83,10 +89,15 @@ EOF
     SWAP_SIZE="2G"
     SERVER_TIMEZONE="UTC"
     TAILSCALE_DIRECT_WAN="false"
+    pin_known_host_alias() { :; }
     cmd_file="$(mktemp)"
 
     scp_root() { :; }
     ssh_root() {
+      if [[ "$1" == *"mktemp -d -p /run/secure-ubuntu-paas/deploy-trees"* ]]; then
+        echo "/run/secure-ubuntu-paas/deploy-trees/deploy-tree.TEST"
+        return 0
+      fi
       printf "%s\n" "$1" >> "${cmd_file}"
       if [[ "$1" == *"/root/base/bootstrap.sh"* && "$1" == *"/root/deploy.env"* && "$1" == *"--install-tailscale --force"* ]]; then
         echo "HARDEN_RESULT_TAILSCALE_IP=100.64.0.25"
@@ -101,11 +112,12 @@ EOF
   assert_success
 }
 
-@test "deploy: gate A checks admin SSH on tailscale" {
+@test "deploy: gate A checks PaaS-specific SSH on tailscale" {
   run bash -c '
     source "'"${DEPLOY_SCRIPT}"'"
     TS_IP="100.64.0.25"
     ADMIN_USER="coolifyadmin"
+    known_host_entry_present() { return 0; }
     attempts=0
     sync_called=0
     known_hosts_sync=0
@@ -149,11 +161,52 @@ EOF
   assert_success
 }
 
+@test "deploy: Dokploy gate A and B use root over Tailscale" {
+  run bash -c '
+    source "'"${DEPLOY_SCRIPT}"'"
+    PAAS="dokploy"
+    TS_IP="100.64.0.25"
+    ADMIN_USER="dokployadmin"
+    known_host_entry_present() { return 0; }
+    sleep() { :; }
+    ssh_admin() {
+      case "${1:-}" in
+        "echo ok") echo ok ;;
+        whoami) echo root ;;
+      esac
+      return 0
+    }
+    ssh_admin_sudo() {
+      if [[ "${1:-}" == "test -f /run/reboot-required" ]]; then
+        return 1
+      fi
+      if [[ "${1:-}" == "docker version >/dev/null 2>&1" ]]; then
+        return 1
+      fi
+      if [[ "${1:-}" == *"base/validate.sh --json"* ]]; then
+        echo "{\"fail\":0,\"checks\":[]}"
+      fi
+      return 0
+    }
+    sync_operator_known_host_entries() { :; }
+    sync_companion_scripts() { :; }
+    reconcile_docker_daemon_remote() { :; }
+    report_validation_result() { :; }
+
+    phase2_gates
+  '
+  assert_success
+  assert_output --partial "Gate A: Testing SSH root@100.64.0.25"
+  assert_output --partial "Gate B: whoami=root"
+  refute_output --partial "dokployadmin@100.64.0.25"
+}
+
 @test "deploy: gate B.5 reboots before Gate C when reboot-required exists" {
   run bash -c '
     source "'"${DEPLOY_SCRIPT}"'"
     TS_IP="100.64.0.25"
     ADMIN_USER="coolifyadmin"
+    known_host_entry_present() { return 0; }
     echo_ok_calls=0
     reboot_check_calls=0
     reboot_cmd_seen=0
@@ -194,8 +247,7 @@ EOF
       if [[ "$1" == "systemctl is-active --quiet docker-user-hardening.service" ]]; then
         return 0
       fi
-      if [[ "$1" == "iptables -S DOCKER-USER" ]]; then
-        printf "%s\n" "-A DOCKER-USER -m comment --comment coolify-hardening-return -j RETURN"
+      if [[ "$1" == *"shared_rules="* ]]; then
         return 0
       fi
       if [[ "$1" == "docker version >/dev/null 2>&1" ]]; then
@@ -218,6 +270,57 @@ EOF
   assert_output --partial "Gate B.5: Reboot completed and reboot-required cleared"
 }
 
+@test "deploy: Dokploy gate B.5 escrows and restores an autolocked Swarm across reboot" {
+  run bash -c '
+    source "'"${DEPLOY_SCRIPT}"'"
+    PAAS="dokploy"
+    TS_IP="100.64.0.25"
+    ADMIN_USER="dokployadmin"
+    known_host_entry_present() { return 0; }
+    echo_calls=0
+    key_loaded=0
+    swarm_unlocked=0
+    sleep() { :; }
+    ssh_admin() {
+      if [[ "$1" == "echo ok" ]]; then
+        echo_calls=$((echo_calls + 1))
+        (( echo_calls == 2 )) && return 1
+        printf "%s\n" ok
+        return 0
+      fi
+      [[ "$1" == "whoami" ]] && { printf "%s\n" root; return 0; }
+      return 0
+    }
+    ssh_admin_sudo() {
+      case "$1" in
+        "test -f /run/reboot-required") return 0 ;;
+        "tr '\''\\n'\'' '\'','\'' < /run/reboot-required.pkgs 2>/dev/null | sed '\''s/,$//'\''") printf "%s\n" linux-image ;;
+        "docker version >/dev/null 2>&1") return 0 ;;
+        "test -f /run/secure-ubuntu-paas-dokploy-swarm-unlock-key") return 1 ;;
+        "nohup bash -c \"sleep 1; systemctl reboot\" >/dev/null 2>&1 &") return 0 ;;
+        "test ! -f /run/reboot-required") return 0 ;;
+        *"base/validate.sh --json"*) printf "%s\n" "{\"fail\":0,\"checks\":[]}" ;;
+        *) return 0 ;;
+      esac
+    }
+    dokploy_swarm_state_remote() { printf "active\\ttrue\\n"; }
+    load_dokploy_swarm_unlock_key() { key_loaded=1; DOKPLOY_SWARM_UNLOCK_KEY_RUNTIME="SWMKEY-test"; }
+    unlock_dokploy_swarm_remote() { swarm_unlocked=1; }
+    verify_post_reboot_services_remote() { :; }
+    sync_companion_scripts() { :; }
+    reconcile_resume_hardening_remote() { :; }
+    reconcile_docker_daemon_remote() { :; }
+    reconcile_docker_audit_runtime_remote() { :; }
+    report_validation_result() { :; }
+
+    phase2_gates
+    [[ "${key_loaded}" -eq 1 && "${swarm_unlocked}" -eq 1 ]]
+    [[ -z "${DOKPLOY_SWARM_UNLOCK_KEY_RUNTIME}" ]]
+  '
+  assert_success
+  assert_output --partial "Gate B.5: Reboot completed and reboot-required cleared"
+}
+
 @test "deploy: --ts-ip resume rejects domain drift from phase1 state" {
   run bash -c '
     source "'"${DEPLOY_SCRIPT}"'"
@@ -226,6 +329,7 @@ EOF
     DOMAIN="new.example.com"
     DEPLOY_MODE="tunnel"
     SKIP_HARDEN="true"
+    known_host_entry_present() { return 0; }
 
     sleep() { :; }
     ssh_admin() {
@@ -241,6 +345,9 @@ EOF
         return 0
       fi
       return 1
+    }
+    fetch_phase1_state_line_remote() {
+      printf "old.example.com\ttrue\n"
     }
     sync_operator_known_host_entries() { :; }
     report_validation_result() { :; }
@@ -259,6 +366,7 @@ EOF
     DOMAIN="vps.example.com"
     DEPLOY_MODE="standard"
     SKIP_HARDEN="true"
+    known_host_entry_present() { return 0; }
 
     sleep() { :; }
     ssh_admin() {
@@ -275,6 +383,9 @@ EOF
       fi
       return 1
     }
+    fetch_phase1_state_line_remote() {
+      printf "vps.example.com\ttrue\n"
+    }
     sync_operator_known_host_entries() { :; }
     report_validation_result() { :; }
 
@@ -289,6 +400,7 @@ EOF
     source "'"${DEPLOY_SCRIPT}"'"
     TS_IP="100.64.0.25"
     ADMIN_USER="coolifyadmin"
+    known_host_entry_present() { return 0; }
 
     sleep() { :; }
     ssh_admin() {
@@ -317,6 +429,7 @@ EOF
     source "'"${DEPLOY_SCRIPT}"'"
     TS_IP="100.64.0.25"
     ADMIN_USER="coolifyadmin"
+    known_host_entry_present() { return 0; }
     validate_seen_file="$(mktemp)"
     report_seen=0
 
@@ -339,6 +452,7 @@ EOF
       fi
       return 1
     }
+    reconcile_resume_hardening_remote() { :; }
     reconcile_docker_daemon_remote() { :; }
     sync_companion_scripts() { :; }
     report_validation_result() {
@@ -359,6 +473,7 @@ EOF
     source "'"${DEPLOY_SCRIPT}"'"
     TS_IP="100.64.0.25"
     ADMIN_USER="coolifyadmin"
+    known_host_entry_present() { return 0; }
     timesync_file="$(mktemp)"
     echo 0 > "${timesync_file}"
     validate_file="$(mktemp)"
@@ -478,9 +593,9 @@ EOF
     cf_upsert_a_record() { calls+="$1|$2|$3"$'\''\n'\''; }
 
     phase4_binding_dns
-    grep -q "^coolify.vps.example.com|203.0.113.10|true$" <<< "${calls}"
+    ! grep -q "^coolify.vps.example.com|203.0.113.10|true$" <<< "${calls}"
     grep -q "^\\*.vps.example.com|203.0.113.10|true$" <<< "${calls}"
-    grep -q "^\\*.example.com|203.0.113.10|true$" <<< "${calls}"
+    ! grep -q "^\\*.example.com|203.0.113.10|true$" <<< "${calls}"
   '
   assert_success
 }

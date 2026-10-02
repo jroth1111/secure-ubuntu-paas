@@ -1,0 +1,7 @@
+.git
+.sol
+.beads
+artifacts
+.env
+*.age
+*.log

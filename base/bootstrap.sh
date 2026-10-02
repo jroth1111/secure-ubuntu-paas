@@ -12,7 +12,7 @@ fi
 set -Eeuo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SCRIPT_VERSION="1.2.8"
+SCRIPT_VERSION="1.2.9"
 SCRIPT_NAME="$(basename "$0")"
 
 # shellcheck source=../lib/tailscale.sh
@@ -112,6 +112,19 @@ source "${SCRIPT_DIR}/modules/state.sh"
 # shellcheck source=./modules/validation_timer.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/modules/validation_timer.sh"
+# shellcheck source=./sudo_policy.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/sudo_policy.sh"
+
+validate_overlay_contract() {
+  [[ "${PAAS:-coolify}" == "dflow" ]] || return 0
+  local required_function
+  for required_function in configure_dflow_tailscale_ssh configure_dflow_ssh_access \
+    configure_dflow_ssh_match_dropin configure_dflow_ufw configure_dflow_predeploy_hook; do
+    declare -F "${required_function}" >/dev/null 2>&1 \
+      || die "dFlow overlay contract is incomplete: missing ${required_function}; refusing host mutation."
+  done
+}
 
 LOG_FILE="/var/log/server-hardening.log"
 REPORT_FILE="/var/log/server-hardening-report.json"
@@ -128,14 +141,18 @@ AUDITD_CONF_FILE="/etc/audit/auditd.conf"
 DOCKER_USER_SCRIPT="/usr/local/sbin/docker-user-hardening.sh"
 DOCKER_USER_ENV_FILE="/etc/default/docker-user-hardening"
 DOCKER_USER_UNIT_FILE="/etc/systemd/system/docker-user-hardening.service"
+DOCKER_USER_REFRESH_SERVICE_FILE="/etc/systemd/system/docker-user-hardening-refresh.service"
+DOCKER_USER_REFRESH_TIMER_FILE="/etc/systemd/system/docker-user-hardening-refresh.timer"
 APT_AUTO_FILE="/etc/apt/apt.conf.d/20auto-upgrades"
 APT_LOCAL_FILE="/etc/apt/apt.conf.d/52unattended-upgrades-local"
 # Sorts after distro defaults like /usr/lib/sysctl.d/99-protect-links.conf
 # (which sets fs.protected_fifos=1); sysctl.d applies files by basename order,
 # last wins, so our hardening must sort last to take effect on boot.
 SYSCTL_DROPIN_FILE="/etc/sysctl.d/99-zzz-hardening.conf"
+UFW_SYSCTL_FILE="/etc/ufw/sysctl.conf"
+RSYSLOG_TMPFILES_OVERRIDE="/etc/tmpfiles.d/00rsyslog.conf"
 # 99-zzz prefix sorts after distro modprobe.d blacklists so our install-rules win.
-KERNEL_MODULES_DROPIN_FILE="/etc/modprobe.d/99-zzz-hardening-modules.conf"
+KERNEL_MODULES_DROPIN_FILE="/etc/modprobe.d/zzzz-hardening-modules.conf"
 FAIL2BAN_JAIL_FILE="/etc/fail2ban/jail.d/coolify-hardening.local"
 FAIL2BAN_LOCAL_FILE="/etc/fail2ban/fail2ban.local"
 APPORT_DEFAULT_FILE="/etc/default/apport"
@@ -146,7 +163,10 @@ DOCKER_SSH_CIDR_SYNC_SCRIPT="/usr/local/sbin/docker-ssh-cidr-sync.sh"
 DOCKER_SSH_CIDR_SYNC_SERVICE="/etc/systemd/system/docker-ssh-cidr-sync.service"
 DOCKER_SSH_CIDR_SYNC_TIMER="/etc/systemd/system/docker-ssh-cidr-sync.timer"
 CRON_EXTRA_OPTS_DROPIN="/etc/systemd/system/cron.service.d/10-extra-opts.conf"
-NETWORKD_WAIT_ONLINE_DROPIN="/etc/systemd/system/systemd-networkd-wait-online.service.d/10-any-timeout.conf"
+# Netplan may generate a same-named drop-in under /run at boot.  Use a later
+# lexical name so the hardening ExecStart reset remains authoritative.
+NETWORKD_WAIT_ONLINE_DROPIN="/etc/systemd/system/systemd-networkd-wait-online.service.d/99-hardening.conf"
+NETPLAN_CONFIG_DIR="${NETPLAN_CONFIG_DIR:-/etc/netplan}"
 
 COOLIFY_ENV_FILE="/data/coolify/source/.env"
 
@@ -170,8 +190,13 @@ UPGRADE_MAIL="${UPGRADE_MAIL:-}"
 BIND_DASHBOARD_TO_TAILSCALE="${BIND_DASHBOARD_TO_TAILSCALE:-false}"
 INSTALL_TAILSCALE="${INSTALL_TAILSCALE:-false}"
 TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"
+TAILSCALE_AUTH_KEY_FILE="${TAILSCALE_AUTH_KEY_FILE:-}"
 TAILSCALE_DIRECT_WAN="${TAILSCALE_DIRECT_WAN:-false}"
 PAAS="${PAAS:-coolify}"
+DOCKER_USER_MANAGEMENT_PORT="${DOCKER_USER_MANAGEMENT_PORT:-}"
+if [[ "${PAAS}" == "dokploy" ]]; then
+  DOCKER_USER_MANAGEMENT_PORT="3000"
+fi
 STRICT_DOCKER_SSH_CIDRS="${STRICT_DOCKER_SSH_CIDRS:-true}"
 INSECURE_ENV="${INSECURE_ENV:-false}"
 DOCKER_NPROC_HARD="${DOCKER_NPROC_HARD:-8192}"
@@ -247,8 +272,9 @@ Optional:
   --docker-nproc-soft <num>   Docker default nproc soft limit (default: 4096)
   --allowed-privileged-containers <csv> Comma-separated privileged container names allowed by policy
   --bind-dashboard-to-tailscale Bind Coolify dashboard to Tailscale IP only (split-horizon)
-  --install-tailscale           Install Tailscale if not present (requires --tailscale-auth-key or interactive)
-  --tailscale-auth-key <key>    Tailscale auth key for non-interactive setup (use with --install-tailscale)
+  --install-tailscale           Install or re-enroll Tailscale (requires a protected auth-key file)
+  --tailscale-auth-key-file <path>
+                                Protected Tailscale auth-key file for non-interactive setup
   --tailscale-direct-wan        Allow WAN UDP 41641 for direct Tailscale paths (optional optimization)
   --no-tailscale-direct-wan     Keep WAN UDP 41641 closed (default; DERP fallback remains available)
   --upgrade-mail <address>      Email for unattended-upgrade failure reports (optional)
@@ -326,7 +352,7 @@ unescape_backslash_sequences() {
 
 env_file_key_supported() {
   case "$1" in
-    ADMIN_USER|ADMIN_PUBKEY|DOMAIN|TAILSCALE_CIDR|SSH_PORT|WAN_IFACE|ENABLE_AUTO_REBOOT|AUTO_REBOOT_TIME|UPDATE_PROFILE|JOURNAL_RETENTION|JOURNAL_MAX_USE|TUNNEL_MODE|SWAP_SIZE|TIMEZONE|DRY_RUN|FORCE|UPGRADE_MAIL|BIND_DASHBOARD_TO_TAILSCALE|INSTALL_TAILSCALE|TAILSCALE_AUTH_KEY|TAILSCALE_DIRECT_WAN|STRICT_DOCKER_SSH_CIDRS|INSECURE_ENV|DOCKER_NPROC_HARD|DOCKER_NPROC_SOFT|ALLOWED_PRIVILEGED_CONTAINERS|PAAS)
+    ADMIN_USER|ADMIN_PUBKEY|DOMAIN|TAILSCALE_CIDR|SSH_PORT|WAN_IFACE|ENABLE_AUTO_REBOOT|AUTO_REBOOT_TIME|UPDATE_PROFILE|JOURNAL_RETENTION|JOURNAL_MAX_USE|TUNNEL_MODE|SWAP_SIZE|TIMEZONE|DRY_RUN|FORCE|UPGRADE_MAIL|BIND_DASHBOARD_TO_TAILSCALE|INSTALL_TAILSCALE|TAILSCALE_AUTH_KEY|TAILSCALE_AUTH_KEY_FILE|TAILSCALE_DIRECT_WAN|DOCKER_USER_MANAGEMENT_PORT|STRICT_DOCKER_SSH_CIDRS|INSECURE_ENV|DOCKER_NPROC_HARD|DOCKER_NPROC_SOFT|ALLOWED_PRIVILEGED_CONTAINERS|PAAS)
       return 0
       ;;
     *)
@@ -339,7 +365,7 @@ set_env_file_value() {
   local key="$1"
   local value="$2"
   case "${key}" in
-    ADMIN_USER|ADMIN_PUBKEY|DOMAIN|TAILSCALE_CIDR|SSH_PORT|WAN_IFACE|ENABLE_AUTO_REBOOT|AUTO_REBOOT_TIME|UPDATE_PROFILE|JOURNAL_RETENTION|JOURNAL_MAX_USE|TUNNEL_MODE|SWAP_SIZE|TIMEZONE|DRY_RUN|FORCE|UPGRADE_MAIL|BIND_DASHBOARD_TO_TAILSCALE|INSTALL_TAILSCALE|TAILSCALE_AUTH_KEY|TAILSCALE_DIRECT_WAN|STRICT_DOCKER_SSH_CIDRS|INSECURE_ENV|DOCKER_NPROC_HARD|DOCKER_NPROC_SOFT|ALLOWED_PRIVILEGED_CONTAINERS|PAAS)
+    ADMIN_USER|ADMIN_PUBKEY|DOMAIN|TAILSCALE_CIDR|SSH_PORT|WAN_IFACE|ENABLE_AUTO_REBOOT|AUTO_REBOOT_TIME|UPDATE_PROFILE|JOURNAL_RETENTION|JOURNAL_MAX_USE|TUNNEL_MODE|SWAP_SIZE|TIMEZONE|DRY_RUN|FORCE|UPGRADE_MAIL|BIND_DASHBOARD_TO_TAILSCALE|INSTALL_TAILSCALE|TAILSCALE_AUTH_KEY|TAILSCALE_AUTH_KEY_FILE|TAILSCALE_DIRECT_WAN|DOCKER_USER_MANAGEMENT_PORT|STRICT_DOCKER_SSH_CIDRS|INSECURE_ENV|DOCKER_NPROC_HARD|DOCKER_NPROC_SOFT|ALLOWED_PRIVILEGED_CONTAINERS|PAAS)
       printf -v "${key}" '%s' "${value}"
       ;;
     *)
@@ -562,8 +588,11 @@ parse_args() {
         shift
         ;;
       --tailscale-auth-key)
+        die "--tailscale-auth-key is disabled because CLI arguments leak secrets to process lists/history. Use --tailscale-auth-key-file or a protected env file."
+        ;;
+      --tailscale-auth-key-file)
         require_value "$1" "${2:-}"
-        TAILSCALE_AUTH_KEY="$2"
+        TAILSCALE_AUTH_KEY_FILE="$2"
         shift 2
         ;;
       --tailscale-direct-wan)
@@ -604,23 +633,38 @@ setup_logging() {
     return 0
   fi
 
-  # Keep /var/log non-world-accessible while allowing rsyslog (group: syslog)
-  # to create missing active targets.
-  if getent group syslog >/dev/null 2>&1; then
-    install -d -m 0770 -o root -g syslog /var/log
-    chown root:syslog /var/log
-    chmod 0770 /var/log
-  else
-    install -d -m 0750 /var/log
-    warn "Group 'syslog' not found; using fallback /var/log mode 0750."
+  # /var/log must remain non-writable by service groups.  Rsyslog writes
+  # already-created target files; it does not need create/unlink rights in the
+  # parent directory.  This also prevents a syslog-group principal from
+  # replacing a fixed bootstrap log path with a symlink between reruns.
+  install -d -m 0755 -o root -g root /var/log
+  if [[ -L "${LOG_FILE}" || ( -e "${LOG_FILE}" && ! -f "${LOG_FILE}" ) ]]; then
+    die "Refusing to use non-regular hardening log path: ${LOG_FILE}"
   fi
-  touch "${LOG_FILE}"
+  if [[ ! -e "${LOG_FILE}" ]]; then
+    install -m 0600 -o root -g root /dev/null "${LOG_FILE}"
+  fi
+  [[ -f "${LOG_FILE}" && ! -L "${LOG_FILE}" ]] \
+    || die "Hardening log path is not a regular file: ${LOG_FILE}"
+  chown root:root "${LOG_FILE}"
   chmod 0600 "${LOG_FILE}"
   exec > >(tee -a "${LOG_FILE}") 2>&1
 }
 
 require_root() {
   [[ "$(id -u)" -eq 0 ]] || die "Run as root."
+}
+
+load_tailscale_auth_key_file() {
+  [[ -n "${TAILSCALE_AUTH_KEY_FILE:-}" && -z "${TAILSCALE_AUTH_KEY:-}" ]] || return 0
+  [[ -f "${TAILSCALE_AUTH_KEY_FILE}" && ! -L "${TAILSCALE_AUTH_KEY_FILE}" ]] \
+    || die "Tailscale auth-key file is missing or is a symlink: ${TAILSCALE_AUTH_KEY_FILE}"
+  local key
+  key="$(cat "${TAILSCALE_AUTH_KEY_FILE}")"
+  key="${key%$'\n'}"
+  key="${key%$'\r'}"
+  [[ -n "${key}" ]] || die "Tailscale auth-key file is empty: ${TAILSCALE_AUTH_KEY_FILE}"
+  TAILSCALE_AUTH_KEY="${key}"
 }
 
 validate_pubkey() {
@@ -631,6 +675,7 @@ validate_pubkey() {
 }
 
 validate_inputs() {
+  load_tailscale_auth_key_file
   [[ -n "${ADMIN_USER}" ]] || die "Missing ADMIN_USER / --admin-user."
   [[ -n "${ADMIN_PUBKEY}" ]] || die "Missing ADMIN_PUBKEY / --admin-pubkey."
   [[ "${ADMIN_USER}" != "root" ]] || die "ADMIN_USER must not be root."
@@ -695,10 +740,8 @@ validate_inputs() {
 
   # Validate Tailscale install options
   if is_true "${INSTALL_TAILSCALE}"; then
-    # If Tailscale is not already installed and no auth key provided, warn about interactive mode
-    if ! command -v tailscale >/dev/null 2>&1 && [[ -z "${TAILSCALE_AUTH_KEY}" ]]; then
-      warn "INSTALL_TAILSCALE is set but TAILSCALE_AUTH_KEY not provided. Interactive auth required."
-    fi
+    [[ -n "${TAILSCALE_AUTH_KEY}" ]] \
+      || die "INSTALL_TAILSCALE requires a protected TAILSCALE_AUTH_KEY or TAILSCALE_AUTH_KEY_FILE; refusing to trust an inherited or interactive enrollment."
   fi
 
   validate_pubkey
@@ -769,6 +812,7 @@ validate_inputs() {
 
 main() {
   parse_args "$@"
+  validate_overlay_contract
   require_root
   setup_logging
 

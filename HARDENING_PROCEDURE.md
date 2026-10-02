@@ -34,8 +34,8 @@ The script `base/bootstrap.sh` (v1.2.4) applies 15 baseline controls in this ord
 ## Inputs
 
 Required:
-- `ADMIN_USER`: Linux admin username
-- `ADMIN_PUBKEY`: SSH public key for `ADMIN_USER`
+- `ADMIN_USER`: Linux admin username (a locked, non-login metadata account in Dokploy mode)
+- `ADMIN_PUBKEY`: SSH public key for `ADMIN_USER`, or the sole root authorized key in Dokploy mode
 
 Optional:
 - `WAN_IFACE` (auto-detected if unset)
@@ -225,15 +225,28 @@ Standard mode:
 - Public `80/443` allowed on WAN interface
 - Tailscale UDP `41641` closed on WAN by default (allowed only when `TAILSCALE_DIRECT_WAN=true`)
 - DOCKER-USER contains managed `coolify-hardening-*` rules (IPv4 + IPv6)
-- DOCKER-USER includes bridge rules for container-to-container traffic
+- Validation fails closed when `ip6tables` is present but Docker's IPv6 `DOCKER-USER` chain cannot be read; a missing family policy is never downgraded to informational success
+- DOCKER-USER includes explicit `docker0`, `docker_gwbridge`, and positively inventoried Docker bridge returns for container traffic; the WAN web/drop decision comes first, unknown interfaces hit the terminal drop, and a refresh timer reconciles later Docker network changes
 - `docker-user-hardening.service` configured with `PartOf=docker.service` + `WantedBy=docker.service` — rules automatically re-applied after any Docker daemon restart or security update
+- Docker runtime audit rules are regenerated after Docker/PaaS installation and by the daily validation timer, covering Docker/containerd execution and Docker socket/configuration changes
+- The unattended-upgrade diagnostic dry run uses a mode-0600 randomized file under `/run`, removes it after success, and retains only the protected randomized path on failure
+- Dokploy and Traefik Swarm services are checked for immutable `tag@sha256` image references because both mount the Docker socket; the finalizer resolves a mutable-only Dokploy reference once and fails closed if it cannot obtain a digest
+- Dokploy's default Swarm autolock policy uses an off-server operator key. An explicitly approved root-owned unattended-recovery policy may disable autolock for automatic Docker startup; this trades away off-server protection of the stored manager key. The current operator approved that exception. Never infer it from `--yes` alone.
+- The complete `/etc/dokploy` configuration tree is normalized to root ownership with no group/other write permission before Traefik consumes its bind mounts
+- Dokploy single-node Swarm manager advertisements are surfaced when they use the provider WAN address; WAN control ports remain denied and future multi-node joins must use the Tailscale endpoint rather than weakening the firewall
 - Docker daemon configured with `json-file` log driver (10m x 3 rotation), `live-restore`, `default-ipc-mode=private`, `storage-driver=overlay2`, and hardened `default-ulimits` (`nofile`, `nproc`) (creates or merges with existing `daemon.json`; hardening owns these keys; Coolify may add `default-address-pools`)
-- Sysctl: `tcp_syncookies=1`, `ip_forward=1`, `rp_filter=2`, `protected_hardlinks=1`, `protected_symlinks=1`, `suid_dumpable=0`, `unprivileged_bpf_disabled=2`, `kexec_load_disabled=1`, `sysrq=4`, `randomize_va_space=2`, ICMP redirects disabled, `tcp_max_syn_backlog=2048`, `tcp_synack_retries=2`, `swappiness=10`
+- Sysctl: `tcp_syncookies=1`, `ip_forward=1`, `rp_filter=2`, `protected_hardlinks=1`, `protected_symlinks=1`, `suid_dumpable=0`, `unprivileged_bpf_disabled=2`, `kexec_load_disabled=1`, `sysrq=4`, `randomize_va_space=2`, ICMP redirects and IPv6 router advertisements disabled, `tcp_max_syn_backlog=4096`, `tcp_synack_retries=2`, `swappiness=10`
+- Martian packet logging is enabled for current and future IPv4 interfaces; the
+  daily validation service repairs runtime drift before validation.
 - BBR TCP congestion control active (if kernel supports `tcp_bbr` module), with `fq` qdisc
 - Swap file active at `/swapfile` with `0600` permissions (default 2G, configurable via `--swap-size`)
 - NTP enabled and synchronized verified at hardening time
 - fail2ban active with SSH jail enabled, bans visible in `ufw status`; `ignoreip` includes `100.64.0.0/10` (Tailscale CIDR) — prevents admin lockout from brute-force ban
-- Audit rules loaded: identity, sudoers, sshd-config, Docker
+- Audit rules loaded: identity, sudoers, sshd-config, Docker, and final `-e 2`
+  policy lock
+- Audit rule configuration is immutable (`enabled=2`) and audit login
+  attribution is immutable (`loginuid_immutable=1`); the daily hardening
+  validation service preserves the locked policy and validates both settings
 - Journald persistent with configurable retention (default 3 months)
 - AppArmor verified enabled (warning if disabled)
 - Login banner present at `/etc/issue.net`

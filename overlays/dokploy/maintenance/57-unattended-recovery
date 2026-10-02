@@ -1,0 +1,5 @@
+// Explicitly approved unattended runtime maintenance; unrelated blacklists are preserved.
+Unattended-Upgrade::Origins-Pattern:: "origin=Docker,label=Docker CE,archive=${distro_codename},component=stable,site=download.docker.com";
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
+Unattended-Upgrade::Automatic-Reboot-Time "04:45";

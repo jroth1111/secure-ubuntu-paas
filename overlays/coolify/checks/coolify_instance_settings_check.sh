@@ -56,10 +56,13 @@ coolify_instance_settings_check() {
   fi
 
   settings_row="$(
-    docker exec -i coolify-db env PGPASSWORD="${db_pass}" \
-      psql -v ON_ERROR_STOP=1 -U "${db_user}" -d "${db_name}" -At -F '|' \
-      -c "SELECT is_registration_enabled, COALESCE(fqdn,'') FROM instance_settings LIMIT 1;" \
-      2>/dev/null || true
+    docker exec -i coolify-db sh -ceu '
+      IFS= read -r PGPASSWORD
+      export PGPASSWORD
+      query="SELECT is_registration_enabled, COALESCE(fqdn, '') FROM instance_settings LIMIT 1;"
+      psql -v ON_ERROR_STOP=1 -U "$1" -d "$2" -At -F "|" \
+        -c "$query"
+    ' _ "${db_user}" "${db_name}" <<< "${db_pass}" 2>/dev/null || true
   )"
 
   if [[ -z "${settings_row}" ]]; then
@@ -84,4 +87,3 @@ coolify_instance_settings_check() {
       "expected ${expected_fqdn:-<empty>}, found ${fqdn:-<empty>}"
   fi
 }
-

@@ -101,31 +101,56 @@ EOF
 }
 
 # coolify_configure_cloudflared_script — Emit host-side script to write tunnel creds/config
-# and start cloudflared service. Requires TUNNEL_ID, TUNNEL_SECRET, CF_ACCOUNT_ID, DOMAIN,
-# APP_DOMAIN, CF_ZONE_NAME in environment.
+# and start cloudflared service. Requires TUNNEL_ID, TUNNEL_SECRET_FILE,
+# TUNNEL_SECRET_DIR, CF_ACCOUNT_ID, DOMAIN, APP_DOMAIN, CF_ZONE_NAME in environment.
 coolify_configure_cloudflared_script() {
   cat <<'EOF'
 set -Eeuo pipefail
 : "${TUNNEL_ID:?TUNNEL_ID is required}"
-: "${TUNNEL_SECRET:?TUNNEL_SECRET is required}"
+: "${TUNNEL_SECRET_FILE:?TUNNEL_SECRET_FILE is required}"
+: "${TUNNEL_SECRET_DIR:?TUNNEL_SECRET_DIR is required}"
 : "${CF_ACCOUNT_ID:?CF_ACCOUNT_ID is required}"
 : "${DOMAIN:?DOMAIN is required}"
 : "${APP_DOMAIN:?APP_DOMAIN is required}"
 : "${CF_ZONE_NAME:?CF_ZONE_NAME is required}"
 
-creds_json="$(jq -n --arg id "${TUNNEL_ID}" --arg secret "${TUNNEL_SECRET}" --arg account "${CF_ACCOUNT_ID}" \
-  '{AccountTag:$account,TunnelID:$id,TunnelSecret:$secret}')"
-mkdir -p /etc/cloudflared
-printf '%s' "${creds_json}" > "/etc/cloudflared/${TUNNEL_ID}.json"
-chmod 600 "/etc/cloudflared/${TUNNEL_ID}.json"
+[[ -f "${TUNNEL_SECRET_FILE}" && ! -L "${TUNNEL_SECRET_FILE}" ]] \
+  || { echo "TUNNEL_SECRET_FILE is missing or is a symlink" >&2; exit 1; }
 
-extra_apex_ingress=""
-if [[ "${APP_DOMAIN}" != "${CF_ZONE_NAME}" ]]; then
-  extra_apex_ingress="  - hostname: \"*.${CF_ZONE_NAME}\"
-    service: http://localhost:80
-"
+cleanup_cloudflared_secret() {
+  local rc=$?
+  rm -f -- "${TUNNEL_SECRET_FILE}" 2>/dev/null || true
+  rmdir -- "${TUNNEL_SECRET_DIR}" 2>/dev/null || true
+  return "${rc}"
+}
+trap cleanup_cloudflared_secret EXIT
+
+creds_json="$(jq -n --arg id "${TUNNEL_ID}" --rawfile secret "${TUNNEL_SECRET_FILE}" --arg account "${CF_ACCOUNT_ID}" \
+  '{AccountTag:$account,TunnelID:$id,TunnelSecret:($secret | rtrimstr("\n"))}')"
+cloudflared_dir="/etc/cloudflared"
+if [[ -L "${cloudflared_dir}" || ( -e "${cloudflared_dir}" && ! -d "${cloudflared_dir}" ) ]]; then
+  echo "${cloudflared_dir} is a symlink or unexpected file" >&2
+  exit 1
 fi
-cat > /etc/cloudflared/config.yml <<CFG
+install -d -m 0700 -o root -g root "${cloudflared_dir}"
+credential_path="${cloudflared_dir}/${TUNNEL_ID}.json"
+if [[ -L "${credential_path}" || ( -e "${credential_path}" && ! -f "${credential_path}" ) ]]; then
+  echo "${credential_path} is a symlink or unexpected file" >&2
+  exit 1
+fi
+creds_tmp="$(mktemp "${cloudflared_dir}/.credentials.XXXXXX")"
+( umask 077; printf '%s' "${creds_json}" > "${creds_tmp}" )
+chown root:root "${creds_tmp}"
+chmod 0600 "${creds_tmp}"
+mv -f "${creds_tmp}" "${credential_path}"
+
+config_path="${cloudflared_dir}/config.yml"
+if [[ -L "${config_path}" || ( -e "${config_path}" && ! -f "${config_path}" ) ]]; then
+  echo "${config_path} is a symlink or unexpected file" >&2
+  exit 1
+fi
+config_tmp="$(mktemp "${cloudflared_dir}/.config.XXXXXX")"
+cat > "${config_tmp}" <<CFG
 tunnel: ${TUNNEL_ID}
 credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
 metrics: 127.0.0.1:2000
@@ -137,8 +162,11 @@ ingress:
     service: http_status:404
   - hostname: "*.${APP_DOMAIN}"
     service: http://localhost:80
-${extra_apex_ingress}  - service: http_status:404
+  - service: http_status:404
 CFG
+chown root:root "${config_tmp}"
+chmod 0600 "${config_tmp}"
+mv -f "${config_tmp}" "${config_path}"
 
 cloudflared service install 2>/dev/null || true
 systemctl enable --now cloudflared

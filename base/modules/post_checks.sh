@@ -17,17 +17,12 @@ is_container_runtime() {
 }
 
 assert_rsyslog_posture() {
-  local log_dir_owner log_dir_group log_dir_mode log_dir_group_digit
+  local log_dir_owner log_dir_group log_dir_mode
   local target q_target target_owner target_group target_mode
-  local expected_dir_group="syslog"
+  local expected_dir_group="root"
   local expected_target_owner="syslog"
   local expected_target_group="adm"
-  local require_dir_group_write="true"
 
-  if ! getent group syslog >/dev/null 2>&1; then
-    expected_dir_group="root"
-    require_dir_group_write="false"
-  fi
   if ! getent passwd syslog >/dev/null 2>&1; then
     expected_target_owner="root"
   fi
@@ -44,13 +39,7 @@ assert_rsyslog_posture() {
   log_dir_mode="$(stat -c '%a' /var/log 2>/dev/null || true)"
   [[ "${log_dir_owner}" == "root" ]] || die "Post-check failed: /var/log owner is ${log_dir_owner:-unknown}, expected root."
   [[ "${log_dir_group}" == "${expected_dir_group}" ]] || die "Post-check failed: /var/log group is ${log_dir_group:-unknown}, expected ${expected_dir_group}."
-  [[ "${log_dir_mode}" =~ ^[0-7]{3,4}$ ]] || die "Post-check failed: /var/log mode unreadable (${log_dir_mode:-unknown})."
-  if is_true "${require_dir_group_write}"; then
-    log_dir_group_digit="${log_dir_mode: -2:1}"
-    if (( (10#${log_dir_group_digit} & 2) == 0 )); then
-      die "Post-check failed: /var/log mode ${log_dir_mode} lacks group write; rsyslog cannot create missing log targets."
-    fi
-  fi
+  [[ "${log_dir_mode}" == "755" ]] || die "Post-check failed: /var/log mode is ${log_dir_mode:-unknown}, expected 755 without service-group write access."
 
   while IFS= read -r target; do
     [[ -n "${target}" ]] || continue
@@ -92,9 +81,30 @@ run_post_checks() {
   ssh_effective="$(sshd -T 2>/dev/null || true)"
   assert_sshd_effective "${ssh_effective}" || die "Post-check failed: sshd effective settings do not match expected hardening."
 
-  local ssh_match_local
-  ssh_match_local="$(sshd -T -C addr=127.0.0.1,user=root,host=localhost,laddr=127.0.0.1 2>/dev/null || true)"
-  assert_sshd_match_localhost "${ssh_match_local}" || die "Post-check failed: SSH Match block for localhost/Docker root access not effective."
+  if [[ "${PAAS}" == "coolify" ]]; then
+    local ssh_match_local
+    ssh_match_local="$(sshd -T -C addr=127.0.0.1,user=root,host=localhost,laddr=127.0.0.1 2>/dev/null || true)"
+    assert_sshd_match_localhost "${ssh_match_local}" \
+      || die "Post-check failed: SSH Match block for localhost/Docker root access not effective."
+  elif [[ "${PAAS}" == "dokploy" ]]; then
+    local tailscale_root_ip="${DETECTED_TAILSCALE_IP:-}"
+    if [[ -z "${tailscale_root_ip}" ]] && command -v tailscale >/dev/null 2>&1; then
+      tailscale_root_ip="$(tailscale ip -4 2>/dev/null || true)"
+    fi
+    [[ -n "${tailscale_root_ip}" ]] \
+      || die "Post-check failed: Dokploy root Tailscale address is unavailable."
+    local ssh_match_tailscale
+    ssh_match_tailscale="$(sshd -T -C "addr=${tailscale_root_ip},user=root,host=localhost,laddr=${tailscale_root_ip}" 2>/dev/null || true)"
+    assert_sshd_match_tailscale "${ssh_match_tailscale}" \
+      || die "Post-check failed: root key access is not limited to Tailscale for Dokploy."
+  else
+    # dFlow and other non-Coolify PaaS must not gain a root Match carve-out.
+    local ssh_match_local
+    ssh_match_local="$(sshd -T -C addr=127.0.0.1,user=root,host=localhost,laddr=127.0.0.1 2>/dev/null || true)"
+    if grep -qE "^permitrootlogin (prohibit-password|without-password|yes)$" <<< "${ssh_match_local}"; then
+      die "Post-check failed: root login is permitted from localhost for PAAS=${PAAS}."
+    fi
+  fi
 
   local ssh_match_external
   ssh_match_external="$(sshd -T -C addr=203.0.113.1,user=root,host=example.com,laddr=0.0.0.0 2>/dev/null || true)"
@@ -103,16 +113,27 @@ run_post_checks() {
   fi
 
   ufw status | grep -q "^Status: active$" || die "Post-check failed: UFW is not active."
-  ufw status verbose | grep -qE "${SSH_PORT}/tcp.*on ${TAILSCALE_IFACE}.*ALLOW IN" || die "Post-check failed: SSH allow rule on ${TAILSCALE_IFACE} missing."
-  if ufw status verbose | grep -qE "${SSH_PORT}/tcp.*on ${WAN_IFACE}.*ALLOW IN"; then
+  local ufw_verbose
+  ufw_verbose="$(ufw status verbose 2>/dev/null || true)"
+  grep -qE '^Default:[[:space:]]+deny \(incoming\),[[:space:]]+allow \(outgoing\),[[:space:]]+deny \(routed\)(,|$)' <<< "${ufw_verbose}" \
+    || die "Post-check failed: UFW default policy must deny incoming and routed traffic."
+  grep -qE "${SSH_PORT}/tcp.*on ${TAILSCALE_IFACE}.*ALLOW IN" <<< "${ufw_verbose}" \
+    || die "Post-check failed: SSH allow rule on ${TAILSCALE_IFACE} missing."
+  if grep -qE "${SSH_PORT}/tcp.*on ${WAN_IFACE}.*ALLOW IN" <<< "${ufw_verbose}"; then
     die "Post-check failed: SSH appears allowed on WAN interface ${WAN_IFACE}."
   fi
 
+  if [[ "${PAAS}" == "coolify" ]]; then
+    if stale_coolify_management_rule="$(ufw_find_stale_coolify_management_rule)" && [[ -n "${stale_coolify_management_rule}" ]]; then
+      die "Post-check failed: stale public Coolify management UFW rule remains: ${stale_coolify_management_rule}"
+    fi
+  fi
+
   if is_true "${TUNNEL_MODE}"; then
-    if ufw status verbose | grep -qE "80/tcp.*on ${WAN_IFACE}.*ALLOW IN"; then
+    if ufw status numbered | awk -v ts_iface="${TAILSCALE_IFACE}" '/ALLOW IN/ && $0 ~ /80\/tcp/ && index($0, "on " ts_iface) == 0 { found=1 } END { exit(found ? 0 : 1) }'; then
       die "Post-check failed: tunnel-mode is active but WAN port 80 UFW rule exists."
     fi
-    if ufw status verbose | grep -qE "443/tcp.*on ${WAN_IFACE}.*ALLOW IN"; then
+    if ufw status numbered | awk -v ts_iface="${TAILSCALE_IFACE}" '/ALLOW IN/ && $0 ~ /443\/tcp/ && index($0, "on " ts_iface) == 0 { found=1 } END { exit(found ? 0 : 1) }'; then
       die "Post-check failed: tunnel-mode is active but WAN port 443 UFW rule exists."
     fi
   fi
@@ -134,15 +155,37 @@ run_post_checks() {
     fi
 
     if [[ "${DOCKER_RULES_APPLIED}" == "true" ]]; then
-      iptables -t filter -S DOCKER-USER | grep -q "coolify-hardening-wan-drop" || die "Post-check failed: DOCKER-USER IPv4 drop rule missing."
-      iptables -t filter -S DOCKER-USER | grep -q "coolify-hardening-bridge-docker0" || die "Post-check failed: DOCKER-USER bridge-docker0 rule missing."
+      iptables -t filter -S DOCKER-USER | awk '$1 == "-A" { print; exit }' | grep -q -- "-j SECURE-DOCKER-USER" \
+        || die "Post-check failed: DOCKER-USER managed policy jump is not first."
+      iptables -t filter -S SECURE-DOCKER-USER | grep -q "coolify-hardening-wan-drop" \
+        || die "Post-check failed: DOCKER-USER IPv4 drop rule missing."
+      iptables -t filter -S SECURE-DOCKER-USER | grep -q "coolify-hardening-unmatched-drop" \
+        || die "Post-check failed: DOCKER-USER IPv4 unmatched-ingress drop rule missing."
+      iptables -t filter -S SECURE-DOCKER-USER | grep -q "coolify-hardening-bridge-docker0" \
+        || die "Post-check failed: DOCKER-USER bridge-docker0 rule missing."
       if is_true "${TUNNEL_MODE}"; then
-        if iptables -t filter -S DOCKER-USER | grep -q "coolify-hardening-wan-web"; then
+        if iptables -t filter -S SECURE-DOCKER-USER | grep -q "coolify-hardening-wan-web"; then
           die "Post-check failed: tunnel-mode is active but DOCKER-USER wan-web ACCEPT rule exists."
         fi
       fi
       if command -v ip6tables >/dev/null 2>&1; then
-        ip6tables -t filter -S DOCKER-USER 2>/dev/null | grep -q "coolify-hardening-wan-drop6" || die "Post-check failed: DOCKER-USER IPv6 drop rule missing."
+        ip6tables -t filter -S DOCKER-USER 2>/dev/null | awk '$1 == "-A" { print; exit }' | grep -q -- "-j SECURE-DOCKER-USER6" \
+          || die "Post-check failed: DOCKER-USER IPv6 policy jump is not first."
+        ip6tables -t filter -S SECURE-DOCKER-USER6 2>/dev/null | grep -q "coolify-hardening-wan-drop6" \
+          || die "Post-check failed: DOCKER-USER IPv6 drop rule missing."
+        ip6tables -t filter -S SECURE-DOCKER-USER6 2>/dev/null | grep -q "coolify-hardening-unmatched-drop6" \
+          || die "Post-check failed: DOCKER-USER IPv6 unmatched-ingress drop rule missing."
+        ip6tables -t filter -S SECURE-DOCKER-USER6 2>/dev/null | grep -q "coolify-hardening-bridge-docker0" \
+          || die "Post-check failed: DOCKER-USER IPv6 bridge-docker0 rule missing."
+        if is_true "${TUNNEL_MODE}"; then
+          if ip6tables -t filter -S SECURE-DOCKER-USER6 | grep -q "coolify-hardening-wan-web6"; then
+            die "Post-check failed: tunnel-mode is active but DOCKER-USER IPv6 wan-web ACCEPT rule exists."
+          fi
+        elif ! ip6tables -t filter -S SECURE-DOCKER-USER6 | grep -q "coolify-hardening-wan-web6"; then
+          die "Post-check failed: standard-mode DOCKER-USER IPv6 wan-web ACCEPT rule is missing."
+        fi
+      elif ! docker_ipv6_disabled_without_listeners; then
+        die "Post-check failed: ip6tables is unavailable and a safe IPv6-disabled Docker posture was not proved."
       fi
     elif [[ "${docker_service_present}" == "true" ]]; then
       die "Post-check failed: docker.service exists but DOCKER-USER rules were not applied."
@@ -240,8 +283,13 @@ run_post_checks() {
     if tailscale status --json >/dev/null 2>&1; then
       local run_ssh_pref
       run_ssh_pref="$(tailscale_runssh_pref_value 5 1)"
-      [[ "${run_ssh_pref}" == "false" ]] \
-        || die "Post-check failed: tailscale RunSSH is ${run_ssh_pref:-unknown}, expected false."
+      if [[ "${PAAS}" == "dflow" ]]; then
+        [[ "${run_ssh_pref}" == "true" ]] \
+          || die "Post-check failed: dFlow requires Tailscale RunSSH=true, got ${run_ssh_pref:-unknown}."
+      else
+        [[ "${run_ssh_pref}" == "false" ]] \
+          || die "Post-check failed: tailscale RunSSH is ${run_ssh_pref:-unknown}, expected false."
+      fi
     elif is_true "${INSTALL_TAILSCALE}"; then
       die "Post-check failed: tailscale CLI is present but status is unavailable after INSTALL_TAILSCALE=true."
     else

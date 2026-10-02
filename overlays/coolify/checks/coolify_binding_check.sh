@@ -16,6 +16,23 @@ coolify_binding_check() {
   local ufw_out
   ufw_out="$(ufw status 2>/dev/null)" || true
 
+  local stale_management_rule=""
+  stale_management_rule="$(ufw status numbered 2>/dev/null | awk -v ts_iface="${TAILSCALE_IFACE}" '
+    function is_management_port(line) {
+      return line ~ /(^|[[:space:]])(8000|6001|6002)(\/tcp)?([[:space:]]|$)/
+    }
+    /ALLOW IN/ && is_management_port($0) && index($0, "on " ts_iface) == 0 {
+      print
+      exit
+    }
+  ')"
+  if [[ -n "${stale_management_rule}" ]]; then
+    record "FAIL" "coolify: no stale public management UFW rules" \
+      "broad or WAN-scoped Coolify management allow remains: ${stale_management_rule}"
+  else
+    record "PASS" "coolify: no stale public management UFW rules"
+  fi
+
   # Check UFW rule for port 8000 on tailscale0
   if echo "${ufw_out}" | grep -q "8000.*on ${TAILSCALE_IFACE}"; then
     record "PASS" "coolify: UFW rule port 8000 on ${TAILSCALE_IFACE}"
@@ -58,4 +75,3 @@ coolify_binding_check() {
     record "FAIL" "coolify: UFW binding-guard timer" "not active — UFW rule drift may go undetected"
   fi
 }
-

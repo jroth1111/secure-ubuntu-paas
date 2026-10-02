@@ -391,10 +391,7 @@ setup() {
         'systemctl is-active --quiet docker-user-hardening.service')
           return 0
           ;;
-        'iptables -S DOCKER-USER')
-          echo '-N DOCKER-USER'
-          echo '-A DOCKER-USER -j coolify-hardening-input'
-          echo '-A coolify-hardening-input -s 10.0.0.0/8 -j ACCEPT'
+        *'shared_rules='*)
           return 0
           ;;
       esac
@@ -454,13 +451,13 @@ setup() {
 
 # ── SSH Options ────────────────────────────────────────────────────────────────
 
-@test "deploy: SSH_OPTS disables strict host key checking" {
-  run bash -c "source '${DEPLOY_SCRIPT}'; echo \"\${SSH_OPTS}\""
-  assert_output --partial "StrictHostKeyChecking=no"
+@test "deploy: SSH_OPTS requires strict host key checking" {
+  run bash -c "source '${DEPLOY_SCRIPT}'; init_ssh_options; echo \"\${SSH_OPTS}\""
+  assert_output --partial "StrictHostKeyChecking=yes"
 }
 
 @test "deploy: SSH_OPTS sets connection timeout" {
-  run bash -c "source '${DEPLOY_SCRIPT}'; echo \"\${SSH_OPTS}\""
+  run bash -c "source '${DEPLOY_SCRIPT}'; init_ssh_options; echo \"\${SSH_OPTS}\""
   assert_output --partial "ConnectTimeout="
 }
 

@@ -47,6 +47,24 @@ fi
 
 unset _helpers_loaded
 
+# The project also defines a logging-only fail(), which must never replace
+# bats-support's assertion failure semantics inside an assertion call.
+eval "$(declare -f fail | sed '1s/^fail /_bats_assertion_fail /')"
+eval "$(declare -f run | sed '1s/^run /_bats_native_run /')"
+
+# Production bootstrap helpers must call their own dry-run executor, not the
+# BATS capture function. Otherwise a dry-run test can execute real commands.
+restore_test_run_dispatcher() {
+  run() {
+    case "${BASH_SOURCE[1]:-}" in
+      "${PROJECT_ROOT}/base/"*)
+        if declare -F script_run >/dev/null; then script_run "$@"; else _bats_native_run "$@"; fi
+        ;;
+      *) _bats_native_run "$@" ;;
+    esac
+  }
+}
+
 # Source the script to import functions.
 # Guards against:
 #   1. set -Eeuo pipefail and ERR trap leaking into the BATS process
@@ -54,10 +72,10 @@ unset _helpers_loaded
 source_script() {
   # Save BATS's run function before it gets overwritten
   if declare -f run >/dev/null 2>&1; then
-    eval "$(declare -f run | sed '1s/^run /bats_run /')" 2>/dev/null
+    eval "$(declare -f _bats_native_run | sed '1s/^_bats_native_run /bats_run /')" 2>/dev/null
   fi
 
-  local _old_opts
+  local _old_opts _old_errexit="${-//[^e]/}"
   _old_opts="$(set +o)"          # capture current shell options as restore commands
   local _old_traps
   _old_traps="$(trap -p ERR)"    # capture current ERR trap (if any)
@@ -65,6 +83,7 @@ source_script() {
   source "${SCRIPT}"
 
   eval "${_old_opts}"            # restore original shell options
+  [[ "${_old_errexit}" != "e" ]] || set -e
   trap - ERR                     # clear any ERR trap set by the script
   if [[ -n "${_old_traps}" ]]; then
     eval "${_old_traps}"         # restore original ERR trap if there was one
@@ -74,7 +93,7 @@ source_script() {
   if declare -f run >/dev/null 2>&1; then
     eval "$(declare -f run | sed '1s/^run /script_run /')"
   fi
-  eval "$(declare -f bats_run | sed '1s/^bats_run /run /')"
+  restore_test_run_dispatcher
 }
 
 # Source deploy.sh to import functions for unit testing.
@@ -82,10 +101,10 @@ source_script() {
 source_deploy_script() {
   # Save BATS's run function before it gets overwritten
   if declare -f run >/dev/null 2>&1; then
-    eval "$(declare -f run | sed '1s/^run /bats_run /')" 2>/dev/null
+    eval "$(declare -f _bats_native_run | sed '1s/^_bats_native_run /bats_run /')" 2>/dev/null
   fi
 
-  local _old_opts
+  local _old_opts _old_errexit="${-//[^e]/}"
   _old_opts="$(set +o)"
   local _old_traps
   _old_traps="$(trap -p ERR)"
@@ -93,6 +112,7 @@ source_deploy_script() {
   source "${DEPLOY_SCRIPT}"
 
   eval "${_old_opts}"
+  [[ "${_old_errexit}" != "e" ]] || set -e
   trap - ERR
   if [[ -n "${_old_traps}" ]]; then
     eval "${_old_traps}"
@@ -102,7 +122,7 @@ source_deploy_script() {
   if declare -f run >/dev/null 2>&1; then
     eval "$(declare -f run | sed '1s/^run /deploy_run /')"
   fi
-  eval "$(declare -f bats_run | sed '1s/^bats_run /run /')"
+  restore_test_run_dispatcher
 }
 
 # Source setup.sh to import functions for unit testing.
@@ -110,10 +130,10 @@ source_deploy_script() {
 source_setup_script() {
   # Save BATS's run function before it gets overwritten
   if declare -f run >/dev/null 2>&1; then
-    eval "$(declare -f run | sed '1s/^run /bats_run /')" 2>/dev/null
+    eval "$(declare -f _bats_native_run | sed '1s/^_bats_native_run /bats_run /')" 2>/dev/null
   fi
 
-  local _old_opts
+  local _old_opts _old_errexit="${-//[^e]/}"
   _old_opts="$(set +o)"
   local _old_traps
   _old_traps="$(trap -p ERR)"
@@ -121,6 +141,7 @@ source_setup_script() {
   source "${SETUP_SCRIPT}"
 
   eval "${_old_opts}"
+  [[ "${_old_errexit}" != "e" ]] || set -e
   trap - ERR
   if [[ -n "${_old_traps}" ]]; then
     eval "${_old_traps}"
@@ -130,7 +151,7 @@ source_setup_script() {
   if declare -f run >/dev/null 2>&1; then
     eval "$(declare -f run | sed '1s/^run /setup_run /')"
   fi
-  eval "$(declare -f bats_run | sed '1s/^bats_run /run /')"
+  restore_test_run_dispatcher
 }
 
 # Source validate_hardening.sh to import functions for unit testing.
@@ -138,10 +159,10 @@ source_setup_script() {
 source_validate_script() {
   # Save BATS's run function before it gets overwritten
   if declare -f run >/dev/null 2>&1; then
-    eval "$(declare -f run | sed '1s/^run /bats_run /')" 2>/dev/null
+    eval "$(declare -f _bats_native_run | sed '1s/^_bats_native_run /bats_run /')" 2>/dev/null
   fi
 
-  local _old_opts
+  local _old_opts _old_errexit="${-//[^e]/}"
   _old_opts="$(set +o)"
   local _old_traps
   _old_traps="$(trap -p ERR)"
@@ -149,23 +170,24 @@ source_validate_script() {
   source "${VALIDATE_SCRIPT}"
 
   eval "${_old_opts}"
+  [[ "${_old_errexit}" != "e" ]] || set -e
   trap - ERR
   if [[ -n "${_old_traps}" ]]; then
     eval "${_old_traps}"
   fi
 
   # Restore BATS run
-  eval "$(declare -f bats_run | sed '1s/^bats_run /run /')"
+  restore_test_run_dispatcher
 }
 
 # Source shared common library for direct unit testing.
 source_common_lib() {
   # Save BATS's run function before it gets overwritten
   if declare -f run >/dev/null 2>&1; then
-    eval "$(declare -f run | sed '1s/^run /bats_run /')" 2>/dev/null
+    eval "$(declare -f _bats_native_run | sed '1s/^_bats_native_run /bats_run /')" 2>/dev/null
   fi
 
-  local _old_opts
+  local _old_opts _old_errexit="${-//[^e]/}"
   _old_opts="$(set +o)"
   local _old_traps
   _old_traps="$(trap -p ERR)"
@@ -173,13 +195,14 @@ source_common_lib() {
   source "${COMMON_LIB}"
 
   eval "${_old_opts}"
+  [[ "${_old_errexit}" != "e" ]] || set -e
   trap - ERR
   if [[ -n "${_old_traps}" ]]; then
     eval "${_old_traps}"
   fi
 
   # Restore BATS run
-  eval "$(declare -f bats_run | sed '1s/^bats_run /run /')"
+  restore_test_run_dispatcher
 }
 
 # Reset validate_hardening.sh runtime counters/arrays in tests.
@@ -244,3 +267,12 @@ assert_json_check_detail_contains() {
   detail="$(json_check_detail "${json}" "${check}")"
   [[ "${detail}" == *"${needle}"* ]]
 }
+
+# Bind only assertion-library failure calls to the saved BATS function.
+# Keep function names/call stacks intact (__assert_stream inspects them).
+# This affects loaded test functions, not vendored files or production code.
+while read -r _bats_assert_name; do
+  [[ "${_bats_assert_name}" =~ ^(assert_|refute_|__assert_|__refute_)[a-zA-Z0-9_]+$ ]] || continue
+  eval "$(declare -f "${_bats_assert_name}" | sed -E 's/(^|[|;{])[[:space:]]*fail([[:space:]]*;?[[:space:]]*)$/\1 _bats_assertion_fail\2/')"
+done < <(declare -F | awk '{print $3}')
+unset _bats_assert_name

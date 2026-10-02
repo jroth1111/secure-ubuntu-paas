@@ -21,6 +21,7 @@ STATE_FILE="/var/lib/server-hardening/state"
 STATE_LOCK_FILE="${STATE_FILE}.lock"
 JOURNALD_DROPIN="/etc/systemd/journald.conf.d/90-coolify-persistent.conf"
 AUDITD_CONF="/etc/audit/auditd.conf"
+AUDIT_RULES_FILE="/etc/audit/rules.d/60-coolify-baseline.rules"
 HOSTS_FILE="${HOSTS_FILE:-/etc/hosts}"
 JSON_MODE="false"
 HEALTH_CHECK_MODE="false"
@@ -49,6 +50,9 @@ source "${SCRIPT_DIR}/../overlays/docker-host/checks/docker_trust_boundary_check
 # shellcheck source=./checks/_runtime.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/checks/_runtime.sh"
+# shellcheck source=./sudo_policy.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/sudo_policy.sh"
 # shellcheck source=./checks/ssh_check.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/checks/ssh_check.sh"
@@ -196,7 +200,8 @@ FAIL2BAN_LOCAL_FILE="/etc/fail2ban/fail2ban.local"
 APPORT_DEFAULT_FILE="/etc/default/apport"
 CRON_EXTRA_OPTS_DROPIN="/etc/systemd/system/cron.service.d/10-extra-opts.conf"
 TAILSCALED_NOTIFY_DROPIN="/etc/systemd/system/tailscaled.service.d/10-notify-access.conf"
-NETWORKD_WAIT_ONLINE_DROPIN="/etc/systemd/system/systemd-networkd-wait-online.service.d/10-any-timeout.conf"
+# Keep this after netplan's generated /run drop-ins when systemd merges them.
+NETWORKD_WAIT_ONLINE_DROPIN="/etc/systemd/system/systemd-networkd-wait-online.service.d/99-hardening.conf"
 APT_HELPER_BIN="${APT_HELPER_BIN:-/usr/lib/apt/apt-helper}"
 
 

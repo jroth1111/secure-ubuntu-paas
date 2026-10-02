@@ -48,6 +48,13 @@ tailscale_check() {
 
     local run_ssh_pref expected_run_ssh="false" expected_label="false"
     run_ssh_pref="$(tailscale_runssh_pref_value 5 1)"
+    local auto_update_apply
+    auto_update_apply="$(tailscale debug prefs 2>/dev/null | jq -r '.AutoUpdate.Apply // false' 2>/dev/null || echo unknown)"
+    if [[ "${auto_update_apply}" == "true" ]]; then
+      record "PASS" "tailscale: automatic stable updates enabled"
+    else
+      record "FAIL" "tailscale: automatic stable updates" "AutoUpdate.Apply=${auto_update_apply:-unknown}"
+    fi
     # dFlow uses Tailscale SSH exclusively; RunSSH=true is required.
     if [[ "${PAAS:-coolify}" == "dflow" ]]; then
       expected_run_ssh="true"

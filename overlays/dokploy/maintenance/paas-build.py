@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Scoped, source-rebuilt security images; fail closed on any acceptance error."""
+import fcntl,hashlib,json,os,pathlib,re,secrets,shutil,subprocess,sys,tempfile,time
+os.umask(0o077)
+component,base=sys.argv[1:3]
+prefix={'dokploy':'dokploy/dokploy:latest@','postgres':'postgres:16@'}
+if component not in prefix or not re.fullmatch(re.escape(prefix[component])+r'sha256:[a-f0-9]{64}',base):raise RuntimeError('Invalid approved base')
+lock=open('/run/lock/paas-image-build.lock','w');fcntl.flock(lock,fcntl.LOCK_EX)
+root=pathlib.Path('/var/lib/server-hardening/paas-images');root.mkdir(mode=0o700,parents=True,exist_ok=True)
+template=pathlib.Path('/usr/local/lib/paas-hardening');statefile=root/(component+'.json')
+def output(*args):return subprocess.check_output(args,text=True,stderr=subprocess.DEVNULL).strip()
+def call(*args,**kwargs):return subprocess.run(args,check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,**kwargs)
+def save(data):
+    fd,name=tempfile.mkstemp(prefix='.receipt-',dir=root)
+    with os.fdopen(fd,'w') as f:json.dump(data,f);f.flush();os.fsync(f.fileno())
+    os.replace(name,statefile)
+def keeper(image,image_id):
+    name='paas-image-pin-'+component+'-'+image_id[7:27]
+    try:
+        observed=json.loads(output('docker','inspect','--format','{"image":{{json .Image}},"running":{{json .State.Running}},"health":{{json .Config.Healthcheck}},"pin":{{json (index .Config.Labels "local.paas.update-pin")}}}',name))
+        if observed['image']!=image_id:raise RuntimeError('Keeper identity mismatch')
+        if observed['pin']!='true':raise RuntimeError('Keeper ownership mismatch')
+        call('docker','update','--restart=unless-stopped',name)
+        if (observed.get('health') or {}).get('Test') not in (None,['NONE']):
+            # This is an inert image-retention container, not an application.
+            # An inherited application healthcheck cannot succeed here.
+            call('docker','rm','-f','-v',name)
+            raise subprocess.CalledProcessError(1,['recreate-owned-pin'])
+        if not observed['running']:call('docker','start',name)
+    except subprocess.CalledProcessError:
+        call('docker','run','-d','--name',name,'--label','local.paas.update-pin=true','--restart=unless-stopped','--no-healthcheck','--user','65534:65534','--network=none','--read-only','--cap-drop=ALL','--security-opt=no-new-privileges:true','--memory=16m','--pids-limit=8','--tmpfs','/var/lib/postgresql/data:rw,noexec,nosuid,size=1m','--entrypoint','sleep',image,'infinity')
+    return name
+def bound_keepers(image_id):
+    protected={image_id}
+    service='dokploy' if component=='dokploy' else 'dokploy-postgres'
+    ids=output('docker','ps','-q','--filter','label=com.docker.swarm.service.name='+service).split()
+    protected.update(output('docker','inspect','--format','{{.Image}}',cid) for cid in ids)
+    previous=root/'update-state.json'
+    if previous.exists():
+        try:
+            ref=json.loads(previous.read_text()).get('previousImages',{}).get(service,'')
+            if re.fullmatch('local/paas-'+component+r'-hardened:sha-[a-f0-9]{64}',ref):protected.add('sha256:'+ref.split(':sha-')[1])
+        except (ValueError,TypeError):return
+    names=output('docker','ps','-a','--filter','label=local.paas.update-pin=true','--format','{{.Names}}').split()
+    candidates=[]
+    for name in names:
+        if not re.fullmatch('paas-image-pin-'+component+r'-[a-f0-9]{20}',name):continue
+        created=output('docker','inspect','--format','{{.Created}}',name)
+        candidate_id=output('docker','inspect','--format','{{.Image}}',name)
+        candidates.append((created,name,candidate_id))
+    for _,name,candidate_id in sorted(candidates)[:-3]:
+        if candidate_id not in protected:call('docker','rm','-f','-v',name)
+files=['Dockerfile.dokploy-source','Dockerfile.postgres','security-overrides.json','apply-overrides.cjs','test-pair.py','.dockerignore']
+digest=hashlib.sha256()
+for name in files:
+    path=template/name;s=path.lstat()
+    if path.is_symlink() or not path.is_file() or s.st_uid!=0 or s.st_mode&0o022:raise RuntimeError('Unsafe image recipe')
+    digest.update(name.encode());digest.update(path.read_bytes())
+recipe=digest.hexdigest();day=time.strftime('%Y-%m-%d',time.gmtime())
+old=json.loads(statefile.read_text()) if statefile.exists() else {}
+if old.get('base')==base and old.get('recipe')==recipe and old.get('day')==day:
+    try:
+        if output('docker','image','inspect','--format','{{.Id}}',old['image'])==old['imageId']:
+            old['pin']=keeper(old['image'],old['imageId']);save(old);print(json.dumps(old));sys.exit(0)
+    except subprocess.CalledProcessError:pass
+if shutil.disk_usage('/var/lib/docker').free<8*1024**3:raise RuntimeError('Insufficient build headroom')
+context=root/('context-'+component);context.mkdir(mode=0o700,exist_ok=True)
+for name in files:shutil.copyfile(template/name,context/name)
+arguments=['--build-arg','BASE_IMAGE='+base]
+source_commit=None;runtime_image=None
+if component=='dokploy':
+    version=output('docker','run','--rm','--network=none','--entrypoint','node',base,'-p','require("/app/package.json").version').removeprefix('v')
+    if not re.fullmatch(r'\d+\.\d+\.\d+',version):raise RuntimeError('Non-stable application source version')
+    version_file=context/'source-version'
+    if not version_file.exists() or version_file.read_text()!=version:
+        source=context/'source'
+        if source.exists():
+            # Preserve the old trusted source checkout; no recursive deletion.
+            os.rename(source,context/('source-retired-'+secrets.token_hex(4)))
+        call('git','clone','--depth','1','--branch','v'+version,'https://github.com/Dokploy/dokploy.git',str(source),timeout=180)
+        version_file.write_text(version)
+    source_commit=output('git','-C',str(context/'source'),'rev-parse','HEAD')
+    if not re.fullmatch(r'[a-f0-9]{40}',source_commit):raise RuntimeError('Invalid source identity')
+    node_major=output('docker','run','--rm','--network=none','--entrypoint','node',base,'-p','process.versions.node.split(".")[0]')
+    if not re.fullmatch(r'[2-9][0-9]',node_major):raise RuntimeError('Unsupported Node major')
+    node_channel='node:'+node_major+'-bookworm';call('docker','pull','-q',node_channel)
+    runtime_image=output('docker','image','inspect','--format','{{index .RepoDigests 0}}',node_channel)
+    arguments+=['--build-arg','NODE_IMAGE='+runtime_image,'--build-arg','SOURCE_COMMIT='+source_commit]
+    dockerfile='Dockerfile.dokploy-source'
+else:
+    gosu_version=output('docker','run','--rm','--network=none','--entrypoint','gosu',base,'--version').split()[0]
+    if not re.fullmatch(r'\d+\.\d+',gosu_version):raise RuntimeError('Invalid privilege helper source version')
+    call('docker','pull','-q','golang:bookworm')
+    runtime_image=output('docker','image','inspect','--format','{{index .RepoDigests 0}}','golang:bookworm')
+    arguments+=['--build-arg','GO_IMAGE='+runtime_image,'--build-arg','GOSU_VERSION='+gosu_version]
+    dockerfile='Dockerfile.postgres'
+tag='local/paas-'+component+'-hardened:build-'+secrets.token_hex(8)
+with (root/(component+'-last-build.log')).open('w') as log:
+    subprocess.run(['docker','buildx','build','--load','--pull','--no-cache-filter','hardened',*arguments,'-f',str(context/dockerfile),'-t',tag,str(context)],stdout=log,stderr=subprocess.STDOUT,check=True,timeout=2400)
+image_id=output('docker','image','inspect','--format','{{.Id}}',tag);image='local/paas-'+component+'-hardened:sha-'+image_id[7:]
+call('docker','tag',tag,image);pin=keeper(image,image_id)
+assert output('docker','image','inspect','--format','{{index .Config.Labels "org.opencontainers.image.base.name"}}',image)==base
+if component=='postgres':
+    panel=output('docker','service','inspect','--format','{{.Spec.TaskTemplate.ContainerSpec.Image}}','dokploy');pg=image
+else:
+    panel=image;pg=output('docker','service','inspect','--format','{{.Spec.TaskTemplate.ContainerSpec.Image}}','dokploy-postgres')
+call('python3',str(template/'test-pair.py'),panel,pg,timeout=360)
+manifest=output('docker','run','--rm','--network=none','--entrypoint','sh',image,'-c','dpkg-query -W; if command -v node >/dev/null; then node --version; sha256sum /app/dist/server.mjs; fi; if command -v gosu >/dev/null; then gosu --version; fi')
+fingerprint=hashlib.sha256((base+recipe+(source_commit or '')+manifest).encode()).hexdigest()
+if old.get('fingerprint')==fingerprint:
+    try:
+        if output('docker','image','inspect','--format','{{.Id}}',old['image'])==old['imageId']:
+            if image_id!=old['imageId']:
+                call('docker','rm','-f','-v',pin);call('docker','image','rm',image,tag)
+            else:call('docker','image','rm',tag)
+            image=old['image'];image_id=old['imageId'];pin=old['pin']
+    except subprocess.CalledProcessError:pass
+else:call('docker','image','rm',tag)
+result={'component':component,'base':base,'image':image,'imageId':image_id,'pin':pin,'day':day,'recipe':recipe,'sourceCommit':source_commit,'runtimeImage':runtime_image,'fingerprint':fingerprint,'isolatedTestsPassed':True,'testedAt':int(time.time())}
+save(result);bound_keepers(image_id);print(json.dumps(result))

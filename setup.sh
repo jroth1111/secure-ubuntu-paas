@@ -35,6 +35,9 @@ source "${SCRIPT_DIR}/lib/overlay-loader.sh"
 # shellcheck source=lib/hardening_resume_reconcile.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/hardening_resume_reconcile.sh"
+# shellcheck source=lib/secret_transport.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/secret_transport.sh"
 
 # ── Inputs (populated by flags or prompts) ──────────────────────────────────
 
@@ -42,6 +45,7 @@ SERVER_IP="${SERVER_IP:-}"
 ADMIN_USER="${ADMIN_USER:-}"
 PUBKEY_FILE="${PUBKEY_FILE:-}"
 TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"
+TAILSCALE_AUTH_KEY_FILE="${TAILSCALE_AUTH_KEY_FILE:-}"
 PAAS="${PAAS:-coolify}"
 DEPLOY_MODE="${DEPLOY_MODE:-}"
 DOMAIN="${DOMAIN:-}"
@@ -55,6 +59,7 @@ CF_ACCOUNT_ID="${CF_ACCOUNT_ID:-}"
 APP_DOMAIN_MODE="${APP_DOMAIN_MODE:-}"
 SWAP_SIZE="${SWAP_SIZE:-}"
 SERVER_TIMEZONE="${SERVER_TIMEZONE:-}"
+DOKPLOY_ENROLLMENT_SOURCE_IP="${DOKPLOY_ENROLLMENT_SOURCE_IP:-}"
 TAILSCALE_DIRECT_WAN="${TAILSCALE_DIRECT_WAN:-false}"
 PRIVATE_TLS_CA="${PRIVATE_TLS_CA:-}"
 ZEROSSL_EAB_KID="${ZEROSSL_EAB_KID:-}"
@@ -80,6 +85,7 @@ setup_exit_trap() {
     rm -f "${PENDING_DEPLOY_ENV_FILE}" 2>/dev/null || true
     PENDING_DEPLOY_ENV_FILE=""
   fi
+  secret_transport_cleanup_all
   run_report_finalize "${exit_code}"
 }
 
@@ -113,7 +119,8 @@ Required (all):
   --server-ip <ip>              Server public IPv4 address
   --admin-user <name>           Admin username
   --pubkey-file <path>          SSH public key file (on this server)
-  --tailscale-auth-key <key>    Required unless --preflight-only
+  --tailscale-auth-key-file <path>
+                                File containing the Tailscale auth key (required unless --preflight-only)
 
 Required (coolify only):
   --domain <fqdn>               Domain name for Coolify
@@ -121,11 +128,13 @@ Required (coolify only):
 
 Optional (dokploy):
   --domain <fqdn>               Intended public app domain (DNS is operator-managed)
+  --dokploy-enrollment-source-ip <100.x.x.x>
+                                Operator laptop Tailscale IPv4 allowed to claim the first Dokploy admin
 
 Optional (coolify):
   --cf-api-token-file <path>    File containing Cloudflare API token
   --cf-tunnel-api-token-file <path>
-                                File containing Cloudflare tunnel API token (optional; defaults to API token)
+                                Dedicated tunnel token file (required in tunnel mode)
   --mode <tunnel|standard>       Deployment mode (default: tunnel)
   --app-domain-mode <vps|apex>  App subdomain scope: vps=appname.DOMAIN, apex=appname.ZONE (default: apex)
   --cf-zone <zone>              Cloudflare zone (default: derived from domain)
@@ -156,7 +165,10 @@ parse_args() {
       --server-ip)       SERVER_IP="${2:?--server-ip requires a value}"; shift 2 ;;
       --admin-user)      ADMIN_USER="${2:?--admin-user requires a value}"; shift 2 ;;
       --pubkey-file)     PUBKEY_FILE="${2:?--pubkey-file requires a value}"; shift 2 ;;
-      --tailscale-auth-key) TAILSCALE_AUTH_KEY="${2:?--tailscale-auth-key requires a value}"; shift 2 ;;
+      --tailscale-auth-key)
+        die "--tailscale-auth-key is disabled because CLI arguments leak secrets to process lists/history. Use --tailscale-auth-key-file, TAILSCALE_AUTH_KEY_FILE, or the silent prompt."
+        ;;
+      --tailscale-auth-key-file) TAILSCALE_AUTH_KEY_FILE="${2:?--tailscale-auth-key-file requires a value}"; shift 2 ;;
       --paas)            PAAS="${2:?--paas requires a value}"; shift 2 ;;
       --mode)            DEPLOY_MODE="${2:?--mode requires a value}"; shift 2 ;;
       --domain)          DOMAIN="${2:?--domain requires a value}"; shift 2 ;;
@@ -174,6 +186,7 @@ parse_args() {
       --app-domain-mode) APP_DOMAIN_MODE="${2:?--app-domain-mode requires a value}"; shift 2 ;;
       --swap-size)       SWAP_SIZE="${2:?--swap-size requires a value}"; shift 2 ;;
       --server-timezone|--timezone) SERVER_TIMEZONE="${2:?$1 requires a value}"; shift 2 ;;
+      --dokploy-enrollment-source-ip) DOKPLOY_ENROLLMENT_SOURCE_IP="${2:?--dokploy-enrollment-source-ip requires a value}"; shift 2 ;;
       --private-tls-ca)  PRIVATE_TLS_CA="${2:?--private-tls-ca requires a value}"; shift 2 ;;
       --zerossl-eab-kid-file) ZEROSSL_EAB_KID_FILE="${2:?--zerossl-eab-kid-file requires a value}"; shift 2 ;;
       --zerossl-eab-hmac-file) ZEROSSL_EAB_HMAC_FILE="${2:?--zerossl-eab-hmac-file requires a value}"; shift 2 ;;
@@ -190,6 +203,9 @@ parse_args() {
 # ── Input collection (flag → prompt fallback) ──────────────────────────────
 
 collect_inputs() {
+  if [[ -z "${TAILSCALE_AUTH_KEY}" && -n "${TAILSCALE_AUTH_KEY_FILE}" ]]; then
+    TAILSCALE_AUTH_KEY="$(read_secret_file "${TAILSCALE_AUTH_KEY_FILE}" "Tailscale auth key")"
+  fi
   if is_true "${PREFLIGHT_ONLY}" && [[ -z "${TAILSCALE_AUTH_KEY}" ]]; then
     TAILSCALE_AUTH_KEY="(not-needed)"
   fi
@@ -217,11 +233,6 @@ validate_inputs() {
     *) die "Unsupported PAAS: ${PAAS} (expected coolify, dflow, or dokploy)" ;;
   esac
 
-  if [[ "${PAAS}" == "coolify" ]]; then
-    finalize_cloudflare_tokens
-    finalize_private_tls_ca_inputs
-  fi
-
   if is_true "${AUTO_YES}" && ! is_true "${PREFLIGHT_ONLY}"; then
     die "setup.sh --yes is only supported with --preflight-only. Full setup requires operator confirmations from a laptop; use deploy.sh or run setup.sh interactively."
   fi
@@ -239,6 +250,8 @@ validate_inputs() {
   ADMIN_PUBKEY="$(cat "${PUBKEY_FILE}")"
 
   if ! is_true "${PREFLIGHT_ONLY}"; then
+    [[ "${TAILSCALE_AUTH_KEY}" != *$'\n'* && "${TAILSCALE_AUTH_KEY}" != *$'\r'* ]] \
+      || die "Tailscale auth key must be a single line."
     [[ "${TAILSCALE_AUTH_KEY}" == tskey-auth-* ]] \
       || die "Tailscale auth key must start with 'tskey-auth-' (got: ${TAILSCALE_AUTH_KEY:0:12}...)"
   fi
@@ -252,6 +265,10 @@ validate_inputs() {
   esac
 
   if [[ "${PAAS}" == "coolify" ]]; then
+    # Normalize and validate Cloudflare secrets after basic operator inputs so
+    # an ordinary malformed IP/user/key error is not masked by token policy.
+    finalize_cloudflare_tokens
+    finalize_private_tls_ca_inputs
     [[ "${DEPLOY_MODE}" == "standard" || "${DEPLOY_MODE}" == "tunnel" ]] \
       || die "Mode must be 'standard' or 'tunnel' (got: ${DEPLOY_MODE})"
     [[ "${PRIVATE_TLS_CA}" == "letsencrypt" || "${PRIVATE_TLS_CA}" == "zerossl" ]] \
@@ -277,6 +294,10 @@ validate_inputs() {
   elif [[ "${PAAS}" == "dokploy" ]]; then
     finalize_dokploy_inputs
     [[ -z "${DOMAIN}" || "${DOMAIN}" =~ ${FQDN_RE} ]] || die "Invalid Dokploy public app domain: ${DOMAIN}"
+    if ! is_true "${PREFLIGHT_ONLY}"; then
+      is_tailscale_ipv4 "${DOKPLOY_ENROLLMENT_SOURCE_IP}" \
+        || die "Invalid Dokploy enrollment source IP: ${DOKPLOY_ENROLLMENT_SOURCE_IP:-unset} (expected operator Tailscale IPv4 in 100.64.0.0/10)"
+    fi
   fi
 
 
@@ -332,9 +353,9 @@ verify_docker_user_gate_local() {
     die "${gate_d_inactive_msg}"
   fi
 
-  local iptables_out
-  iptables_out="$(iptables -S DOCKER-USER 2>/dev/null)" || true
-  if printf '%s' "${iptables_out}" | grep -q "coolify-hardening"; then
+  source "${SCRIPT_DIR}/overlays/docker-host/modules/readiness.sh"
+  DOCKER_PRESENT="true"
+  if TUNNEL_MODE="${TUNNEL_MODE:-false}" docker_user_rules_present; then
     pass "${gate_label}: DOCKER-USER hardening rules active"
   else
     fail "${gate_label}: DOCKER-USER hardening rules not found"
@@ -343,12 +364,18 @@ verify_docker_user_gate_local() {
 }
 
 reconcile_docker_daemon_local() {
-  log "Reconciling Docker daemon settings after Coolify install..."
-  # Hardening owns: log-driver, log-opts, live-restore, default-ipc-mode, storage-driver.
-  # Using json-file driver to match Coolify's expectation for compatibility.
-  coolify_reconcile_docker_daemon_script | bash -s \
+  local reconcile_fn="coolify_reconcile_docker_daemon_script"
+  if [[ "${PAAS:-coolify}" == "dokploy" ]]; then
+    reconcile_fn="dokploy_reconcile_docker_daemon_script"
+  fi
+  log "Reconciling Docker daemon settings after ${PAAS:-coolify} install..."
+  "${reconcile_fn}" | bash -s \
     || die "Failed to reconcile Docker daemon hardening settings."
-  pass "Docker daemon hardening reconciled (json-file log rotation + live-restore)"
+  if [[ "${PAAS:-coolify}" == "dokploy" ]]; then
+    pass "Docker daemon hardening reconciled (Swarm-safe json-file log rotation)"
+  else
+    pass "Docker daemon hardening reconciled (json-file log rotation + live-restore)"
+  fi
 }
 
 # ── Pre-flight ──────────────────────────────────────────────────────────────
@@ -393,6 +420,10 @@ phase1_harden() {
 
   local tunnel_flag="false"
   [[ "${DEPLOY_MODE}" == "tunnel" ]] && tunnel_flag="true"
+  [[ "${TAILSCALE_AUTH_KEY}" != *$'\n'* && "${TAILSCALE_AUTH_KEY}" != *$'\r'* ]] \
+    || die "Tailscale auth key must be a single line before it is serialized."
+  [[ "${ADMIN_PUBKEY}" != *$'\n'* && "${ADMIN_PUBKEY}" != *$'\r'* ]] \
+    || die "Administrator public key must be a single line before it is serialized."
 
   {
     printf 'ADMIN_USER="%s"\n' "${ADMIN_USER//\"/\\\"}"
@@ -443,6 +474,60 @@ setup_reboot_required_pkgs_file() {
   printf '%s\n' "${REBOOT_REQUIRED_PKGS_FILE:-/run/reboot-required.pkgs}"
 }
 
+ensure_dokploy_swarm_unlocked_local() {
+  [[ "${PAAS:-coolify}" == "dokploy" ]] || return 0
+  command -v docker >/dev/null 2>&1 || return 0
+  local state
+  state="$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || true)"
+  [[ "${state}" == "locked" ]] || return 0
+  if is_true "${AUTO_YES:-false}"; then
+    die "Docker Swarm is locked. Run 'docker swarm unlock' interactively with the operator-held key, then rerun setup.sh."
+  fi
+  log "Docker Swarm is locked after reboot; enter the operator-held unlock key at Docker's prompt."
+  docker swarm unlock \
+    || die "Docker Swarm unlock failed; the key must remain in the external operator store."
+  [[ "$(docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null || true)" == "active" ]] \
+    || die "Docker Swarm did not return to active state after unlock."
+  pass "Docker Swarm unlocked from the external operator key"
+}
+
+docker_audit_runtime_state_local() {
+  local script_tmp state
+  script_tmp="$(mktemp)" || die "Failed to create Docker audit reconciliation script."
+  docker_audit_runtime_reconcile_script > "${script_tmp}"
+  if state="$(bash -s < "${script_tmp}")"; then
+    rm -f "${script_tmp}"
+  else
+    rm -f "${script_tmp}"
+    die "Docker audit runtime reconciliation failed on the server."
+  fi
+  state="$(tr -d '[:space:]' <<< "${state}")"
+  case "${state}" in
+    ready|reboot-required|not-applicable) printf '%s\n' "${state}" ;;
+    *) die "Docker audit runtime reconciliation returned an unexpected state." ;;
+  esac
+}
+
+reconcile_docker_audit_runtime_local() {
+  local gate_label="${1:-Docker audit reconciliation}" state
+  state="$(docker_audit_runtime_state_local)"
+  case "${state}" in
+    ready)
+      pass "${gate_label}: Docker runtime audit watches are loaded"
+      ;;
+    not-applicable)
+      return 0
+      ;;
+    reboot-required)
+      fail "${gate_label}: immutable Docker audit watches require a reboot"
+      if [[ "${PAAS:-coolify}" == "dokploy" ]]; then
+        die "Reboot the server, reconnect over Tailscale, run 'docker swarm unlock' with the external operator key, then rerun setup.sh."
+      fi
+      die "Reboot the server, then rerun setup.sh so Docker audit watches can be verified before final validation."
+      ;;
+  esac
+}
+
 phase2_gates() {
   step "2/5" "Gate checks"
 
@@ -457,13 +542,30 @@ phase2_gates() {
     die "Reboot the server, then rerun setup.sh to continue from a clean post-upgrade state."
   fi
 
-  # Gate A: Operator verifies SSH from laptop
-  pause_for_operator "From your LAPTOP, verify SSH: ssh ${ADMIN_USER}@${TS_IP} (Tailscale IP)"
+  # Gate A: Operator verifies the PaaS-specific SSH principal from the laptop.
+  if [[ "${PAAS}" == "dokploy" ]]; then
+    pause_for_operator "From your LAPTOP, verify SSH: ssh root@${TS_IP} (Tailscale IP; root-only)"
+  else
+    pause_for_operator "From your LAPTOP, verify SSH: ssh ${ADMIN_USER}@${TS_IP} (Tailscale IP)"
+  fi
 
-  # Gate B: Verify admin user is functional locally
-  local admin_home
+  # Gate B: Dokploy keeps the metadata user non-login; other PaaS paths use
+  # the admin account for SSH orchestration.
+  local admin_home admin_shell admin_pw_status
   admin_home="$(getent passwd "${ADMIN_USER}" | cut -d: -f6 2>/dev/null)" || true
-  if [[ -n "${admin_home}" ]] && [[ -d "${admin_home}/.ssh" ]]; then
+  if [[ "${PAAS}" == "dokploy" ]]; then
+    admin_shell="$(getent passwd "${ADMIN_USER}" | cut -d: -f7 2>/dev/null)" || true
+    admin_pw_status="$(passwd -S "${ADMIN_USER}" 2>/dev/null | awk '{print $2}')" || true
+    if [[ -n "${admin_home}" ]] \
+      && [[ "${admin_shell}" == "/usr/sbin/nologin" ]] \
+      && [[ "${admin_pw_status}" == "L" ]] \
+      && [[ ! -s "${admin_home}/.ssh/authorized_keys" ]]; then
+      pass "Gate B: Dokploy metadata user ${ADMIN_USER} is locked and non-login; root is the sole SSH principal"
+    else
+      fail "Gate B: Dokploy metadata user ${ADMIN_USER} is not fully disabled"
+      die "Gate B failed. Expected nologin shell, locked password, and no authorized keys."
+    fi
+  elif [[ -n "${admin_home}" ]] && [[ -d "${admin_home}/.ssh" ]]; then
     pass "Gate B: Admin user ${ADMIN_USER} exists with SSH dir"
   else
     fail "Gate B: Admin user ${ADMIN_USER} home or .ssh not found"
@@ -485,15 +587,16 @@ phase2_gates() {
     run_local_generated_script "Base hardening reconcile" hardening_resume_reconcile_script
     case "${PAAS}" in
       dokploy)
+        run_local_generated_script "Dokploy root Tailscale SSH policy" dokploy_root_tailscale_reconcile_script
         run_local_generated_script "Stale Coolify UFW cleanup" dokploy_remove_stale_coolify_dashboard_ufw_script \
           || true
         run_local_generated_script "Dokploy dashboard UFW policy" dokploy_dashboard_ufw_policy_script
-        run_local_generated_script "Dokploy runtime finalize" dokploy_finalize_runtime_script
         ;;
     esac
     pass "Hardening state reconciled for Gate C"
   }
 
+  ensure_dokploy_swarm_unlocked_local
   reconcile_resume_hardening_local
 
   # Gate C: Validation passes
@@ -504,6 +607,7 @@ phase2_gates() {
     reconcile_docker_daemon_local
     systemctl enable --now docker-user-hardening.service 2>/dev/null || true
     systemctl start docker-ssh-cidr-sync.service 2>/dev/null || true
+    reconcile_docker_audit_runtime_local "Gate C pre-check"
   fi
 
   local wait_attempt wait_max_attempts=12 wait_delay=5 synced_val wait_logged=0
@@ -571,7 +675,7 @@ paas_phase4_dispatch() {
 paas_phase5_dispatch() {
   case "${PAAS}" in
     dflow)   dflow_phase5_verify_shared "${1:-}" ;;
-    dokploy) dokploy_phase5_verify_shared "${1:-}" ;;
+    dokploy) dokploy_phase5_verify_shared "$@" ;;
     coolify) coolify_phase5_verify_shared "$@" ;;
     *)       die "Unsupported PAAS: ${PAAS}" ;;
   esac
@@ -614,15 +718,20 @@ phase3_docker_dokploy() {
   phase3_install_dokploy() { dokploy_install_dokploy_script | bash -s; }
   phase3_reconcile_docker_daemon() { reconcile_docker_daemon_local; }
   phase3_restart_docker_user() { systemctl restart docker-user-hardening.service; }
-  phase3_sync_docker_ssh_cidrs() { systemctl start docker-ssh-cidr-sync.service; }
   phase3_finalize_dokploy_runtime() {
-    local script_tmp
+    local script_tmp rc
     script_tmp="$(mktemp)"
     dokploy_finalize_runtime_script > "${script_tmp}"
-    bash -s < "${script_tmp}"
-    local rc=$?
+    if bash -s < "${script_tmp}"; then
+      rc=0
+    else
+      rc=$?
+    fi
     rm -f "${script_tmp}"
-    return "${rc}"
+    (( rc == 0 )) || return "${rc}"
+    if [[ -s /run/secure-ubuntu-paas-dokploy-swarm-unlock-key ]]; then
+      log "External Swarm unlock handoff staged at /run/secure-ubuntu-paas-dokploy-swarm-unlock-key; transfer it to a protected operator store, then remove the file."
+    fi
   }
 
   paas_phase3_dispatch \
@@ -634,7 +743,7 @@ phase3_docker_dokploy() {
     phase3_install_dokploy \
     phase3_reconcile_docker_daemon \
     phase3_restart_docker_user \
-    phase3_sync_docker_ssh_cidrs \
+    "" \
     phase3_finalize_dokploy_runtime
 }
 
@@ -662,10 +771,22 @@ phase4_binding_dns() {
   }
   phase4_install_cloudflared() { coolify_install_cloudflared_script | bash -s; }
   phase4_configure_cloudflared() {
-    coolify_configure_cloudflared_script \
-      | env TUNNEL_ID="${TUNNEL_ID}" TUNNEL_SECRET="${TUNNEL_SECRET}" \
-          CF_ACCOUNT_ID="${CF_ACCOUNT_ID}" DOMAIN="${DOMAIN}" APP_DOMAIN="${APP_DOMAIN}" \
-          CF_ZONE_NAME="${CF_ZONE_NAME}" bash -s
+    local secret_dir rc
+    secret_dir="$(secret_transport_dir_create)" || die "Failed to create protected tunnel-secret directory."
+    if ! secret_transport_write_file "${secret_dir}/tunnel_secret" "${TUNNEL_SECRET}"; then
+      secret_transport_cleanup_dir "${secret_dir}"
+      die "Failed to stage the Cloudflare tunnel secret in a protected file."
+    fi
+    if coolify_configure_cloudflared_script \
+      | env TUNNEL_ID="${TUNNEL_ID}" TUNNEL_SECRET_FILE="${secret_dir}/tunnel_secret" \
+          TUNNEL_SECRET_DIR="${secret_dir}" CF_ACCOUNT_ID="${CF_ACCOUNT_ID}" DOMAIN="${DOMAIN}" \
+          APP_DOMAIN="${APP_DOMAIN}" CF_ZONE_NAME="${CF_ZONE_NAME}" bash -s; then
+      rc=0
+    else
+      rc=$?
+    fi
+    secret_transport_cleanup_dir "${secret_dir}"
+    return "${rc}"
   }
   phase4_stop_cloudflared() {
     systemctl disable --now cloudflared 2>/dev/null || systemctl stop cloudflared 2>/dev/null || true
@@ -689,8 +810,23 @@ phase4_binding_dns() {
       | env DOMAIN="${DOMAIN}" PRIVATE_TLS_RESOLVER="$(private_tls_resolver_name)" bash -s
   }
   phase4_configure_private_tls() {
-    coolify_configure_private_tls_dns_script \
-      | env CF_DNS_API_TOKEN="${CF_API_TOKEN}" CF_ZONE_NAME="${CF_ZONE_NAME}" DOMAIN="${DOMAIN}" PRIVATE_TLS_RESOLVER="$(private_tls_resolver_name)" PRIVATE_TLS_CA="${PRIVATE_TLS_CA}" ZEROSSL_EAB_KID="${ZEROSSL_EAB_KID}" ZEROSSL_EAB_HMAC="${ZEROSSL_EAB_HMAC}" bash -s
+    local secret_dir rc
+    secret_dir="$(secret_transport_dir_create)" || die "Failed to create protected private TLS-secret directory."
+    if ! secret_transport_write_file "${secret_dir}/cf_dns_api_token" "${CF_API_TOKEN}" \
+      || ! secret_transport_write_file "${secret_dir}/zerossl_eab_kid" "${ZEROSSL_EAB_KID}" \
+      || ! secret_transport_write_file "${secret_dir}/zerossl_eab_hmac" "${ZEROSSL_EAB_HMAC}"; then
+      secret_transport_cleanup_dir "${secret_dir}"
+      die "Failed to stage private TLS secrets in protected files."
+    fi
+    if coolify_configure_private_tls_dns_script \
+      | env PRIVATE_TLS_SECRET_DIR="${secret_dir}" CF_ZONE_NAME="${CF_ZONE_NAME}" DOMAIN="${DOMAIN}" \
+          PRIVATE_TLS_RESOLVER="$(private_tls_resolver_name)" PRIVATE_TLS_CA="${PRIVATE_TLS_CA}" bash -s; then
+      rc=0
+    else
+      rc=$?
+    fi
+    secret_transport_cleanup_dir "${secret_dir}"
+    return "${rc}"
   }
   phase4_remove_private_routes() {
     coolify_remove_private_dashboard_routes_script | bash -s
@@ -757,7 +893,8 @@ phase5_verify() {
   # Running final base/validate.sh...
   # setup.sh runs on the server itself; public-IP reachability checks are confirmed
   # from an operator laptop in coolify_phase5_verify_shared (public_probe_mode=operator).
-  paas_phase5_dispatch phase5_fetch_validate_json operator pause_for_operator
+  paas_phase5_dispatch phase5_fetch_validate_json operator pause_for_operator \
+    phase4_configure_dokploy_dashboard_ufw
 }
 
 # ── Main ────────────────────────────────────────────────────────────────────
@@ -773,7 +910,11 @@ main() {
   log "Deployment configuration:"
   log "  PaaS:      ${PAAS}"
   log "  Server:    ${SERVER_IP}"
-  log "  Admin:     ${ADMIN_USER}"
+  if [[ "${PAAS}" == "dokploy" ]]; then
+    log "  SSH:       root over Tailscale only"
+  else
+    log "  Admin:     ${ADMIN_USER}"
+  fi
   log "  Pubkey:    ${PUBKEY_FILE}"
   log "  Swap:      ${SWAP_SIZE}"
   log "  Timezone:  ${SERVER_TIMEZONE}"
@@ -809,10 +950,12 @@ main() {
       ;;
     dokploy)
       phase3_docker_dokploy
+      reconcile_docker_audit_runtime_local "Post-Dokploy audit reconciliation"
       phase4_dokploy_access_policy
       ;;
     coolify)
       phase3_docker_coolify
+      reconcile_docker_audit_runtime_local "Post-Coolify audit reconciliation"
       phase4_binding_dns
       ;;
   esac

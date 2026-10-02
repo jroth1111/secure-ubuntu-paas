@@ -10,6 +10,7 @@ networkd_wait_online_check() {
     unit_available "systemd-networkd.socket" && stray_units+=("systemd-networkd.socket")
     unit_available "systemd-networkd.service" && stray_units+=("systemd-networkd.service")
     unit_available "networkd-dispatcher.service" && stray_units+=("networkd-dispatcher.service")
+    unit_available "systemd-networkd-wait-online.service" && stray_units+=("systemd-networkd-wait-online.service")
 
     local unit active_state enabled_state
     local -a offenders=()

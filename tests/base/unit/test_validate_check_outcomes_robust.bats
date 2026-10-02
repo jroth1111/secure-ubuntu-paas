@@ -30,6 +30,7 @@ setup() {
     if [[ "${1:-}" == "status" ]]; then
       cat <<'UFW'
 Status: active
+Default: deny (incoming), allow (outgoing), deny (routed), disabled (forwarded)
 22/tcp                     ALLOW IN    on tailscale0
 22                         ALLOW       10.0.0.0/8
 8000/tcp                   ALLOW IN    on tailscale0
@@ -57,7 +58,9 @@ UFW
       cat <<'SSHD'
 permitrootlogin no
 passwordauthentication no
+kbdinteractiveauthentication no
 pubkeyauthentication yes
+authenticationmethods publickey
 permitemptypasswords no
 compression no
 ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com
@@ -109,7 +112,7 @@ EXT
 
   docker() {
     if [[ "${1:-}" == "info" ]]; then
-      echo "Server:"
+      echo " Firewall Backend: iptables"
       return 0
     fi
     return 0
@@ -132,6 +135,49 @@ RULES
   local json
   json="$(emit_validate_results_json)"
   assert_json_check_status "${json}" "docker-user: IPv4 wan-drop" "FAIL"
+}
+
+@test "docker_user_check: missing IPv6 DOCKER-USER chain fails closed" {
+  TUNNEL_MODE="true"
+  DOCKER_RULES_APPLIED="true"
+
+  command() {
+    if [[ "${1:-}" == "-v" ]]; then
+      case "${2:-}" in
+        iptables|ip6tables|docker|systemctl) return 0 ;;
+      esac
+    fi
+    builtin command "$@"
+  }
+  docker() {
+    [[ "${1:-}" == "info" ]] && echo "iptables: true"
+    return 0
+  }
+  systemctl() { return 0; }
+  iptables() {
+    if [[ "${4:-}" == "DOCKER-USER" ]]; then
+      cat <<'RULES'
+-N DOCKER-USER
+-A DOCKER-USER -m comment --comment secure-ubuntu-paas-docker-user-jump -j SECURE-DOCKER-USER
+RULES
+    else
+      cat <<'RULES'
+-N SECURE-DOCKER-USER
+-A SECURE-DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment coolify-hardening-estab -j RETURN
+-A SECURE-DOCKER-USER -i eth0 -m comment --comment coolify-hardening-wan-drop -j DROP
+-A SECURE-DOCKER-USER -i docker0 -m comment --comment coolify-hardening-bridge-docker0 -j RETURN
+-A SECURE-DOCKER-USER -i docker_gwbridge -m comment --comment coolify-hardening-bridge-docker-gw -j RETURN
+-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-unmatched-drop -j DROP
+-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-return -j RETURN
+RULES
+    fi
+  }
+  ip6tables() { return 1; }
+
+  docker_user_check
+  local json
+  json="$(emit_validate_results_json)"
+  assert_json_check_status "${json}" "docker-user: IPv6" "FAIL"
 }
 
 @test "docker_user_check: fails when docker info reports Firewall: nftables" {
@@ -164,6 +210,23 @@ INFO
   assert_json_check_status "${json}" "docker-user: backend" "FAIL"
 }
 
+@test "docker_user_check: fails closed when Docker firewall backend is unavailable" {
+  DOCKER_RULES_APPLIED="true"
+  command() {
+    if [[ "${1:-}" == "-v" ]]; then
+      case "${2:-}" in iptables|docker|systemctl|jq) return 0 ;; esac
+    fi
+    builtin command "$@"
+  }
+  docker() { return 1; }
+
+  docker_user_check
+  local json
+  json="$(emit_validate_results_json)"
+  assert_json_check_status "${json}" "docker-user: backend" "FAIL"
+  assert_json_check_detail_contains "${json}" "docker-user: backend" "unavailable"
+}
+
 @test "docker_user_check: fails in tunnel mode when wan-web rule exists" {
   TUNNEL_MODE="true"
   DOCKER_RULES_APPLIED="true"
@@ -191,9 +254,17 @@ INFO
     if [[ "${1:-}" == "-t" && "${2:-}" == "filter" && "${3:-}" == "-S" && "${4:-}" == "DOCKER-USER" ]]; then
       cat <<'RULES'
 -N DOCKER-USER
--A DOCKER-USER -m comment --comment coolify-hardening-wan-drop -j DROP
--A DOCKER-USER -m comment --comment coolify-hardening-bridge-docker0 -j RETURN
--A DOCKER-USER -m comment --comment coolify-hardening-wan-web -p tcp --dport 8000 -j ACCEPT
+-A DOCKER-USER -m comment --comment secure-ubuntu-paas-docker-user-jump -j SECURE-DOCKER-USER
+RULES
+      return 0
+    fi
+    if [[ "${1:-}" == "-t" && "${2:-}" == "filter" && "${3:-}" == "-S" && "${4:-}" == "SECURE-DOCKER-USER" ]]; then
+      cat <<'RULES'
+-N SECURE-DOCKER-USER
+-A SECURE-DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment coolify-hardening-estab -j RETURN
+-A SECURE-DOCKER-USER -i docker0 -m comment --comment coolify-hardening-bridge-docker0 -j RETURN
+-A SECURE-DOCKER-USER -i eth0 -m comment --comment coolify-hardening-wan-drop -j DROP
+-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-return -j RETURN
 RULES
       return 0
     fi
@@ -240,18 +311,21 @@ RULES
   assert_json_check_status "${json}" "sysctl: net.ipv4.ip_forward" "FAIL"
 }
 
-@test "auditd_check: fails when max_log_file_action is not keep_logs" {
+@test "auditd_check: fails when max_log_file_action is not rotate" {
   IS_CONTAINER="false"
   local tmp_auditd_conf
   tmp_auditd_conf="$(mktemp)"
   cat > "${tmp_auditd_conf}" <<'CONF'
-max_log_file_action = rotate
+max_log_file = 50
+num_logs = 10
+rate_limit = 1000
+max_log_file_action = keep_logs
 disk_full_action = suspend
 disk_error_action = suspend
 space_left = 100
 space_left_action = syslog
 admin_space_left = 50
-admin_space_left_action = suspend
+admin_space_left_action = syslog
 CONF
   AUDITD_CONF="${tmp_auditd_conf}"
 
@@ -288,13 +362,16 @@ STATUS
   local tmp_auditd_conf
   tmp_auditd_conf="$(mktemp)"
   cat > "${tmp_auditd_conf}" <<'CONF'
-max_log_file_action = keep_logs
+max_log_file = 50
+num_logs = 10
+rate_limit = 1000
+max_log_file_action = rotate
 disk_full_action = suspend
 disk_error_action = suspend
 space_left = 100
 space_left_action = syslog
 admin_space_left = 50
-admin_space_left_action = suspend
+admin_space_left_action = syslog
 CONF
   AUDITD_CONF="${tmp_auditd_conf}"
 
@@ -323,6 +400,54 @@ STATUS
   local json
   json="$(emit_validate_results_json)"
   assert_json_check_status "${json}" "auditd: queue loss" "FAIL"
+  rm -f "${tmp_auditd_conf}"
+}
+
+@test "auditd_check: fails when loginuid attribution is mutable" {
+  IS_CONTAINER="false"
+  local tmp_auditd_conf
+  tmp_auditd_conf="$(mktemp)"
+  cat > "${tmp_auditd_conf}" <<'CONF'
+max_log_file = 50
+num_logs = 10
+rate_limit = 1000
+max_log_file_action = rotate
+disk_full_action = suspend
+disk_error_action = suspend
+space_left = 100
+space_left_action = syslog
+admin_space_left = 50
+admin_space_left_action = syslog
+CONF
+  AUDITD_CONF="${tmp_auditd_conf}"
+
+  systemctl() { return 0; }
+  auditctl() {
+    if [[ "${1:-}" == "-l" ]]; then
+      cat <<'RULES'
+-a always,exit -F arch=b64 -S sethostname -k identity
+-a always,exit -F arch=b64 -S chmod -k sudoers-change
+-a always,exit -F arch=b64 -S init_module -k kernel-module
+-a always,exit -F arch=b64 -S execve -k user_commands
+RULES
+      return 0
+    fi
+    if [[ "${1:-}" == "-s" ]]; then
+      cat <<'STATUS'
+enabled 1
+loginuid_immutable 0 unlocked
+lost 0
+backlog 0
+STATUS
+      return 0
+    fi
+    return 1
+  }
+
+  auditd_check
+  local json
+  json="$(emit_validate_results_json)"
+  assert_json_check_status "${json}" "auditd: loginuid immutable" "FAIL"
   rm -f "${tmp_auditd_conf}"
 }
 

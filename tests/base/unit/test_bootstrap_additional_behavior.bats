@@ -41,7 +41,7 @@ setup() {
 @test "warn_on_state_version_mismatch: warns when state version differs" {
   local state
   state="$(mktemp)"
-  printf 'state_version=0.0.0\n' > "${state}"
+  printf 'script_version=0.0.0\n' > "${state}"
 
   STATE_FILE="${state}"
   SCRIPT_VERSION="1.2.3"
@@ -75,7 +75,7 @@ setup() {
 
   run detect_os
   assert_failure
-  assert_output --partial "Expected Ubuntu"
+  assert_output --partial "Only Ubuntu is supported"
 }
 
 @test "configure_coolify_binding_watchdog: dry-run emits planned timer install" {
@@ -194,11 +194,189 @@ EOF
   [ ! -f "${NETWORKD_WAIT_ONLINE_DROPIN}" ]
 }
 
+@test "repair_netplan_offlink_ipv6_default_route: literal IPv6 default route is not a local prefix and repair is idempotent" {
+  local tmpdir config calls
+  tmpdir="$(mktemp -d)"
+  config="${tmpdir}/99-provider.yaml"
+  calls="${tmpdir}/netplan.calls"
+  cat > "${config}" <<'EOF'
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    eth0:
+      addresses:
+        - 80.97.44.156/24
+        - 2a0e:1d80:24:8a0b::1/64
+      routes:
+        - to: default
+          via: 80.97.44.1
+        - to: ::/0
+          via: 2a0e:1d80:24::1
+EOF
+
+  NETPLAN_CONFIG_DIR="${tmpdir}"
+  WAN_IFACE="eth0"
+  DRY_RUN="false"
+  stat() {
+    if [[ "${1:-}" == "-c" && "${2:-}" == "%u" ]]; then echo 0; return 0; fi
+    if [[ "${1:-}" == "-c" && "${2:-}" == "%a" ]]; then echo 600; return 0; fi
+    command stat "$@"
+  }
+  netplan() { printf '%s\n' "$*" >> "${calls}"; return 0; }
+  ip() {
+    if [[ "$*" == "-6 route show default dev eth0" ]]; then
+      echo "default via 2a0e:1d80:24::1 dev eth0 proto static metric 1024 onlink pref medium"
+      return 0
+    fi
+    return 1
+  }
+
+  run repair_netplan_offlink_ipv6_default_route
+  assert_success
+  assert_output --partial "Repaired provider off-link IPv6 default route"
+  [ "$(grep -c '^[[:space:]]*on-link: true$' "${config}")" -eq 1 ]
+  [ "$(grep -c '^generate$' "${calls}")" -eq 1 ]
+  [ "$(grep -c '^apply$' "${calls}")" -eq 1 ]
+
+  run repair_netplan_offlink_ipv6_default_route
+  assert_success
+  [ "$(grep -c '^[[:space:]]*on-link: true$' "${config}")" -eq 1 ]
+  [ "$(grep -c '^generate$' "${calls}")" -eq 1 ]
+  [ "$(grep -c '^apply$' "${calls}")" -eq 1 ]
+  rm -rf "${tmpdir}"
+}
+
+@test "repair_netplan_offlink_ipv6_default_route: restores original when netplan rejects repair" {
+  local tmpdir config original calls
+  tmpdir="$(mktemp -d)"
+  config="${tmpdir}/99-provider.yaml"
+  original="${tmpdir}/original.backup"
+  calls="${tmpdir}/netplan.calls"
+  # Emulate GNU metadata flags on macOS without touching host ownership.
+  cp() { [[ "${1:-}" != --preserve=all ]] || shift; command cp -p "$@"; }
+  chown() { return 0; }
+  chmod() { [[ "${1:-}" == --reference=* ]] || command chmod "$@"; }
+  cat > "${config}" <<'EOF'
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    eth0:
+      addresses:
+        - 2a0e:1d80:24:8a0b::1/64
+      routes:
+        - to: default
+          via: 2a0e:1d80:24::1
+EOF
+  cp "${config}" "${original}"
+
+  NETPLAN_CONFIG_DIR="${tmpdir}"
+  WAN_IFACE="eth0"
+  DRY_RUN="false"
+  stat() {
+    if [[ "${1:-}" == "-c" && "${2:-}" == "%u" ]]; then echo 0; return 0; fi
+    if [[ "${1:-}" == "-c" && "${2:-}" == "%a" ]]; then echo 600; return 0; fi
+    command stat "$@"
+  }
+  netplan() {
+    printf '%s\n' "$*" >> "${calls}"
+    if [[ "${1:-}" == "generate" && "$(grep -c '^generate$' "${calls}")" -eq 1 ]]; then
+      return 1
+    fi
+    return 0
+  }
+
+  run repair_netplan_offlink_ipv6_default_route
+  assert_failure
+  assert_output --partial "original configuration restored"
+  run cmp -s "${original}" "${config}"
+  assert_success
+  [ "$(grep -c '^generate$' "${calls}")" -eq 2 ]
+  [ "$(grep -c '^apply$' "${calls}")" -eq 1 ]
+  rm -rf "${tmpdir}"
+}
+
+@test "repair_netplan_offlink_ipv6_default_route: restarts networkd for a stale rejected route" {
+  local tmpdir config calls restarted
+  tmpdir="$(mktemp -d)"
+  config="${tmpdir}/99-provider.yaml"
+  calls="${tmpdir}/calls"
+  restarted="${tmpdir}/restarted"
+  cat > "${config}" <<'EOF'
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    eth0:
+      addresses:
+        - 2a0e:1d80:24:8a0b::1/64
+      routes:
+        - to: default
+          via: 2a0e:1d80:24::1
+EOF
+
+  NETPLAN_CONFIG_DIR="${tmpdir}"
+  WAN_IFACE="eth0"
+  DRY_RUN="false"
+  stat() {
+    if [[ "${1:-}" == "-c" && "${2:-}" == "%u" ]]; then echo 0; return 0; fi
+    if [[ "${1:-}" == "-c" && "${2:-}" == "%a" ]]; then echo 600; return 0; fi
+    command stat "$@"
+  }
+  netplan() { printf 'netplan %s\n' "$*" >> "${calls}"; return 0; }
+  networkctl() { printf 'networkctl %s\n' "$*" >> "${calls}"; return 0; }
+  systemctl() {
+    printf 'systemctl %s\n' "$*" >> "${calls}"
+    if [[ "${1:-}" == "show" ]]; then echo loaded; return 0; fi
+    if [[ "${1:-}" == "restart" ]]; then touch "${restarted}"; return 0; fi
+    return 0
+  }
+  ip() {
+    if [[ "$*" == "-6 route show default dev eth0" && -f "${restarted}" ]]; then
+      echo "default via 2a0e:1d80:24::1 dev eth0 proto static onlink"
+      return 0
+    fi
+    return 1
+  }
+  sleep() { return 0; }
+
+  run repair_netplan_offlink_ipv6_default_route
+  assert_success
+  assert_output --partial "Repaired provider off-link IPv6 default route"
+  run grep -q '^networkctl reconfigure eth0$' "${calls}"
+  assert_success
+  run grep -q '^systemctl restart systemd-networkd.service$' "${calls}"
+  assert_success
+  [ -f "${restarted}" ]
+  rm -rf "${tmpdir}"
+}
+
+@test "restore_netplan_file: restores backup and regenerates network state" {
+  local tmpdir config backup calls
+  tmpdir="$(mktemp -d)"
+  config="${tmpdir}/99-provider.yaml"
+  backup="${tmpdir}/backup.yaml"
+  calls="${tmpdir}/netplan.calls"
+  printf 'broken\n' > "${config}"
+  printf 'network:\n  version: 2\n' > "${backup}"
+  netplan() { printf '%s\n' "$*" >> "${calls}"; return 0; }
+
+  run restore_netplan_file "${config}" "${backup}"
+  assert_success
+  run cmp -s "${backup}" "${config}"
+  assert_success
+  [ "$(sed -n '1p' "${calls}")" = "generate" ]
+  [ "$(sed -n '2p' "${calls}")" = "apply" ]
+  rm -rf "${tmpdir}"
+}
+
 @test "write_state: persists domain for later validation" {
   local tmpdir
   tmpdir="$(mktemp -d)"
   STATE_DIR="${tmpdir}"
   STATE_FILE="${tmpdir}/state"
+  STATE_LOCK_FILE="${tmpdir}/state.lock"
   ADMIN_USER="coolifyadmin"
   DOMAIN="vps.example.com"
   WAN_IFACE="eth0"
@@ -277,6 +455,12 @@ EOF
   ip() {
     printf '7: docker0    inet 172.17.0.1/16\n'
   }
+  xargs() {
+    [[ "${1:-}" == -r ]] && shift
+    # xargs launches an external executable; model that boundary explicitly
+    # rather than expecting a shell function to be visible to execvp.
+    "$@" net-a
+  }
 
   discover_docker_ssh_cidrs
   [[ "${DOCKER_SSH_CIDRS[*]}" == *"172.20.0.0/16"* ]]
@@ -295,6 +479,39 @@ EOF
   assert_success
   assert_output --partial "DRY-RUN"
   [ ! -f "${SSH_DROPIN_FILE}" ]
+}
+
+@test "configure_ssh: Dokploy adds Tailscale-only root Match policy" {
+  DRY_RUN="false"
+  PAAS="dokploy"
+  ADMIN_USER="dokployadmin"
+  SSH_PORT="22"
+  TAILSCALE_CIDR="100.64.0.0/10"
+  DETECTED_TAILSCALE_IP="100.64.1.10"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  SSH_DROPIN_FILE="${tmpdir}/00-base-hardening.conf"
+
+  install() {
+    if [[ "${1:-}" == "-d" && "${4:-}" == "/run/sshd" ]]; then
+      return 0
+    fi
+    command install "$@"
+  }
+  sshd() { return 0; }
+  assert_sshd_effective() { return 0; }
+  assert_sshd_match_tailscale() { return 0; }
+  reload_ssh_service() { return 0; }
+
+  run configure_ssh
+  assert_success
+  grep -q '^AllowUsers root$' "${SSH_DROPIN_FILE}" || return 1
+  grep -q '^Match Address 100.64.0.0/10$' "${SSH_DROPIN_FILE}" || return 1
+  grep -q '^    PermitRootLogin prohibit-password$' "${SSH_DROPIN_FILE}" || return 1
+  grep -q '^    AllowUsers root$' "${SSH_DROPIN_FILE}" || return 1
+  ! grep -q '^AllowUsers .*dokployadmin' "${SSH_DROPIN_FILE}" || return 1
+
+  rm -rf "${tmpdir}"
 }
 
 @test "configure_ssh: successful apply prunes stale backup artifacts" {
@@ -348,7 +565,7 @@ EOF
 
   docker() {
     if [[ "$1" == "info" ]]; then
-      printf 'Server:\n Firewall: iptables\n iptables: true\n'
+      printf '{"Driver":"iptables"}\n'
       return 0
     fi
     return 0
@@ -363,7 +580,7 @@ EOF
     source "'"${SCRIPT}"'"
     docker() {
       if [[ "$1" == "info" ]]; then
-        printf "Server:\n firewall: nftables\n"
+        printf "{\"Driver\":\"nftables\"}\n"
         return 0
       fi
       return 0
@@ -371,7 +588,22 @@ EOF
     detect_docker
   '
   assert_failure
-  assert_output --partial "nftables backend detected"
+  assert_output --partial "Expected a positively identified Docker iptables firewall backend, got nftables"
+}
+
+@test "detect_docker: fails closed when Docker backend cannot be identified" {
+  run bash -c '
+    source "'"${SCRIPT}"'"
+    docker() {
+      if [[ "$1" == "info" ]]; then
+        return 0
+      fi
+      return 0
+    }
+    detect_docker
+  '
+  assert_failure
+  assert_output --partial "Expected a positively identified Docker iptables firewall backend, got unavailable"
 }
 
 @test "configure_docker_user: dry-run installs/enables service without failure" {
@@ -421,16 +653,22 @@ EOF
 @test "configure_auditd_policy: updates auditd.conf keys" {
   local conf
   conf="$(mktemp)"
-  printf 'max_log_file_action = rotate\n' > "${conf}"
+  printf 'max_log_file_action = keep_logs\n' > "${conf}"
 
   AUDITD_CONF_FILE="${conf}"
   DRY_RUN="false"
 
   configure_auditd_policy
 
-  run grep -q '^max_log_file_action = keep_logs$' "${conf}"
+  run grep -q '^max_log_file = 50$' "${conf}"
   assert_success
-  run grep -q '^space_left = 100$' "${conf}"
+  run grep -q '^num_logs = 10$' "${conf}"
+  assert_success
+  run grep -q '^rate_limit = 1000$' "${conf}"
+  assert_failure # rate belongs to the ordered kernel helper, not auditd.conf
+  run grep -q '^max_log_file_action = rotate$' "${conf}"
+  assert_success
+  run grep -q '^admin_space_left_action = syslog$' "${conf}"
   assert_success
 
   rm -f "${conf}"
@@ -445,6 +683,141 @@ EOF
   assert_success
   assert_output --partial "DRY-RUN"
   [ ! -f "${AUDIT_RULES_FILE}" ]
+}
+
+@test "install_auditd_rate_limit_persistence: orders rate before immutable rule load" {
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  AUDITD_RATE_LIMIT_HELPER="${tmpdir}/hardening-auditd-rate-limit"
+  AUDITD_RATE_LIMIT_DROPIN="${tmpdir}/auditd.service.d/10-rate-limit.conf"
+  DRY_RUN="false"
+  install() {
+    local -a filtered=()
+    while (($#)); do
+      case "$1" in
+        -o|-g) shift 2 ;;
+        *) filtered+=("$1"); shift ;;
+      esac
+    done
+    command install "${filtered[@]}"
+  }
+  run() { "$@"; }
+  systemctl() { [[ "$1" == "daemon-reload" ]]; }
+
+  install_auditd_rate_limit_persistence
+
+  grep -Fq 'auditctl -r 10000' "${AUDITD_RATE_LIMIT_HELPER}"
+  [[ "$(sed -n '2p' "${AUDITD_RATE_LIMIT_DROPIN}")" == 'ExecStartPost=' ]]
+  [[ "$(sed -n '3p' "${AUDITD_RATE_LIMIT_DROPIN}")" == "ExecStartPost=${AUDITD_RATE_LIMIT_HELPER}" ]]
+  [[ "$(sed -n '4p' "${AUDITD_RATE_LIMIT_DROPIN}")" == 'ExecStartPost=-/sbin/augenrules --load' ]]
+
+  # Executing the helper during resume must stage, not mutate, an immutable
+  # old-rate kernel. A fresh boot still applies the rate before rule locking.
+  AUDIT_TEST_CALLS="${tmpdir}/audit.calls"
+  AUDIT_TEST_ENABLED=2
+  export AUDIT_TEST_CALLS AUDIT_TEST_ENABLED
+  auditctl() {
+    if [[ "$1" == '-s' ]]; then printf 'enabled %s\nrate_limit 1000\n' "${AUDIT_TEST_ENABLED}";
+    else printf '%s\n' "$*" >> "${AUDIT_TEST_CALLS}"; fi
+  }
+  export -f auditctl
+  bash "${AUDITD_RATE_LIMIT_HELPER}"
+  [ ! -e "${AUDIT_TEST_CALLS}" ]
+  AUDIT_TEST_ENABLED=1
+  bash "${AUDITD_RATE_LIMIT_HELPER}"
+  grep -Fxq -- '-r 10000' "${AUDIT_TEST_CALLS}"
+
+  rm -rf "${tmpdir}"
+}
+
+@test "configure_auditd: immutable state installs next-boot rate repair without forbidden mutation" {
+  local tmpdir auditctl_mutation_marker restart_marker
+  tmpdir="$(mktemp -d)"
+  auditctl_mutation_marker="${tmpdir}/auditctl-mutated"
+  restart_marker="${tmpdir}/auditd-restarted"
+  AUDIT_RULES_FILE="${tmpdir}/rules.d/60-baseline.rules"
+  AUDITD_CONF_FILE="${tmpdir}/auditd.conf"
+  AUDITD_RATE_LIMIT_HELPER="${tmpdir}/hardening-auditd-rate-limit"
+  AUDITD_RATE_LIMIT_DROPIN="${tmpdir}/auditd.service.d/10-rate-limit.conf"
+  printf 'max_log_file_action = keep_logs\n' > "${AUDITD_CONF_FILE}"
+  DRY_RUN="false"
+  install() {
+    local -a filtered=()
+    while (($#)); do
+      case "$1" in
+        -o|-g) shift 2 ;;
+        *) filtered+=("$1"); shift ;;
+      esac
+    done
+    command install "${filtered[@]}"
+  }
+  run() { "$@"; }
+  systemctl() {
+    [[ "$1" == "restart" ]] && : > "${restart_marker}"
+    return 0
+  }
+  auditctl() {
+    if [[ "$1" == "-s" ]]; then
+      printf 'enabled 2\nrate_limit 0\nloginuid_immutable 1 locked\n'
+      return 0
+    fi
+    : > "${auditctl_mutation_marker}"
+    return 1
+  }
+
+  configure_auditd
+
+  [[ -f "${AUDITD_RATE_LIMIT_HELPER}" ]]
+  [[ -f "${AUDITD_RATE_LIMIT_DROPIN}" ]]
+  [[ ! -e "${auditctl_mutation_marker}" ]]
+  [[ ! -e "${restart_marker}" ]]
+
+  rm -rf "${tmpdir}"
+}
+
+@test "configure_auditd: fresh restart relies on ordered unit hooks and verifies final state" {
+  local tmpdir restart_marker augenrules_marker
+  tmpdir="$(mktemp -d)"
+  restart_marker="${tmpdir}/auditd-restarted"
+  augenrules_marker="${tmpdir}/standalone-augenrules"
+  AUDIT_RULES_FILE="${tmpdir}/rules.d/60-baseline.rules"
+  AUDITD_CONF_FILE="${tmpdir}/auditd.conf"
+  AUDITD_RATE_LIMIT_HELPER="${tmpdir}/hardening-auditd-rate-limit"
+  AUDITD_RATE_LIMIT_DROPIN="${tmpdir}/auditd.service.d/10-rate-limit.conf"
+  printf 'max_log_file_action = keep_logs\n' > "${AUDITD_CONF_FILE}"
+  DRY_RUN="false"
+  install() {
+    local -a filtered=()
+    while (($#)); do
+      case "$1" in
+        -o|-g) shift 2 ;;
+        *) filtered+=("$1"); shift ;;
+      esac
+    done
+    command install "${filtered[@]}"
+  }
+  run() { "$@"; }
+  systemctl() {
+    [[ "$1" == "restart" ]] && : > "${restart_marker}"
+    return 0
+  }
+  auditctl() {
+    [[ "$1" == "-s" ]] || return 1
+    if [[ -e "${restart_marker}" ]]; then
+      printf 'enabled 2\nrate_limit 10000\nloginuid_immutable 1 locked\n'
+    else
+      printf 'enabled 1\nrate_limit 0\nloginuid_immutable 0 unlocked\n'
+    fi
+  }
+  augenrules() { : > "${augenrules_marker}"; return 9; }
+
+  configure_auditd
+
+  [[ -e "${restart_marker}" ]]
+  [[ ! -e "${augenrules_marker}" ]]
+  grep -Fqx -- '-e 2' "${AUDIT_RULES_FILE}"
+
+  rm -rf "${tmpdir}"
 }
 
 @test "generate_report: dry-run exits cleanly without writing report file" {
@@ -495,7 +868,7 @@ EOF
 
   run configure_docker_ssh_cidr_sync_timer
   assert_success
-  run grep -F 'rm -f "${SSH_DROPIN_FILE}".bak.*' "${DOCKER_SSH_CIDR_SYNC_SCRIPT}"
+  run grep -F 'bak.' "${DOCKER_SSH_CIDR_SYNC_SCRIPT}"
   assert_success
   run grep -F 'ufw --force delete allow in proto tcp from "${old_cidr}" to any port "${ssh_port}" comment "${RULE_COMMENT}"' "${DOCKER_SSH_CIDR_SYNC_SCRIPT}"
   assert_success
@@ -527,6 +900,33 @@ EOF
   assert_success
   assert_output --partial "sysctl"
   [ ! -f "${SYSCTL_DROPIN_FILE}" ]
+}
+
+@test "configure_ufw_sysctl_martian_logging: prevents UFW from undoing the boot baseline" {
+  DRY_RUN="false"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  UFW_SYSCTL_FILE="${tmpdir}/sysctl.conf"
+  cat > "${UFW_SYSCTL_FILE}" <<'EOF'
+# provider defaults
+net/ipv4/conf/all/log_martians=0
+net/ipv4/conf/default/log_martians = 0
+net/ipv4/ip_forward=1
+EOF
+
+  run configure_ufw_sysctl_martian_logging
+  assert_success
+  run grep -c '^net/ipv4/conf/all/log_martians=1$' "${UFW_SYSCTL_FILE}"
+  assert_success
+  assert_output "1"
+  run grep -c '^net/ipv4/conf/default/log_martians=1$' "${UFW_SYSCTL_FILE}"
+  assert_success
+  assert_output "1"
+  grep -qx 'net/ipv4/ip_forward=1' "${UFW_SYSCTL_FILE}"
+
+  configure_ufw_sysctl_martian_logging
+  [[ "$(grep -c 'log_martians=1' "${UFW_SYSCTL_FILE}")" -eq 2 ]]
+  rm -rf "${tmpdir}"
 }
 
 @test "configure_kernel_modules: writes install rules for unused modules and is idempotent" {
@@ -583,7 +983,7 @@ EOF
 
   run configure_sysctl
   assert_success
-  assert_output --partial "/etc/sysctl.d/99-base-hardening.conf"
+  assert_output --partial "/etc/sysctl.d/99-zzz-hardening.conf"
 }
 
 @test "configure_ufw: dry-run logs firewall rule reconciliation" {
@@ -604,6 +1004,29 @@ EOF
   assert_output --partial "DRY-RUN"
   assert_output --partial 'ufw allow in proto tcp from 10.0.0.0/8 to any port 22 comment coolify-hardening-ssh-docker-bridge'
   [ ! -f "${marker}" ]
+}
+
+@test "ufw reconciliation: finds and removes stale public Coolify management allows" {
+  TAILSCALE_IFACE="tailscale0"
+  stale_state_file="$(mktemp)"
+  printf '0\n' > "${stale_state_file}"
+  ufw() {
+    if [[ "${1:-}" == "status" && "${2:-}" == "numbered" ]]; then
+      stale_calls="$(<"${stale_state_file}")"
+      stale_calls=$((stale_calls + 1))
+      printf '%s\n' "${stale_calls}" > "${stale_state_file}"
+      if (( stale_calls <= 2 )); then
+        printf '%s\n' '[ 1] 8000/tcp ALLOW IN Anywhere'
+      fi
+    fi
+    return 0
+  }
+  run ufw_find_stale_coolify_management_rule
+  assert_success
+  assert_output --partial "8000/tcp"
+  remove_stale_coolify_management_rules
+  (( $(<"${stale_state_file}") >= 2 ))
+  rm -f "${stale_state_file}"
 }
 
 @test "configure_fail2ban: dry-run logs jail configuration and service action" {
@@ -676,13 +1099,29 @@ EOF
 
   run configure_rsyslog_targets
   assert_success
-  assert_output --partial "DRY-RUN: ensure /var/log is root:syslog mode 0770"
+  assert_output --partial "DRY-RUN: ensure /var/log is root:root mode 0755"
   assert_output --partial "DRY-RUN: ensure /var/log/ufw.log exists (0640 syslog:adm)"
   assert_output --partial "patched /etc/logrotate.d/ufw"
   [ ! -f "${marker}" ]
 }
 
-@test "configure_rsyslog_targets: does not reset /var/log mode while ensuring target directories" {
+@test "install_rsyslog_tmpfiles_override: preserves root-owned non-writable var log across boots" {
+  DRY_RUN="false"
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  RSYSLOG_TMPFILES_OVERRIDE="${tmpdir}/00rsyslog.conf"
+
+  run install_rsyslog_tmpfiles_override
+  assert_success
+  grep -qx 'z /var/log 0755 root root -' "${RSYSLOG_TMPFILES_OVERRIDE}"
+  [[ "$(python3 -c 'import os,stat,sys;print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode))[2:])' "${RSYSLOG_TMPFILES_OVERRIDE}")" == "644" ]]
+
+  install_rsyslog_tmpfiles_override
+  [[ "$(grep -c '^z /var/log 0755 root root -$' "${RSYSLOG_TMPFILES_OVERRIDE}")" -eq 1 ]]
+  rm -rf "${tmpdir}"
+}
+
+@test "configure_rsyslog_targets: keeps /var/log root-owned and non-writable while ensuring target directories" {
   DRY_RUN="false"
   rsyslog_collect_log_targets() {
     printf '%s\n' "/var/log/ufw.log" "/var/log/mail.log"
@@ -702,9 +1141,9 @@ EOF
   run configure_rsyslog_targets
   assert_success
 
-  run grep -F -- "-d -m 0770 -o root -g syslog /var/log" "${install_log}"
+  run grep -F -- "-d -m 0755 -o root -g root /var/log" "${install_log}"
   assert_success
-  run grep -F -- "-d -m 0755 /var/log" "${install_log}"
+  run grep -F -- "-d -m 0770 -o root -g syslog /var/log" "${install_log}"
   assert_failure
 
   rm -f "${install_log}"
@@ -789,8 +1228,17 @@ EOF
     [[ "${1:-}" == "info" ]]
   }
   iptables() {
-    if [[ "${1:-}" == "-S" && "${2:-}" == "DOCKER-USER" ]]; then
-      echo '-A DOCKER-USER -m comment --comment coolify-hardening'
+    if [[ "${1:-}" == "-t" && "${2:-}" == "filter" && "${3:-}" == "-S" && "${4:-}" == "DOCKER-USER" ]]; then
+      echo '-A DOCKER-USER -m comment --comment secure-ubuntu-paas-docker-user-jump -j SECURE-DOCKER-USER'
+      return 0
+    fi
+    if [[ "${1:-}" == "-t" && "${2:-}" == "filter" && "${3:-}" == "-S" && "${4:-}" == "SECURE-DOCKER-USER" ]]; then
+      printf '%s\n' \
+        '-A SECURE-DOCKER-USER -i eth0 -m comment --comment coolify-hardening-wan-web -j ACCEPT' \
+        '-A SECURE-DOCKER-USER -i eth0 -m comment --comment coolify-hardening-wan-drop -j DROP' \
+        '-A SECURE-DOCKER-USER -i docker0 -m comment --comment coolify-hardening-bridge-docker0 -j RETURN' \
+        '-A SECURE-DOCKER-USER -i docker_gwbridge -m comment --comment coolify-hardening-bridge-docker-gw -j RETURN' \
+        '-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-unmatched-drop -j DROP'
       return 0
     fi
     return 1
@@ -811,6 +1259,7 @@ EOF
   run wait_for_docker_daemon_ready 2 0
   assert_success
 
+  TUNNEL_MODE="false"
   unset -f docker_daemon_ready
   docker_daemon_ready() { return 0; }
   run docker_user_rules_present
@@ -823,6 +1272,79 @@ EOF
   DOCKER_RULES_APPLIED="false"
   ensure_docker_user_service_applied "Gate D"
   [ "${DOCKER_RULES_APPLIED}" = "true" ]
+}
+
+@test "docker firewall readiness: covers IPv6 fallback and family policy helpers" {
+  TUNNEL_MODE="false"
+  iptables() {
+    if [[ "${4:-}" == "DOCKER-USER" ]]; then
+      printf '%s\n' '-A DOCKER-USER -m comment --comment secure-ubuntu-paas-docker-user-jump -j SECURE-DOCKER-USER'
+    else
+      printf '%s\n' \
+        '-A SECURE-DOCKER-USER -i eth0 -m comment --comment coolify-hardening-wan-web -j ACCEPT' \
+        '-A SECURE-DOCKER-USER -i eth0 -m comment --comment coolify-hardening-wan-drop -j DROP' \
+        '-A SECURE-DOCKER-USER -i docker0 -m comment --comment coolify-hardening-bridge-docker0 -j RETURN' \
+        '-A SECURE-DOCKER-USER -i docker_gwbridge -m comment --comment coolify-hardening-bridge-docker-gw -j RETURN' \
+        '-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-unmatched-drop -j DROP'
+    fi
+  }
+  docker_user_family_rules_present iptables DOCKER-USER SECURE-DOCKER-USER \
+    secure-ubuntu-paas-docker-user-jump coolify-hardening-wan-drop \
+    coolify-hardening-unmatched-drop coolify-hardening-wan-web
+  docker_ipv6_disabled_without_listeners || true
+}
+
+@test "docker firewall readiness: direct helper assertions" {
+  TUNNEL_MODE="false"
+  iptables() {
+    if [[ "${4:-}" == "DOCKER-USER" ]]; then
+      printf '%s\n' '-A DOCKER-USER -m comment --comment secure-ubuntu-paas-docker-user-jump -j SECURE-DOCKER-USER'
+    else
+      printf '%s\n' \
+        '-A SECURE-DOCKER-USER -i eth0 -m comment --comment coolify-hardening-wan-web -j ACCEPT' \
+        '-A SECURE-DOCKER-USER -i eth0 -m comment --comment coolify-hardening-wan-drop -j DROP' \
+        '-A SECURE-DOCKER-USER -i docker0 -m comment --comment coolify-hardening-bridge-docker0 -j RETURN' \
+        '-A SECURE-DOCKER-USER -i docker_gwbridge -m comment --comment coolify-hardening-bridge-docker-gw -j RETURN' \
+        '-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-unmatched-drop -j DROP'
+    fi
+  }
+  run docker_user_family_rules_present iptables DOCKER-USER SECURE-DOCKER-USER \
+    secure-ubuntu-paas-docker-user-jump coolify-hardening-wan-drop \
+    coolify-hardening-unmatched-drop coolify-hardening-wan-web
+  assert_success
+  run docker_ipv6_disabled_without_listeners
+  [[ "${status}" -eq 0 || "${status}" -eq 1 ]]
+}
+
+@test "docker firewall readiness: management drop must be original-direction only" {
+  TUNNEL_MODE="false"
+  DOCKER_USER_MANAGEMENT_PORT="3000"
+  PAAS="dokploy"
+  MOCK_PANEL_DIRECTION="ORIGINAL"
+  iptables() {
+    if [[ "${4:-}" == "DOCKER-USER" ]]; then
+      printf '%s\n' '-A DOCKER-USER -m comment --comment secure-ubuntu-paas-docker-user-jump -j SECURE-DOCKER-USER'
+    else
+      printf '%s\n' \
+        "-A SECURE-DOCKER-USER -p tcp -m conntrack --ctorigdstport 3000 --ctdir ${MOCK_PANEL_DIRECTION} -m comment --comment coolify-hardening-management-container-drop -j DROP" \
+        '-A SECURE-DOCKER-USER -i eth0 -m comment --comment coolify-hardening-wan-web -j ACCEPT' \
+        '-A SECURE-DOCKER-USER -i eth0 -m comment --comment coolify-hardening-wan-drop -j DROP' \
+        '-A SECURE-DOCKER-USER -i docker0 -m comment --comment coolify-hardening-bridge-docker0 -j RETURN' \
+        '-A SECURE-DOCKER-USER -i docker_gwbridge -m comment --comment coolify-hardening-bridge-docker-gw -j RETURN' \
+        '-A SECURE-DOCKER-USER -m comment --comment coolify-hardening-unmatched-drop -j DROP'
+    fi
+  }
+
+  run docker_user_family_rules_present iptables DOCKER-USER SECURE-DOCKER-USER \
+    secure-ubuntu-paas-docker-user-jump coolify-hardening-wan-drop \
+    coolify-hardening-unmatched-drop coolify-hardening-wan-web
+  assert_success
+
+  MOCK_PANEL_DIRECTION="REPLY"
+  run docker_user_family_rules_present iptables DOCKER-USER SECURE-DOCKER-USER \
+    secure-ubuntu-paas-docker-user-jump coolify-hardening-wan-drop \
+    coolify-hardening-unmatched-drop coolify-hardening-wan-web
+  assert_failure
 }
 
 @test "wait_for_fail2ban_sshd_jail: returns success after jail becomes queryable" {
@@ -1381,13 +1903,21 @@ EOF
   [[ -z "$(ls -A "${dropin_dir}")" ]]
 }
 
-@test "configure_ssh_socket: skips gracefully when Tailscale IP unavailable" {
+@test "configure_ssh_socket: fails closed when Tailscale IP unavailable" {
   DRY_RUN="true"
   tailscale() { return 1; }
 
   run configure_ssh_socket
+  assert_failure
+  assert_output --partial "Could not detect a valid Tailscale IPv4"
+}
+
+@test "ssh_socket_is_tailscale_ipv4: accepts only exact Tailscale IPv4 range" {
+  run ssh_socket_is_tailscale_ipv4 "100.72.228.23"
   assert_success
-  assert_output --partial "Could not detect Tailscale IP"
+
+  run ssh_socket_is_tailscale_ipv4 "100.1.2.3"
+  assert_failure
 }
 
 @test "configure_password_policy: dry-run logs policy application without writing files" {
@@ -1448,5 +1978,22 @@ EOF
     [[ ! -d "${tmpdir}/legacy" ]]
     [[ -f "${tmpdir}/target/state" ]]
   '
+  assert_success
+}
+
+@test "load_tailscale_auth_key_file: loads a protected auth-key file without CLI material" {
+  local key_file
+  key_file="$(mktemp)"
+  printf 'tskey-auth-test\n' > "${key_file}"
+  TAILSCALE_AUTH_KEY_FILE="${key_file}"
+  TAILSCALE_AUTH_KEY=""
+  load_tailscale_auth_key_file
+  [ "${TAILSCALE_AUTH_KEY}" = "tskey-auth-test" ]
+  rm -f "${key_file}"
+}
+
+@test "validate_overlay_contract: verifies required dFlow functions before mutation" {
+  PAAS="dflow"
+  run validate_overlay_contract
   assert_success
 }

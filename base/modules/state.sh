@@ -17,6 +17,12 @@ write_state() {
   fi
 
   cidr_csv="$(IFS=,; echo "${DOCKER_SSH_CIDRS[*]}")"
+  local audit_loginuid_immutable="false"
+  if command -v auditctl >/dev/null 2>&1; then
+    if auditctl -s 2>/dev/null | awk '$1 == "loginuid_immutable" && $2 == "1" {found=1} END {exit(found ? 0 : 1)}'; then
+      audit_loginuid_immutable="true"
+    fi
+  fi
 
   install -d -m 0750 "${STATE_DIR}"
   tmp_state="$(mktemp)"
@@ -43,6 +49,7 @@ allowed_privileged_containers=${ALLOWED_PRIVILEGED_CONTAINERS}
 tailscale_direct_wan=${TAILSCALE_DIRECT_WAN}
 bind_dashboard_to_tailscale=${BIND_DASHBOARD_TO_TAILSCALE}
 install_tailscale=${INSTALL_TAILSCALE}
+audit_loginuid_immutable=${audit_loginuid_immutable}
 paas=${PAAS}
 EOF
 
@@ -77,9 +84,11 @@ generate_report() {
   local journald_persistent
   local auditd_enabled
   local audit_rules_loaded
+  local audit_loginuid_immutable
   local docker_drop_rule
   local docker_drop_rule_v6
   local sysctl_syncookies
+  local sysctl_log_martians
   local fail2ban_active
   local tailscale_runssh_disabled
   local banner_present
@@ -96,9 +105,35 @@ generate_report() {
   journald_persistent="$(grep -q "^Storage=persistent$" "${JOURNALD_DROPIN_FILE}" && echo "true" || echo "false")"
   auditd_enabled="$(systemctl is-enabled auditd >/dev/null 2>&1 && echo "true" || echo "false")"
   audit_rules_loaded="$(auditctl -l | grep -q "identity" && echo "true" || echo "false")"
-  docker_drop_rule="$(iptables -t filter -S DOCKER-USER 2>/dev/null | grep -q "coolify-hardening-wan-drop" && echo "true" || echo "false")"
-  docker_drop_rule_v6="$(ip6tables -t filter -S DOCKER-USER 2>/dev/null | grep -q "coolify-hardening-wan-drop6" && echo "true" || echo "false")"
+  audit_loginuid_immutable="$(auditctl -s 2>/dev/null | awk '$1 == "loginuid_immutable" && $2 == "1" {found=1} END {print found ? "true" : "false"}')"
+  docker_drop_rule="$(
+    shared_rules="" policy_rules="" first_rule=""
+    shared_rules="$(iptables -t filter -S DOCKER-USER 2>/dev/null || true)"
+    policy_rules="$(iptables -t filter -S SECURE-DOCKER-USER 2>/dev/null || true)"
+    first_rule="$(awk '$1 == "-A" { print; exit }' <<< "${shared_rules}")"
+    if [[ "${first_rule}" == *"-j SECURE-DOCKER-USER"* ]] \
+      && grep -q "coolify-hardening-wan-drop" <<< "${policy_rules}" \
+      && grep -q "coolify-hardening-unmatched-drop" <<< "${policy_rules}"; then
+      echo "true"
+    else
+      echo "false"
+    fi
+  )"
+  docker_drop_rule_v6="$(
+    shared_rules="" policy_rules="" first_rule=""
+    shared_rules="$(ip6tables -t filter -S DOCKER-USER 2>/dev/null || true)"
+    policy_rules="$(ip6tables -t filter -S SECURE-DOCKER-USER6 2>/dev/null || true)"
+    first_rule="$(awk '$1 == "-A" { print; exit }' <<< "${shared_rules}")"
+    if [[ "${first_rule}" == *"-j SECURE-DOCKER-USER6"* ]] \
+      && grep -q "coolify-hardening-wan-drop6" <<< "${policy_rules}" \
+      && grep -q "coolify-hardening-unmatched-drop6" <<< "${policy_rules}"; then
+      echo "true"
+    else
+      echo "false"
+    fi
+  )"
   sysctl_syncookies="$([[ "$(sysctl -n net.ipv4.tcp_syncookies 2>/dev/null)" == "1" ]] && echo "true" || echo "false")"
+  sysctl_log_martians="$([[ "$(sysctl -n net.ipv4.conf.all.log_martians 2>/dev/null)" == "1" ]] && echo "true" || echo "false")"
   local sysctl_bbr
   sysctl_bbr="$([[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]] && echo "true" || echo "false")"
   local timesync_ntp
@@ -170,6 +205,8 @@ generate_report() {
     --argjson journald_persistent "${journald_persistent}" \
     --argjson auditd_enabled "${auditd_enabled}" \
     --argjson audit_rules_loaded "${audit_rules_loaded}" \
+    --argjson audit_loginuid_immutable "${audit_loginuid_immutable}" \
+    --argjson sysctl_log_martians "${sysctl_log_martians}" \
     --argjson docker_user_drop_rule_v4 "${docker_drop_rule}" \
     --argjson docker_user_drop_rule_v6 "${docker_drop_rule_v6}" \
     --argjson docker_sock_world_writable "${docker_sock_world_writable}" \
@@ -216,6 +253,8 @@ generate_report() {
         journald_persistent: $journald_persistent,
         auditd_enabled: $auditd_enabled,
         audit_rules_loaded: $audit_rules_loaded,
+        audit_loginuid_immutable: $audit_loginuid_immutable,
+        sysctl_log_martians: $sysctl_log_martians,
         docker_user_drop_rule_v4: $docker_user_drop_rule_v4,
         docker_user_drop_rule_v6: $docker_user_drop_rule_v6,
         docker_sock_world_writable: $docker_sock_world_writable,

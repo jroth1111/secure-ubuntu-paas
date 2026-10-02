@@ -43,21 +43,40 @@ docker_trust_boundary_check() {
   fi
 
   if getent group docker >/dev/null 2>&1; then
-    local docker_members
-    docker_members="$(getent group docker | awk -F: '{print $4}')"
-
-    if [[ -z "${docker_members}" ]]; then
-      record "PASS" "docker-trust: docker group has no named members"
-    else
+    local docker_group_entry docker_gid supplementary_members primary_members docker_members
+    docker_group_entry="$(getent group docker 2>/dev/null | head -n 1 || true)"
+    docker_gid="$(awk -F: '{print $3}' <<< "${docker_group_entry}")"
+    if [[ ! "${docker_gid}" =~ ^[0-9]+$ ]]; then
+      record "FAIL" "docker-trust: docker group membership resolution" \
+        "docker group has an invalid or unreadable GID; refusing to treat membership as empty"
       record "FAIL" "docker-trust: docker group has no named members" \
-        "named members present: ${docker_members} (root-equivalent Docker access)"
-    fi
-
-    if [[ -n "${ADMIN_USER}" ]] && grep -qE "(^|,)$(regex_escape "${ADMIN_USER}")($|,)" <<< "${docker_members}"; then
+        "unable to enumerate effective docker-group members"
       record "FAIL" "docker-trust: admin user not in docker group" \
-        "${ADMIN_USER} is in docker group (root-equivalent Docker access)"
+        "unable to prove ${ADMIN_USER:-the admin user} is outside the docker group"
     else
-      record "PASS" "docker-trust: admin user not in docker group"
+      supplementary_members="$(awk -F: '{print $4}' <<< "${docker_group_entry}")"
+      # A user whose primary GID is docker is an effective group member even
+      # when the supplementary-member field is empty.  Union both sources and
+      # deduplicate before applying the root-equivalent access policy.
+      primary_members="$(getent passwd 2>/dev/null | awk -F: -v gid="${docker_gid}" '$4 == gid {print $1}' || true)"
+      docker_members="$({
+        printf '%s\n' "${supplementary_members//,/$'\n'}"
+        printf '%s\n' "${primary_members}"
+      } | sed '/^[[:space:]]*$/d' | sort -u | paste -sd, -)"
+
+      if [[ -z "${docker_members}" ]]; then
+        record "PASS" "docker-trust: docker group has no named members"
+      else
+        record "FAIL" "docker-trust: docker group has no named members" \
+          "effective members present: ${docker_members} (root-equivalent Docker access)"
+      fi
+
+      if [[ -n "${ADMIN_USER}" ]] && grep -qE "(^|,)$(regex_escape "${ADMIN_USER}")($|,)" <<< "${docker_members}"; then
+        record "FAIL" "docker-trust: admin user not in docker group" \
+          "${ADMIN_USER} is in docker group (root-equivalent Docker access)"
+      else
+        record "PASS" "docker-trust: admin user not in docker group"
+      fi
     fi
   else
     record "INFO" "docker-trust: docker group" "group not present"

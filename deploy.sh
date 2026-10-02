@@ -35,10 +35,14 @@ source "${SCRIPT_DIR}/lib/overlay-loader.sh"
 # shellcheck source=lib/hardening_resume_reconcile.sh
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/hardening_resume_reconcile.sh"
+# shellcheck source=lib/secret_transport.sh
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/secret_transport.sh"
 
 # ── Inputs (populated by flags or prompts) ──────────────────────────────────
 
 SERVER_IP="${SERVER_IP:-}"
+SERVER_HOST_KEY_FILE="${SERVER_HOST_KEY_FILE:-}"
 ROOT_PASS="${ROOT_PASS:-}"
 ROOT_PASS_FILE="${ROOT_PASS_FILE:-}"
 ROOT_PASS_RUNTIME_FILE=""
@@ -46,6 +50,7 @@ PAAS="${PAAS:-coolify}"
 ADMIN_USER="${ADMIN_USER:-}"
 PUBKEY_FILE="${PUBKEY_FILE:-}"
 TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"
+TAILSCALE_AUTH_KEY_FILE="${TAILSCALE_AUTH_KEY_FILE:-}"
 DEPLOY_MODE="${DEPLOY_MODE:-}"
 DOMAIN="${DOMAIN:-}"
 CF_API_TOKEN="${CF_API_TOKEN:-}"
@@ -58,6 +63,7 @@ CF_ACCOUNT_ID="${CF_ACCOUNT_ID:-}"
 APP_DOMAIN_MODE="${APP_DOMAIN_MODE:-}"
 SWAP_SIZE="${SWAP_SIZE:-}"
 SERVER_TIMEZONE="${SERVER_TIMEZONE:-}"
+DOKPLOY_ENROLLMENT_SOURCE_IP="${DOKPLOY_ENROLLMENT_SOURCE_IP:-}"
 TAILSCALE_DIRECT_WAN="${TAILSCALE_DIRECT_WAN:-false}"
 PRIVATE_TLS_CA="${PRIVATE_TLS_CA:-}"
 ZEROSSL_EAB_KID="${ZEROSSL_EAB_KID:-}"
@@ -80,6 +86,7 @@ TUNNEL_SECRET=""
 REMOTE_DEPLOY_ENV_PATH="/root/deploy.env"
 DEPLOY_ENV_REMOTE_PENDING="false"
 ROOT_SSH_HOST=""
+DOKPLOY_SWARM_UNLOCK_KEY_RUNTIME=""
 
 # ── SSH options ─────────────────────────────────────────────────────────────
 
@@ -92,6 +99,7 @@ declare -a ROOT_SSH_OPTS=()
 
 cleanup_temp_files() {
   rm -f "${DEPLOY_KNOWN_HOSTS:-}" "${ADMIN_KNOWN_HOSTS:-}" "${ROOT_PASS_RUNTIME_FILE:-}"
+  secret_transport_cleanup_all
 }
 
 sync_operator_known_host_entries() {
@@ -113,12 +121,6 @@ sync_operator_known_host_entries() {
   fi
   chmod 600 "${operator_known_hosts}" >/dev/null 2>&1 || true
 
-  local host
-  for host in "$@"; do
-    [[ -n "${host}" ]] || continue
-    ssh-keygen -R "${host}" -f "${operator_known_hosts}" >/dev/null 2>&1 || true
-  done
-
   local line added=0
   while IFS= read -r line; do
     [[ -n "${line}" ]] || continue
@@ -134,6 +136,50 @@ sync_operator_known_host_entries() {
   if (( added > 0 )) && [[ $# -gt 0 ]]; then
     log "Operator known_hosts refreshed for: $*"
   fi
+}
+
+known_host_entry_present() {
+  local host="$1"
+  local known_hosts_file="$2"
+  [[ -n "${host}" && -s "${known_hosts_file}" ]] \
+    && ssh-keygen -F "${host}" -f "${known_hosts_file}" >/dev/null 2>&1
+}
+
+known_host_key_material() {
+  local host="$1"
+  local known_hosts_file="$2"
+  ssh-keygen -F "${host}" -f "${known_hosts_file}" 2>/dev/null \
+    | awk 'NF >= 3 && $2 ~ /^(ssh-|ecdsa-|sk-)/ { print $2 " " $3 }' \
+    | sort -u || true
+}
+
+pin_known_host_alias() {
+  local source_host="$1"
+  local alias_host="$2"
+  local source_file="$3"
+  local target_file="$4"
+  [[ -n "${source_host}" && -n "${alias_host}" && -s "${source_file}" && -n "${target_file}" ]] || return 1
+
+  local key_material alias_key_material key_type key_blob entry
+  key_material="$(known_host_key_material "${source_host}" "${source_file}")"
+  [[ -n "${key_material}" ]] || return 1
+
+  alias_key_material="$(known_host_key_material "${alias_host}" "${target_file}")"
+  if [[ -n "${alias_key_material}" ]]; then
+    # An alias is safe only when its complete key set is exactly the set
+    # already verified for the source endpoint.  Presence of any prior key is
+    # not proof of identity and must never authorize a privileged transition.
+    [[ "${alias_key_material}" == "${key_material}" ]] || return 1
+    return 0
+  fi
+
+  while read -r key_type key_blob; do
+    [[ -n "${key_type}" && -n "${key_blob}" ]] || continue
+    entry="${alias_host} ${key_type} ${key_blob}"
+    printf '%s\n' "${entry}" >> "${target_file}"
+  done <<< "${key_material}"
+  alias_key_material="$(known_host_key_material "${alias_host}" "${target_file}")"
+  [[ "${alias_key_material}" == "${key_material}" ]]
 }
 
 cleanup_remote_deploy_env() {
@@ -157,6 +203,14 @@ cleanup_remote_deploy_env() {
   fi
 }
 
+is_tailscale_ipv4() {
+  local address="$1" octet1 octet2 octet3 octet4
+  [[ "${address}" =~ ${IPV4_RE} ]] || return 1
+  IFS=. read -r octet1 octet2 octet3 octet4 <<< "${address}"
+  [[ "${octet1}" == "100" && -n "${octet2}" ]] \
+    && (( 10#${octet2} >= 64 && 10#${octet2} <= 127 ))
+}
+
 deploy_exit_trap() {
   local exit_code=$?
   cleanup_remote_deploy_env
@@ -165,12 +219,23 @@ deploy_exit_trap() {
 }
 
 init_ssh_options() {
-  # Use accept-new: accept on first connect, reject changed keys (OpenSSH 7.6+).
+  # Work from a snapshot of the operator's pinned known_hosts database.  Never
+  # accept a first public root host key automatically: the root password and
+  # deployment secrets must not cross an unverified SSH endpoint.
   DEPLOY_KNOWN_HOSTS="$(mktemp)" || die "Failed to create temp file for deploy known hosts"
   ADMIN_KNOWN_HOSTS="$(mktemp)" || die "Failed to create temp file for admin known hosts"
+  local known_hosts_source="${SERVER_HOST_KEY_FILE:-${HOME:-}/.ssh/known_hosts}"
+  if [[ -n "${SERVER_HOST_KEY_FILE}" && ! -f "${known_hosts_source}" ]]; then
+    die "Pinned SSH host-key file not found: ${known_hosts_source}"
+  fi
+  if [[ -f "${known_hosts_source}" ]]; then
+    cp "${known_hosts_source}" "${DEPLOY_KNOWN_HOSTS}"
+    cp "${known_hosts_source}" "${ADMIN_KNOWN_HOSTS}"
+  fi
+  chmod 600 "${DEPLOY_KNOWN_HOSTS}" "${ADMIN_KNOWN_HOSTS}"
 
   SSH_OPTS=(
-    -o StrictHostKeyChecking=accept-new
+    -o StrictHostKeyChecking=yes
     -o "UserKnownHostsFile=${ADMIN_KNOWN_HOSTS}"
     -o ConnectTimeout=10
     -o LogLevel=ERROR
@@ -178,7 +243,7 @@ init_ssh_options() {
   # Root SSH uses password auth; PreferredAuthentications ensures sshpass works even when server
   # advertises publickey first (macOS OpenSSH skips password challenge otherwise).
   ROOT_SSH_OPTS=(
-    -o StrictHostKeyChecking=accept-new
+    -o StrictHostKeyChecking=yes
     -o "UserKnownHostsFile=${DEPLOY_KNOWN_HOSTS}"
     -o ConnectTimeout=10
     -o LogLevel=ERROR
@@ -200,6 +265,17 @@ init_root_password_auth() {
   ROOT_PASS=""
 }
 
+file_sha256() {
+  local path="$1"
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "${path}" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "${path}" | awk '{print $1}'
+  else
+    die "Neither shasum nor sha256sum is available to fingerprint ${path}."
+  fi
+}
+
 # ── Usage ───────────────────────────────────────────────────────────────────
 
 usage() {
@@ -215,15 +291,17 @@ If any are missing, prompts for them (mixed mode supported).
 
 Required:
   --server-ip <ip>              Server public IPv4 address
+  --server-host-key-file <path> Pinned known_hosts file for first root SSH contact (default: ~/.ssh/known_hosts)
   Root password                 Required unless --preflight-only or --ts-ip is used
-  --tailscale-auth-key <key>    Required unless --preflight-only or --ts-ip is used
+  --tailscale-auth-key-file <path>
+                                File containing the Tailscale auth key (required unless --preflight-only or --ts-ip)
   --domain <fqdn>               Domain name for Coolify; optional public app domain for Dokploy
   Cloudflare API token          Required for Coolify only; provide via CF_API_TOKEN, --cf-api-token-file, or prompt
 
 Optional:
   --cf-api-token-file <path>    File containing Cloudflare API token
   --cf-tunnel-api-token-file <path>
-                                File containing Cloudflare tunnel API token (optional; defaults to API token)
+                                Dedicated tunnel token file (required in tunnel mode)
   --admin-user <name>           Admin username (default: coolifyadmin; dokployadmin for Dokploy)
   --root-pass-file <path>       Read root password from file (recommended for automation)
   --pubkey-file <path>          SSH public key file (default: ~/.ssh/id_ed25519.pub)
@@ -234,6 +312,8 @@ Optional:
   --cf-account-id <id>          Cloudflare account ID override (32-char hex)
   --swap-size <size>            Swap size (default: 2G)
   --server-timezone <IANA>      Server timezone (for example: Australia/Melbourne, UTC)
+  --dokploy-enrollment-source-ip <100.x.x.x>
+                                Operator laptop Tailscale IPv4 allowed to claim the first Dokploy admin
   --private-tls-ca <letsencrypt|zerossl>
                                 Private dashboard/websocket CA in tunnel mode (default: letsencrypt)
   --zerossl-eab-kid-file <path> File containing ZeroSSL EAB kid (required when --private-tls-ca zerossl)
@@ -254,13 +334,17 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --server-ip)       SERVER_IP="${2:?--server-ip requires a value}"; shift 2 ;;
+      --server-host-key-file) SERVER_HOST_KEY_FILE="${2:?--server-host-key-file requires a value}"; shift 2 ;;
       --root-pass)
         die "--root-pass is disabled for security (CLI args leak to process list/history). Use --root-pass-file or interactive prompt."
         ;;
       --root-pass-file)  ROOT_PASS_FILE="${2:?--root-pass-file requires a value}"; shift 2 ;;
       --admin-user)      ADMIN_USER="${2:?--admin-user requires a value}"; shift 2 ;;
       --pubkey-file)     PUBKEY_FILE="${2:?--pubkey-file requires a value}"; shift 2 ;;
-      --tailscale-auth-key) TAILSCALE_AUTH_KEY="${2:?--tailscale-auth-key requires a value}"; shift 2 ;;
+      --tailscale-auth-key)
+        die "--tailscale-auth-key is disabled because CLI arguments leak secrets to process lists/history. Use --tailscale-auth-key-file, TAILSCALE_AUTH_KEY_FILE, or the silent prompt."
+        ;;
+      --tailscale-auth-key-file) TAILSCALE_AUTH_KEY_FILE="${2:?--tailscale-auth-key-file requires a value}"; shift 2 ;;
       --mode)            DEPLOY_MODE="${2:?--mode requires a value}"; shift 2 ;;
       --domain)          DOMAIN="${2:?--domain requires a value}"; shift 2 ;;
       --cf-api-token)
@@ -277,6 +361,7 @@ parse_args() {
       --app-domain-mode) APP_DOMAIN_MODE="${2:?--app-domain-mode requires a value}"; shift 2 ;;
       --swap-size)       SWAP_SIZE="${2:?--swap-size requires a value}"; shift 2 ;;
       --server-timezone|--timezone) SERVER_TIMEZONE="${2:?$1 requires a value}"; shift 2 ;;
+      --dokploy-enrollment-source-ip) DOKPLOY_ENROLLMENT_SOURCE_IP="${2:?--dokploy-enrollment-source-ip requires a value}"; shift 2 ;;
       --private-tls-ca)  PRIVATE_TLS_CA="${2:?--private-tls-ca requires a value}"; shift 2 ;;
       --zerossl-eab-kid-file) ZEROSSL_EAB_KID_FILE="${2:?--zerossl-eab-kid-file requires a value}"; shift 2 ;;
       --zerossl-eab-hmac-file) ZEROSSL_EAB_HMAC_FILE="${2:?--zerossl-eab-hmac-file requires a value}"; shift 2 ;;
@@ -295,6 +380,9 @@ parse_args() {
 # ── Input collection (flag → prompt fallback) ──────────────────────────────
 
 collect_inputs() {
+  if [[ -z "${TAILSCALE_AUTH_KEY}" && -n "${TAILSCALE_AUTH_KEY_FILE}" ]]; then
+    TAILSCALE_AUTH_KEY="$(read_secret_file "${TAILSCALE_AUTH_KEY_FILE}" "Tailscale auth key")"
+  fi
   # When hardening is being skipped (--ts-ip) or only preflight is requested,
   # tailscale auth key is not needed.
   # Pre-populate to bypass the interactive prompt in collect_common_inputs so that
@@ -302,6 +390,14 @@ collect_inputs() {
   if { is_true "${SKIP_HARDEN}" || is_true "${PREFLIGHT_ONLY}"; } \
     && [[ -z "${TAILSCALE_AUTH_KEY}" ]]; then
     TAILSCALE_AUTH_KEY="(not-needed)"
+  fi
+  if [[ "${PAAS}" == "dokploy" && -z "${DOKPLOY_ENROLLMENT_SOURCE_IP}" ]] \
+    && command -v tailscale >/dev/null 2>&1; then
+    local operator_ts_candidate
+    operator_ts_candidate="$(tailscale ip -4 2>/dev/null | head -1 | tr -d '[:space:]' || true)"
+    if is_tailscale_ipv4 "${operator_ts_candidate}"; then
+      DOKPLOY_ENROLLMENT_SOURCE_IP="${operator_ts_candidate}"
+    fi
   fi
   case "${PAAS}" in
     dflow)   collect_dflow_setup_inputs ;;
@@ -311,15 +407,7 @@ collect_inputs() {
   esac
   if ! is_true "${SKIP_HARDEN}" && ! is_true "${PREFLIGHT_ONLY}" \
     && [[ -z "${ROOT_PASS}" ]] && [[ -n "${ROOT_PASS_FILE}" ]]; then
-    [[ -f "${ROOT_PASS_FILE}" ]] || die "Root password file not found: ${ROOT_PASS_FILE}"
-    local file_perms
-    file_perms="$(stat -c '%a' "${ROOT_PASS_FILE}" 2>/dev/null || stat -f '%Lp' "${ROOT_PASS_FILE}" 2>/dev/null || echo "unknown")"
-    if [[ "${file_perms}" != "unknown" && "${file_perms}" != "600" && "${file_perms}" != "400" ]]; then
-      warn "Root password file ${ROOT_PASS_FILE} has permissions ${file_perms}; recommend 0600 or stricter."
-    fi
-    ROOT_PASS="$(cat "${ROOT_PASS_FILE}")"
-    ROOT_PASS="${ROOT_PASS%$'\n'}"
-    ROOT_PASS="${ROOT_PASS%$'\r'}"
+    ROOT_PASS="$(read_secret_file "${ROOT_PASS_FILE}" "Root password")"
   fi
   # ROOT_PASS not needed when --ts-ip is supplied (hardening already done)
   if ! is_true "${SKIP_HARDEN}" && ! is_true "${PREFLIGHT_ONLY}"; then
@@ -348,13 +436,15 @@ validate_inputs() {
 
   # Auth key only required when hardening will run; --ts-ip / --preflight-only skip hardening.
   if ! is_true "${SKIP_HARDEN}" && ! is_true "${PREFLIGHT_ONLY}"; then
+    [[ "${TAILSCALE_AUTH_KEY}" != *$'\n'* && "${TAILSCALE_AUTH_KEY}" != *$'\r'* ]] \
+      || die "Tailscale auth key must be a single line."
     [[ "${TAILSCALE_AUTH_KEY}" == tskey-auth-* ]] \
       || die "Tailscale auth key must start with 'tskey-auth-' (got: ${TAILSCALE_AUTH_KEY:0:12}...)"
   fi
 
   # When resuming via --ts-ip, validate the supplied IP is a valid IPv4 address.
   if is_true "${SKIP_HARDEN}"; then
-    [[ "${TS_IP}" =~ ${IPV4_RE} ]] \
+    is_tailscale_ipv4 "${TS_IP}" \
       || die "Invalid Tailscale IP supplied via --ts-ip: '${TS_IP}'"
   fi
 
@@ -372,6 +462,8 @@ validate_inputs() {
   esac
 
   if [[ "${PAAS}" == "coolify" ]]; then
+    # Normalize and validate Cloudflare secrets after basic operator inputs so
+    # an ordinary malformed IP/user/key error is not masked by token policy.
     finalize_cloudflare_tokens
     finalize_private_tls_ca_inputs
 
@@ -398,6 +490,10 @@ validate_inputs() {
   else
     finalize_dokploy_inputs
     [[ -z "${DOMAIN}" || "${DOMAIN}" =~ ${FQDN_RE} ]] || die "Invalid Dokploy public app domain: ${DOMAIN}"
+    if ! is_true "${PREFLIGHT_ONLY}"; then
+      is_tailscale_ipv4 "${DOKPLOY_ENROLLMENT_SOURCE_IP}" \
+        || die "Invalid Dokploy enrollment source IP: ${DOKPLOY_ENROLLMENT_SOURCE_IP:-unset} (expected operator Tailscale IPv4 in 100.64.0.0/10)"
+    fi
   fi
 
   # Verify companion scripts exist before prompting to proceed
@@ -458,7 +554,14 @@ retry_root_transport() {
 extract_bootstrap_tailscale_ip() {
   local capture_file="${1:-}"
   [[ -n "${capture_file}" && -f "${capture_file}" ]] || return 0
-  awk -F= '/^HARDEN_RESULT_TAILSCALE_IP=/{ip=$2} END{gsub(/[[:space:]]/,"",ip); print ip}' "${capture_file}"
+  local ip
+  ip="$(awk -F= '/^HARDEN_RESULT_TAILSCALE_IP=/{ip=$2} END{gsub(/[[:space:]]/,"",ip); print ip}' "${capture_file}")"
+  if is_tailscale_ipv4 "${ip}"; then
+    printf '%s\n' "${ip}"
+  fi
+  # A failed first transport attempt may not have emitted a sentinel yet;
+  # callers handle the empty result and decide whether to retry or fail.
+  return 0
 }
 
 scp_admin() {
@@ -466,20 +569,190 @@ scp_admin() {
 }
 
 ssh_admin() {
-  ssh "${SSH_OPTS[@]}" -i "${PRIVATE_KEY}" "${ADMIN_USER}@${TS_IP}" "$@"
+  if [[ "${PAAS:-coolify}" == "dokploy" ]]; then
+    ssh_root_tailscale "$@"
+  else
+    ssh "${SSH_OPTS[@]}" -i "${PRIVATE_KEY}" "${ADMIN_USER}@${TS_IP}" "$@"
+  fi
+}
+
+ssh_root_tailscale() {
+  is_tailscale_ipv4 "${TS_IP:-}" || die "Tailscale IP is not a valid 100.64.0.0/10 address."
+  [[ -n "${PRIVATE_KEY:-}" && -f "${PRIVATE_KEY}" ]] || die "Private key is missing for root Tailscale transport."
+  ssh "${SSH_OPTS[@]}" -i "${PRIVATE_KEY}" "root@${TS_IP}" "$@"
 }
 
 ssh_admin_sudo() {
   [[ $# -eq 1 ]] || die "ssh_admin_sudo expects exactly one remote command string."
-  ssh "${SSH_OPTS[@]}" -i "${PRIVATE_KEY}" "${ADMIN_USER}@${TS_IP}" "sudo $1"
+  if [[ "${PAAS:-coolify}" == "dokploy" ]]; then
+    # Dokploy keeps the metadata account non-login and non-privileged. Privileged
+    # orchestration uses the root key on the Tailscale-only SSH path.
+    ssh_root_tailscale "$1"
+  else
+    ssh "${SSH_OPTS[@]}" -i "${PRIVATE_KEY}" "${ADMIN_USER}@${TS_IP}" "sudo $1"
+  fi
+}
+
+dokploy_swarm_unlock_keychain_service() {
+  printf 'secure-ubuntu-paas/dokploy/swarm-unlock/%s\n' "${SERVER_IP}"
+}
+
+store_dokploy_swarm_unlock_key() {
+  local unlock_key="$1"
+  local account="${USER:-operator}"
+  local service
+  service="$(dokploy_swarm_unlock_keychain_service)"
+  [[ "${unlock_key}" =~ ^SWMKEY- ]] \
+    || die "Dokploy Swarm unlock handoff was missing or malformed; the key was not stored."
+  command -v security >/dev/null 2>&1 \
+    || die "macOS Keychain CLI is unavailable; retrieve the one-time remote handoff before removing it."
+  command -v expect >/dev/null 2>&1 \
+    || die "expect is required for non-argv Keychain handoff; retrieve the one-time remote handoff before removing it."
+  # macOS security's -w option prompts on its controlling terminal rather than
+  # consuming a normal pipe. Feed the key to an expect-owned pseudo-terminal:
+  # the value travels only on expect's stdin and in its memory, never in the
+  # argv or environment of security or expect. The remote copy is removed only
+  # after this Keychain write and verification succeed.
+  if ! DOKPLOY_KEYCHAIN_ACCOUNT="${account}" DOKPLOY_KEYCHAIN_SERVICE="${service}" \
+    printf '%s\n' "${unlock_key}" \
+    | DOKPLOY_KEYCHAIN_ACCOUNT="${account}" DOKPLOY_KEYCHAIN_SERVICE="${service}" \
+      expect -c '
+        set unlock_key [string trimright [read stdin] "\r\n"]
+        spawn security add-generic-password -a $env(DOKPLOY_KEYCHAIN_ACCOUNT) -s $env(DOKPLOY_KEYCHAIN_SERVICE) -U -w
+        expect {
+          -re {password data for new item:} { send -- "$unlock_key\r"; exp_continue }
+          -re {retype password for new item:} { send -- "$unlock_key\r"; exp_continue }
+          eof {}
+        }
+        catch wait result
+        exit [lindex $result 3]
+      ' >/dev/null 2>&1; then
+    die "Failed to store the Dokploy Swarm unlock key in the operator Keychain."
+  fi
+  security find-generic-password -a "${account}" -s "${service}" >/dev/null 2>&1 \
+    || die "Keychain verification failed for the Dokploy Swarm unlock key."
+}
+
+load_dokploy_swarm_unlock_key() {
+  local account="${USER:-operator}" service unlock_key
+  service="$(dokploy_swarm_unlock_keychain_service)"
+  unlock_key="$(security find-generic-password -a "${account}" -s "${service}" -w 2>/dev/null)" \
+    || die "The Dokploy Swarm unlock key is unavailable in the operator Keychain."
+  [[ "${unlock_key}" =~ ^SWMKEY- ]] \
+    || die "The Dokploy Swarm unlock key in the operator Keychain is malformed."
+  DOKPLOY_SWARM_UNLOCK_KEY_RUNTIME="${unlock_key}"
+  unset unlock_key
+}
+
+capture_dokploy_swarm_unlock_handoff_remote() {
+  local unlock_key
+  unlock_key="$(ssh_admin_sudo "set -Eeuo pipefail; handoff=${DOKPLOY_SWARM_UNLOCK_HANDOFF_FILE}; [[ -f \"\${handoff}\" && ! -L \"\${handoff}\" ]] || exit 4; read -r uid gid mode < <(stat -c '%u %g %a' \"\${handoff}\"); [[ \"\${uid}:\${gid}:\${mode}\" == '0:0:600' ]]; cat \"\${handoff}\"")" \
+    || die "Dokploy Swarm unlock handoff is missing or does not meet the root:root 0600 contract."
+  [[ "${unlock_key}" =~ ^SWMKEY- ]] \
+    || die "Dokploy Swarm unlock handoff was malformed; the remote copy was preserved."
+  store_dokploy_swarm_unlock_key "${unlock_key}"
+  DOKPLOY_SWARM_UNLOCK_KEY_RUNTIME="${unlock_key}"
+  unset unlock_key
+  ssh_admin_sudo "rm -f -- ${DOKPLOY_SWARM_UNLOCK_HANDOFF_FILE}" \
+    || die "Swarm unlock key reached Keychain, but the temporary VPS handoff could not be removed."
+}
+
+dokploy_swarm_state_remote() {
+  ssh_admin_sudo 'state="$(docker info --format "{{.Swarm.LocalNodeState}}" 2>/dev/null || true)"; autolock="$(docker info 2>/dev/null | awk -F: '\''/Autolock Managers/ {gsub(/[[:space:]]/, "", $2); print tolower($2); exit}'\'' || true)"; printf "%s\t%s\n" "${state}" "${autolock}"'
+}
+
+unlock_dokploy_swarm_remote() {
+  local secret_dir secret_file secret_file_q rc=0 attempt state
+  [[ "${DOKPLOY_SWARM_UNLOCK_KEY_RUNTIME:-}" =~ ^SWMKEY- ]] \
+    || die "Refusing Dokploy Swarm unlock without a validated operator-held key."
+
+  for (( attempt=1; attempt<=24; attempt++ )); do
+    state="$(dokploy_swarm_state_remote | cut -f1 | tr -d '[:space:]')"
+    [[ "${state}" == "locked" ]] && break
+    if [[ "${state}" == "active" ]]; then
+      pass "Docker Swarm was already active after reboot"
+      return 0
+    fi
+    (( attempt < 24 )) || die "Docker Swarm did not reach a state that can be unlocked after reboot."
+    sleep 5
+  done
+
+  secret_dir="$(remote_secret_dir_create)" \
+    || die "Failed to create protected remote Swarm unlock staging."
+  secret_file="${secret_dir}/swarm-unlock-key"
+  secret_file_q="$(printf '%q' "${secret_file}")"
+  if ! remote_secret_write_file "${secret_file}" "${DOKPLOY_SWARM_UNLOCK_KEY_RUNTIME}"; then
+    remote_secret_cleanup_dir "${secret_dir}"
+    die "Failed to transfer the Swarm unlock key over protected stdin."
+  fi
+  if ssh_admin_sudo "timeout 30 docker swarm unlock < ${secret_file_q}" >/dev/null; then
+    rc=0
+  else
+    rc=$?
+  fi
+  remote_secret_cleanup_dir "${secret_dir}"
+  (( rc == 0 )) || die "Docker Swarm unlock failed after reboot. The Keychain copy was preserved."
+
+  for (( attempt=1; attempt<=12; attempt++ )); do
+    state="$(dokploy_swarm_state_remote | cut -f1 | tr -d '[:space:]')"
+    [[ "${state}" == "active" ]] && break
+    (( attempt < 12 )) || die "Docker Swarm did not return to active state after unlock."
+    sleep 5
+  done
+  pass "Docker Swarm unlocked from the external operator key"
+}
+
+ensure_dokploy_swarm_unlocked_remote() {
+  [[ "${PAAS:-coolify}" == "dokploy" ]] || return 0
+  local state_line state autolock
+  state_line="$(dokploy_swarm_state_remote)"
+  IFS=$'\t' read -r state autolock <<< "${state_line}"
+  case "${state}" in
+    active|inactive|"") return 0 ;;
+    locked)
+      if ssh_admin_sudo "test -f ${DOKPLOY_SWARM_UNLOCK_HANDOFF_FILE}" >/dev/null 2>&1; then
+        capture_dokploy_swarm_unlock_handoff_remote
+      else
+        load_dokploy_swarm_unlock_key
+      fi
+      unlock_dokploy_swarm_remote
+      DOKPLOY_SWARM_UNLOCK_KEY_RUNTIME=""
+      ;;
+    *) die "Unexpected Docker Swarm state '${state}' on the Dokploy host." ;;
+  esac
+}
+
+remote_secret_dir_create() {
+  ssh_admin_sudo 'install -d -m 0700 -o root -g root /run/secure-ubuntu-paas; umask 077; mktemp -d -p /run/secure-ubuntu-paas deploy-secrets.XXXXXXXX'
+}
+
+remote_secret_write_file() {
+  local path="$1" value="$2" path_q
+  [[ "${value}" != *$'\n'* && "${value}" != *$'\r'* ]] \
+    || die "Refusing multiline remote secret material."
+  path_q="$(printf '%q' "${path}")"
+  printf '%s\n' "${value}" | ssh_admin_sudo "install -m 0600 -o root -g root /dev/stdin ${path_q}"
+}
+
+remote_secret_cleanup_dir() {
+  local dir="$1" dir_q
+  dir_q="$(printf '%q' "${dir}")"
+  ssh_admin_sudo "find ${dir_q} -mindepth 1 -maxdepth 1 -type f -delete 2>/dev/null || true; rmdir ${dir_q} 2>/dev/null || true" \
+    >/dev/null 2>&1 || true
 }
 
 package_deployment_tree() {
   local dest="$1"
+  local -a tar_metadata_args=()
   for d in base lib overlays; do
     [[ -d "${SCRIPT_DIR}/${d}" ]] || die "Required directory not found: ${SCRIPT_DIR}/${d}"
   done
-  if ! ( cd "${SCRIPT_DIR}" && COPYFILE_DISABLE=1 tar --exclude '._*' --exclude '.DS_Store' -czf "${dest}" base lib overlays ); then
+  # bsdtar on macOS can archive com.apple.* metadata as SCHILY pax headers
+  # even with COPYFILE_DISABLE=1, producing noisy extraction warnings on Linux.
+  if tar --no-xattrs -cf /dev/null --files-from /dev/null >/dev/null 2>&1; then
+    tar_metadata_args+=(--no-xattrs)
+  fi
+  if ! ( cd "${SCRIPT_DIR}" && COPYFILE_DISABLE=1 tar "${tar_metadata_args[@]}" --exclude '._*' --exclude '.DS_Store' -czf "${dest}" base lib overlays ); then
     die "Failed to package deployment tree from ${SCRIPT_DIR}"
   fi
 }
@@ -487,9 +760,34 @@ package_deployment_tree() {
 install_deployment_tree_remote_script() {
   cat <<'EOF'
 set -Eeuo pipefail
-archive="${DEPLOY_TREE_ARCHIVE:-/tmp/deploy-tree.tar.gz}"
-tar -C /root --no-same-owner -xzf "${archive}"
-rm -f "${archive}"
+archive="${DEPLOY_TREE_ARCHIVE:?DEPLOY_TREE_ARCHIVE is required}"
+expected_sha256="${DEPLOY_TREE_SHA256:?DEPLOY_TREE_SHA256 is required}"
+[[ "${archive}" == /run/secure-ubuntu-paas/deploy-trees/deploy-tree.*/tree.tar.gz ]] \
+  || { echo "Deployment archive must use the protected staging directory." >&2; exit 1; }
+archive_dir="$(dirname -- "${archive}")"
+[[ -f "${archive}" && ! -L "${archive}" ]] \
+  || { echo "Deployment archive is missing or is a symlink." >&2; exit 1; }
+read -r archive_uid archive_mode < <(stat -c '%u %a' "${archive_dir}" 2>/dev/null)
+[[ "${archive_uid}" == "0" && "${archive_mode}" == "700" ]] \
+  || { echo "Deployment archive directory is not root-owned mode 0700." >&2; exit 1; }
+read -r archive_uid archive_mode < <(stat -c '%u %a' "${archive}" 2>/dev/null)
+[[ "${archive_uid}" == "0" && "${archive_mode}" == "600" ]] \
+  || { echo "Deployment archive is not root-owned mode 0600." >&2; exit 1; }
+actual_sha256="$(sha256sum "${archive}" | awk '{print $1}')"
+[[ "${actual_sha256}" == "${expected_sha256}" ]] \
+  || { echo "Deployment archive integrity check failed." >&2; exit 1; }
+if tar -tzf "${archive}" | awk '
+  $0 ~ /^\// || $0 ~ /(^|\/)\.\.($|\/)/ || $0 !~ /^(base|lib|overlays)(\/|$)/ { bad=1 }
+  END { exit(bad ? 1 : 0) }
+'; then
+  :
+else
+  echo "Deployment archive contains an unsafe path." >&2
+  exit 1
+fi
+tar -C /root --no-same-owner --no-same-permissions -xzf "${archive}"
+rm -f -- "${archive}"
+rmdir -- "${archive_dir}" 2>/dev/null || true
 chown -R root:root /root/base /root/lib /root/overlays
 chmod 755 /root/base/bootstrap.sh /root/base/validate.sh
 chmod 755 /root/overlays/coolify/configure_coolify_binding.sh 2>/dev/null || true
@@ -497,24 +795,50 @@ chmod 755 /root/overlays/dflow/data/dokku-predeploy-resource-check.sh 2>/dev/nul
 EOF
 }
 
+remote_tree_dir_create() {
+  ssh_admin_sudo 'install -d -m 0700 -o root -g root /run/secure-ubuntu-paas/deploy-trees; umask 077; mktemp -d -p /run/secure-ubuntu-paas/deploy-trees deploy-tree.XXXXXXXX'
+}
+
+remote_tree_cleanup() {
+  local tree_dir="$1" tree_dir_q
+  [[ "${tree_dir}" == /run/secure-ubuntu-paas/deploy-trees/deploy-tree.* ]] || return 0
+  tree_dir_q="$(printf '%q' "${tree_dir}")"
+  ssh_admin_sudo "find ${tree_dir_q} -mindepth 1 -maxdepth 1 -type f -delete 2>/dev/null || true; rmdir ${tree_dir_q} 2>/dev/null || true" \
+    >/dev/null 2>&1 || true
+}
+
 # Upload base/, lib/, and overlays/ as one tarball. Phase 2 always re-syncs the
 # full tree so --ts-ip resumes get new validators without 60+ sequential SCPs.
 sync_companion_scripts() {
-  local tree_tar
+  local tree_tar tree_sha256 tree_dir tree_archive tree_archive_q tree_sha256_q extract_command
+  local tree_dir_output tree_dir_attempt tree_dir_rc
   log "Syncing deployment tree to server /root/ (tarball)..."
   tree_tar="$(mktemp -t deploy-tree.XXXXXXXX.tar.gz)" || die "Failed to create temp tarball"
   if ! package_deployment_tree "${tree_tar}"; then
     rm -f "${tree_tar}"
     die "Failed to package deployment tree"
   fi
-  scp_admin "${tree_tar}" "${ADMIN_USER}@${TS_IP}:/tmp/deploy-tree.tar.gz" \
-    || { rm -f "${tree_tar}"; die "Failed to upload deployment tree"; }
+  tree_sha256="$(file_sha256 "${tree_tar}")" \
+    || { rm -f "${tree_tar}"; die "Failed to fingerprint deployment tree"; }
+  tree_dir="$(remote_tree_dir_create | tr -d '[:space:]')" \
+    || { rm -f "${tree_tar}"; die "Failed to create protected deployment staging directory"; }
+  [[ "${tree_dir}" == /run/secure-ubuntu-paas/deploy-trees/deploy-tree.* ]] \
+    || { rm -f "${tree_tar}"; remote_tree_cleanup "${tree_dir}"; die "Remote deployment staging directory was unexpected"; }
+  tree_archive="${tree_dir}/tree.tar.gz"
+  tree_archive_q="$(printf '%q' "${tree_archive}")"
+  if ! cat "${tree_tar}" | ssh_admin_sudo "install -m 0600 -o root -g root /dev/stdin ${tree_archive_q}"; then
+    rm -f "${tree_tar}"
+    remote_tree_cleanup "${tree_dir}"
+    die "Failed to upload deployment tree to protected staging directory"
+  fi
   rm -f "${tree_tar}"
   local extract_script
   extract_script="$(mktemp)" || die "Failed to create temp extract script"
   install_deployment_tree_remote_script > "${extract_script}"
-  ssh_admin_sudo 'bash -s' < "${extract_script}" \
-    || { rm -f "${extract_script}"; die "Failed to extract deployment tree on server"; }
+  tree_sha256_q="$(printf '%q' "${tree_sha256}")"
+  extract_command="DEPLOY_TREE_ARCHIVE=${tree_archive_q} DEPLOY_TREE_SHA256=${tree_sha256_q} bash -s"
+  ssh_admin_sudo "${extract_command}" < "${extract_script}" \
+    || { rm -f "${extract_script}"; remote_tree_cleanup "${tree_dir}"; die "Failed to extract deployment tree on server"; }
   rm -f "${extract_script}"
   pass "Deployment tree synced to server"
 }
@@ -522,12 +846,23 @@ sync_companion_scripts() {
 run_remote_script_via_admin() {
   local label="$1"
   shift
-  local script_tmp
+  local script_tmp attempt rc
   script_tmp="$(mktemp)" || die "Failed to create temp script for ${label}"
   "$@" > "${script_tmp}"
-  ssh_admin_sudo 'bash -s' < "${script_tmp}" \
-    || { rm -f "${script_tmp}"; die "${label} failed on server."; }
-  rm -f "${script_tmp}"
+  for attempt in 1 2 3 4 5 6; do
+    rc=0
+    ssh_admin_sudo 'bash -s' < "${script_tmp}" || rc=$?
+    if (( rc == 0 )); then
+      rm -f "${script_tmp}"
+      return 0
+    fi
+    if (( rc != 255 || attempt == 6 )); then
+      rm -f "${script_tmp}"
+      die "${label} failed on server."
+    fi
+    warn "${label}: SSH transport unavailable after network reconciliation (attempt ${attempt}/6); retrying in 5s."
+    sleep 5
+  done
 }
 
 reconcile_resume_hardening_remote() {
@@ -535,10 +870,10 @@ reconcile_resume_hardening_remote() {
   run_remote_script_via_admin "Base hardening reconcile" hardening_resume_reconcile_script
   case "${PAAS}" in
     dokploy)
+      run_remote_script_via_admin "Dokploy root Tailscale SSH policy" dokploy_root_tailscale_reconcile_script
       run_remote_script_via_admin "Stale Coolify UFW cleanup" dokploy_remove_stale_coolify_dashboard_ufw_script \
         || true
       run_remote_script_via_admin "Dokploy dashboard UFW policy" dokploy_dashboard_ufw_policy_script
-      run_remote_script_via_admin "Dokploy runtime finalize" dokploy_finalize_runtime_script
       ;;
   esac
   pass "Hardening state reconciled for Gate C"
@@ -547,17 +882,50 @@ reconcile_resume_hardening_remote() {
 verify_docker_user_gate_remote() {
   local gate_label="$1"
   local gate_d_inactive_msg="Gate D failed: docker-user-hardening.service is not active."
+  local attempt rc service_active="false" rules_present="false"
 
-  if ssh_admin_sudo 'systemctl is-active --quiet docker-user-hardening.service'; then
+  for attempt in 1 2 3 4 5 6; do
+    rc=0
+    ssh_admin_sudo 'systemctl is-active --quiet docker-user-hardening.service' || rc=$?
+    if (( rc == 0 )); then
+      service_active="true"
+      break
+    fi
+    if (( attempt == 6 )); then
+      break
+    fi
+    if (( rc == 255 )); then
+      warn "${gate_label}: SSH transport unavailable while checking docker-user-hardening.service (attempt ${attempt}/6); retrying in 5s."
+    else
+      warn "${gate_label}: docker-user-hardening.service has not converged yet (attempt ${attempt}/6); retrying in 5s."
+    fi
+    sleep 5
+  done
+  if [[ "${service_active}" == "true" ]]; then
     pass "${gate_label}: docker-user-hardening.service is active"
   else
     fail "${gate_label}: docker-user-hardening.service is not active"
     die "${gate_d_inactive_msg}"
   fi
 
-  local iptables_out
-  iptables_out="$(ssh_admin_sudo 'iptables -S DOCKER-USER' 2>/dev/null)" || true
-  if printf '%s' "${iptables_out}" | grep -q "coolify-hardening"; then
+  for attempt in 1 2 3 4 5 6; do
+    rc=0
+    ssh_admin_sudo 'source /root/overlays/docker-host/modules/readiness.sh; TUNNEL_MODE="$(awk -F= '\''$1 == "TUNNEL_MODE" { print substr($0, index($0, "=") + 1); exit }'\'' /etc/default/docker-user-hardening 2>/dev/null || true)"; DOCKER_PRESENT="true"; docker_user_rules_present' || rc=$?
+    if (( rc == 0 )); then
+      rules_present="true"
+      break
+    fi
+    if (( attempt == 6 )); then
+      break
+    fi
+    if (( rc == 255 )); then
+      warn "${gate_label}: SSH transport unavailable while checking DOCKER-USER rules (attempt ${attempt}/6); retrying in 5s."
+    else
+      warn "${gate_label}: DOCKER-USER policy has not converged yet (attempt ${attempt}/6); retrying in 5s."
+    fi
+    sleep 5
+  done
+  if [[ "${rules_present}" == "true" ]]; then
     pass "${gate_label}: DOCKER-USER hardening rules active"
   else
     fail "${gate_label}: DOCKER-USER hardening rules not found"
@@ -566,12 +934,23 @@ verify_docker_user_gate_remote() {
 }
 
 reconcile_docker_daemon_remote() {
-  log "Reconciling Docker daemon settings after Coolify install..."
-  # Hardening owns: log-driver, log-opts, live-restore, default-ipc-mode, storage-driver.
-  # Using json-file driver to match Coolify's expectation for compatibility.
-  coolify_reconcile_docker_daemon_script | ssh_admin 'sudo bash -s' \
-    || die "Failed to reconcile Docker daemon hardening settings."
-  pass "Docker daemon hardening reconciled (json-file log rotation + live-restore)"
+  local reconcile_fn="coolify_reconcile_docker_daemon_script"
+  if [[ "${PAAS:-coolify}" == "dokploy" ]]; then
+    reconcile_fn="dokploy_reconcile_docker_daemon_script"
+  fi
+  log "Reconciling Docker daemon settings after ${PAAS:-coolify} install..."
+  if [[ "${PAAS:-coolify}" == "dokploy" ]]; then
+    "${reconcile_fn}" | ssh_root_tailscale 'bash -s' \
+      || die "Failed to reconcile Docker daemon hardening settings."
+  else
+    "${reconcile_fn}" | ssh_admin 'sudo bash -s' \
+      || die "Failed to reconcile Docker daemon hardening settings."
+  fi
+  if [[ "${PAAS:-coolify}" == "dokploy" ]]; then
+    pass "Docker daemon hardening reconciled (Swarm-safe json-file log rotation)"
+  else
+    pass "Docker daemon hardening reconciled (json-file log rotation + live-restore)"
+  fi
 }
 
 # ── Pre-flight ──────────────────────────────────────────────────────────────
@@ -581,6 +960,9 @@ preflight() {
 
   # Check local tools
   local required_cmds=(ssh scp curl jq sshpass ssh-keygen openssl tar)
+  if [[ "${PAAS}" == "dokploy" ]]; then
+    required_cmds+=(expect security)
+  fi
   for cmd in "${required_cmds[@]}"; do
     command -v "${cmd}" >/dev/null 2>&1 || die "Required command not found: ${cmd}. Install it first."
   done
@@ -611,6 +993,9 @@ preflight() {
     log "Skipping root SSH check (--ts-ip/--preflight-only mode)."
   else
     log "Testing SSH to root@${SERVER_IP}..."
+    if ! known_host_entry_present "${SERVER_IP}" "${DEPLOY_KNOWN_HOSTS}"; then
+      die "No pinned SSH host key for ${SERVER_IP}. Add the provider-verified key to ${SERVER_HOST_KEY_FILE:-${HOME}/.ssh/known_hosts} (or pass --server-host-key-file) before sending the root password."
+    fi
     if ssh_root 'echo ok' >/dev/null 2>&1; then
       sync_operator_known_host_entries "${DEPLOY_KNOWN_HOSTS}" "${SERVER_IP}"
       pass "SSH root@${SERVER_IP} reachable"
@@ -635,22 +1020,55 @@ EOF
   printf -v bootstrap_cmd 'bash -lc %q' "${bootstrap_cmd_script}"
   local bootstrap_transport="root"
 
-  local tree_tar
+  local tree_tar tree_sha256 tree_dir tree_archive tree_archive_q tree_sha256_q extract_command
   tree_tar="$(mktemp -t deploy-tree.XXXXXXXX.tar.gz)" || die "Failed to create temp tarball"
   if ! package_deployment_tree "${tree_tar}"; then
     rm -f "${tree_tar}"
     die "Failed to package deployment tree"
   fi
 
+  tree_sha256="$(file_sha256 "${tree_tar}")" \
+    || { rm -f "${tree_tar}"; die "Failed to fingerprint deployment tree"; }
+  tree_dir_output="$(mktemp)" \
+    || { rm -f "${tree_tar}"; die "Failed to allocate local staging-path capture file"; }
+  tree_dir_rc=0
+  for tree_dir_attempt in 1 2 3; do
+    if ssh_root 'install -d -m 0700 -o root -g root /run/secure-ubuntu-paas/deploy-trees; umask 077; mktemp -d -p /run/secure-ubuntu-paas/deploy-trees deploy-tree.XXXXXXXX' \
+      > "${tree_dir_output}"; then
+      tree_dir_rc=0
+      break
+    else
+      tree_dir_rc=$?
+      : > "${tree_dir_output}"
+    fi
+    if (( tree_dir_rc == 255 && tree_dir_attempt < 3 )); then
+      warn "Creating protected deployment staging directory failed with SSH exit 255 on attempt ${tree_dir_attempt}/3; retrying in 3s."
+      sleep 3
+      continue
+    fi
+    break
+  done
+  if (( tree_dir_rc != 0 )); then
+    rm -f "${tree_tar}" "${tree_dir_output}"
+    die "Failed to create protected deployment staging directory on ${SERVER_IP} (SSH exit ${tree_dir_rc})"
+  fi
+  tree_dir="$(tr -d '[:space:]' < "${tree_dir_output}")"
+  rm -f "${tree_dir_output}"
+  [[ "${tree_dir}" == /run/secure-ubuntu-paas/deploy-trees/deploy-tree.* ]] \
+    || { rm -f "${tree_tar}"; die "Remote deployment staging directory was unexpected"; }
+  tree_archive="${tree_dir}/tree.tar.gz"
   if ! retry_root_transport "Uploading deployment tree to ${SERVER_IP}" \
-       scp_root "${tree_tar}" "root@${SERVER_IP}:/root/deploy-tree.tar.gz"; then
+       scp_root "${tree_tar}" "root@${SERVER_IP}:${tree_archive}"; then
     rm -f "${tree_tar}"
     die "Failed to upload deployment tree to ${SERVER_IP}"
   fi
   rm -f "${tree_tar}"
 
+  tree_archive_q="$(printf '%q' "${tree_archive}")"
+  tree_sha256_q="$(printf '%q' "${tree_sha256}")"
+  extract_command="DEPLOY_TREE_ARCHIVE=${tree_archive_q} DEPLOY_TREE_SHA256=${tree_sha256_q} bash -s"
   retry_root_transport "Extracting deployment tree on ${SERVER_IP}" \
-    ssh_root "DEPLOY_TREE_ARCHIVE=/root/deploy-tree.tar.gz bash -s" \
+    ssh_root "${extract_command}" \
     < <(install_deployment_tree_remote_script) \
     || die "Failed to extract deployment tree on ${SERVER_IP}"
   pass "Scripts uploaded"
@@ -667,6 +1085,10 @@ EOF
   # Write env file on server (avoids quoting issues with SSH pubkey)
   local tunnel_flag="false"
   [[ "${DEPLOY_MODE}" == "tunnel" ]] && tunnel_flag="true"
+  [[ "${TAILSCALE_AUTH_KEY}" != *$'\n'* && "${TAILSCALE_AUTH_KEY}" != *$'\r'* ]] \
+    || die "Tailscale auth key must be a single line before it is serialized."
+  [[ "${ADMIN_PUBKEY}" != *$'\n'* && "${ADMIN_PUBKEY}" != *$'\r'* ]] \
+    || die "Administrator public key must be a single line before it is serialized."
   local deploy_env_tmp
   deploy_env_tmp="$(mktemp)" || die "Failed to create temp file for deploy env"
   {
@@ -698,8 +1120,9 @@ EOF
 
   # Run hardening, streaming output to terminal while capturing it for TS_IP extraction.
   # base/bootstrap.sh emits HARDEN_RESULT_TAILSCALE_IP as soon as Tailscale is
-  # verified, and again at the end. Retries pivot to root@TS_IP first, then to
-  # admin@TS_IP via sudo once root password auth is no longer a valid recovery path.
+  # verified, and again at the end. Retries pivot to the PaaS-specific
+  # Tailscale transport once public root password auth is no longer valid:
+  # root@TS_IP for Dokploy, otherwise admin@TS_IP via sudo.
   log "Running base/bootstrap.sh (this may take a few minutes)..."
   local harden_tmp bootstrap_attempt bootstrap_rc
   harden_tmp="$(mktemp)" || die "Failed to create temp file for hardening output"
@@ -723,10 +1146,14 @@ EOF
 
   promote_bootstrap_transport_to_admin() {
     [[ "${bootstrap_transport}" == "admin" ]] && return 0
-    [[ "${TS_IP:-}" =~ ${IPV4_RE} ]] || return 1
+    is_tailscale_ipv4 "${TS_IP:-}" || return 1
     if ssh_admin 'echo ok' >/dev/null 2>&1; then
       bootstrap_transport="admin"
-      log "Phase 1 fallback: switching bootstrap retries to ${ADMIN_USER}@${TS_IP} via sudo"
+      if [[ "${PAAS:-coolify}" == "dokploy" ]]; then
+        log "Phase 1 fallback: using root@${TS_IP} over Tailscale for privileged retries (Dokploy admin has no sudo)"
+      else
+        log "Phase 1 fallback: switching bootstrap retries to ${ADMIN_USER}@${TS_IP} via sudo"
+      fi
       return 0
     fi
     return 1
@@ -745,16 +1172,22 @@ EOF
       bootstrap_rc=$?
       local captured_ts_ip=""
       captured_ts_ip="$(extract_bootstrap_tailscale_ip "${harden_tmp}")"
-      if [[ "${captured_ts_ip}" =~ ${IPV4_RE} ]]; then
+      if is_tailscale_ipv4 "${captured_ts_ip}"; then
         TS_IP="${captured_ts_ip}"
         if [[ "${ROOT_SSH_HOST}" != "${TS_IP}" ]]; then
+          pin_known_host_alias "${SERVER_IP}" "${TS_IP}" "${DEPLOY_KNOWN_HOSTS}" "${ADMIN_KNOWN_HOSTS}" \
+            || die "Could not pin the verified public SSH host key to Tailscale address ${TS_IP}. Refusing the phase 1 recovery transition."
           ROOT_SSH_HOST="${TS_IP}"
           log "Phase 1 fallback: switching root retries to Tailscale IP ${TS_IP}"
         fi
       fi
       if (( bootstrap_rc == 255 && bootstrap_attempt < 3 )); then
         if promote_bootstrap_transport_to_admin; then
-          warn "base/bootstrap.sh SSH transport failed on attempt ${bootstrap_attempt}/3; retrying via admin sudo in 3s."
+          if [[ "${PAAS:-coolify}" == "dokploy" ]]; then
+            warn "base/bootstrap.sh SSH transport failed on attempt ${bootstrap_attempt}/3; retrying via root@${TS_IP} in 3s."
+          else
+            warn "base/bootstrap.sh SSH transport failed on attempt ${bootstrap_attempt}/3; retrying via admin sudo in 3s."
+          fi
         else
           warn "base/bootstrap.sh SSH transport/auth failed on attempt ${bootstrap_attempt}/3; retrying in 3s."
         fi
@@ -778,7 +1211,9 @@ EOF
   # Extract Tailscale IP from captured bootstrap output (sentinel line).
   TS_IP="$(extract_bootstrap_tailscale_ip "${harden_tmp}")"
   rm -f "${harden_tmp}"
-  [[ "${TS_IP}" =~ ${IPV4_RE} ]] || die "Failed to get a valid Tailscale IP from bootstrap output."
+  is_tailscale_ipv4 "${TS_IP}" || die "Failed to get a valid Tailscale IP from bootstrap output."
+  pin_known_host_alias "${SERVER_IP}" "${TS_IP}" "${DEPLOY_KNOWN_HOSTS}" "${ADMIN_KNOWN_HOSTS}" \
+    || die "Could not pin the verified public SSH host key to Tailscale address ${TS_IP}. Refusing the admin transition."
   pass "Server Tailscale IP: ${TS_IP}"
 
   # deploy.env cleanup is attempted by the remote bootstrap wrapper and retained
@@ -830,7 +1265,15 @@ gate_c_failures_are_transient() {
 }
 
 fetch_phase1_state_line_remote() {
-  ssh "${SSH_OPTS[@]}" -i "${PRIVATE_KEY}" "${ADMIN_USER}@${TS_IP}" "sudo bash -s" 2>/dev/null <<'REMOTE' || true
+  local remote_target remote_command
+  if [[ "${PAAS:-coolify}" == "dokploy" ]]; then
+    remote_target="root@${TS_IP}"
+    remote_command="bash -s"
+  else
+    remote_target="${ADMIN_USER}@${TS_IP}"
+    remote_command="sudo bash -s"
+  fi
+  ssh "${SSH_OPTS[@]}" -i "${PRIVATE_KEY}" "${remote_target}" "${remote_command}" 2>/dev/null <<'REMOTE' || true
 set -Eeuo pipefail
 state_file="/var/lib/server-hardening/state"
 state_lock_file="${state_file}.lock"
@@ -851,6 +1294,126 @@ printf "%s\t%s\n" "${domain:-}" "${tunnel_mode:-}"
 REMOTE
 }
 
+recover_interrupted_phase1_dokploy_remote() {
+  if [[ "${ALLOW_CONTROLLED_REBOOT:-false}" != true ]]; then
+    ssh_admin_sudo '[[ -f /usr/local/sbin/paas-recovery-policy && ! -L /usr/local/sbin/paas-recovery-policy && "$(stat -c "%a:%U:%G" /usr/local/sbin/paas-recovery-policy)" == "700:root:root" ]] && python3 /usr/local/sbin/paas-recovery-policy' >/dev/null 2>&1 \
+      || die "Interrupted recovery needs explicit reboot approval or a protected approved unattended recovery policy."
+  fi
+  [[ "${PAAS:-coolify}" == "dokploy" ]] || return 1
+
+  local proof_script recovery_env_tmp recovery_cmd recovery_cmd_q
+	proof_script="$(cat <<EOF
+	set -Eeuo pipefail
+	trap 'rc=\$?; printf "Interrupted phase 1 proof failed at predicate line %s (rc=%s)\\n" "\$LINENO" "\$rc" >&2; exit "\$rc"' ERR
+	expected_ts_ip=${TS_IP@Q}
+expected_source_ip=${DOKPLOY_ENROLLMENT_SOURCE_IP@Q}
+expected_domain=${DOMAIN@Q}
+expected_admin=${ADMIN_USER@Q}
+expected_key=${ADMIN_PUBKEY@Q}
+
+# This path is only for a bootstrap that crossed the public-to-Tailscale SSH
+# boundary but failed before write_state(). Refuse a generic state-less host.
+[[ ! -e /var/lib/server-hardening/state ]]
+[[ "\$(tailscale ip -4 2>/dev/null | head -1 | tr -d '[:space:]')" == "\${expected_ts_ip}" ]]
+[[ -z "\${expected_domain}" || "\$(hostname -f 2>/dev/null)" == "\${expected_domain}" ]]
+[[ "\$(passwd -S root 2>/dev/null | awk '{print \$2}')" == "L" ]]
+[[ -f /root/.ssh/authorized_keys && ! -L /root/.ssh/authorized_keys ]]
+[[ "\$(wc -l < /root/.ssh/authorized_keys | tr -d '[:space:]')" == "1" ]]
+[[ "\$(cat /root/.ssh/authorized_keys)" == "\${expected_key}" ]]
+
+admin_entry="\$(getent passwd "\${expected_admin}")"
+[[ -n "\${admin_entry}" && "\${admin_entry##*:}" == "/usr/sbin/nologin" ]]
+[[ "\$(passwd -S "\${expected_admin}" 2>/dev/null | awk '{print \$2}')" == "L" ]]
+admin_home="\$(awk -F: -v user="\${expected_admin}" '\$1 == user {print \$6; exit}' /etc/passwd)"
+[[ -n "\${admin_home}" ]]
+[[ ! -s "\${admin_home}/.ssh/authorized_keys" ]]
+! id -nG "\${expected_admin}" 2>/dev/null | tr ' ' '\n' | grep -Eq '^(sudo|docker)$'
+
+	global_policy="\$(sshd -T 2>/dev/null)"
+	grep -qx 'permitrootlogin no' <<< "\${global_policy}"
+	grep -qx 'passwordauthentication no' <<< "\${global_policy}"
+	grep -qx 'allowusers root' <<< "\${global_policy}"
+match_policy="\$(sshd -T -C user=root,addr="\${expected_source_ip}",host="\${expected_domain:-localhost}" 2>/dev/null)"
+grep -Eq '^permitrootlogin (without-password|prohibit-password)$' <<< "\${match_policy}"
+grep -qx 'passwordauthentication no' <<< "\${match_policy}"
+grep -qx 'authenticationmethods publickey' <<< "\${match_policy}"
+grep -qx 'allowusers root' <<< "\${match_policy}"
+
+listener_endpoints="\$(ss -H -lnt 'sport = :22' | awk '{print \$4}')"
+grep -qx "\${expected_ts_ip}:22" <<< "\${listener_endpoints}"
+! grep -Eq '^(0\.0\.0\.0|\[::\]|\*):22$' <<< "\${listener_endpoints}"
+EOF
+)"
+
+  if ! printf '%s\n' "${proof_script}" | ssh_admin_sudo 'bash -s'; then
+    return 1
+  fi
+
+  warn "Interrupted phase 1 was strictly proven on the pinned Dokploy host; beginning Tailscale-only recovery."
+  sync_companion_scripts
+
+  # The current kernel audit policy is immutable. Install only the corrected
+  # boot ordering, then reboot so rate_limit=10000 is applied before -e 2.
+  if ! ssh_admin_sudo 'bash -s' <<'REMOTE'; then
+set -Eeuo pipefail
+source /root/base/modules/auditd.sh
+DRY_RUN="false"
+is_true() { case "${1,,}" in 1|true|yes|y|on) return 0 ;; *) return 1 ;; esac; }
+run() { "$@"; }
+log() { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+install_auditd_rate_limit_persistence
+REMOTE
+    die "Interrupted phase 1 recovery failed to install the ordered auditd boot hook."
+  fi
+
+  warn "Interrupted phase 1 recovery: rebooting to apply the upgraded kernel and audit rate-before-lock ordering."
+  ssh_admin_sudo 'nohup bash -c "sleep 1; systemctl reboot" >/dev/null 2>&1 &' || true
+  local reboot_drop_attempt
+  for (( reboot_drop_attempt=1; reboot_drop_attempt<=12; reboot_drop_attempt++ )); do
+    if ! ssh_admin 'echo ok' >/dev/null 2>&1; then
+      break
+    fi
+    sleep 5
+  done
+  wait_for_admin_ssh_or_die "Interrupted phase 1 reboot wait" 36 10 \
+    || die "Interrupted phase 1 recovery failed: server did not return over pinned Tailscale SSH."
+  ssh_admin_sudo 'auditctl -s 2>/dev/null | awk '\''$1 == "enabled" {enabled=$2} $1 == "rate_limit" {rate=$2} END {exit(enabled == 2 && rate == 10000 ? 0 : 1)}'\'' ' \
+    || die "Interrupted phase 1 recovery failed: auditd did not return immutable with rate_limit=10000 after reboot."
+
+  recovery_env_tmp="$(mktemp)" || die "Failed to create interrupted phase 1 recovery env file."
+  {
+    printf 'ADMIN_USER="%s"\n' "${ADMIN_USER//\"/\\\"}"
+    printf 'ADMIN_PUBKEY="%s"\n' "${ADMIN_PUBKEY//\"/\\\"}"
+    printf 'DOMAIN="%s"\n' "${DOMAIN//\"/\\\"}"
+    printf 'TAILSCALE_CIDR="100.64.0.0/10"\n'
+    printf 'SSH_PORT="22"\n'
+    printf 'TUNNEL_MODE="false"\n'
+    printf 'SWAP_SIZE="%s"\n' "${SWAP_SIZE//\"/\\\"}"
+    printf 'TIMEZONE="%s"\n' "${SERVER_TIMEZONE//\"/\\\"}"
+    printf 'INSTALL_TAILSCALE="false"\n'
+    printf 'TAILSCALE_DIRECT_WAN="%s"\n' "${TAILSCALE_DIRECT_WAN//\"/\\\"}"
+    printf 'BIND_DASHBOARD_TO_TAILSCALE="false"\n'
+    printf 'PAAS="dokploy"\n'
+  } > "${recovery_env_tmp}"
+  chmod 600 "${recovery_env_tmp}"
+  if ! ssh_admin_sudo 'install -d -m 0700 -o root -g root /run/secure-ubuntu-paas; install -m 0600 -o root -g root /dev/stdin /run/secure-ubuntu-paas/interrupted-phase1.env' < "${recovery_env_tmp}"; then
+    rm -f "${recovery_env_tmp}"
+    die "Interrupted phase 1 recovery failed to upload its protected non-secret environment."
+  fi
+  rm -f "${recovery_env_tmp}"
+
+  recovery_cmd='set -Eeuo pipefail; cleanup() { rm -f /run/secure-ubuntu-paas/interrupted-phase1.env; }; trap cleanup EXIT; /root/base/bootstrap.sh --env-file /run/secure-ubuntu-paas/interrupted-phase1.env --force'
+  printf -v recovery_cmd_q '%q' "${recovery_cmd}"
+  run_with_heartbeat "interrupted phase 1 bootstrap over root@${TS_IP}" \
+    ssh_admin_sudo "bash -lc ${recovery_cmd_q}" \
+    || die "Interrupted phase 1 recovery bootstrap failed. Check /var/log/server-hardening.log."
+
+  [[ -n "$(fetch_phase1_state_line_remote)" ]] \
+    || die "Interrupted phase 1 recovery completed without a readable state file."
+  pass "Interrupted phase 1 recovered over pinned root@${TS_IP} without Tailscale re-enrollment"
+}
+
 assert_resume_phase1_contract_remote() {
   is_true "${SKIP_HARDEN}" || return 0
 
@@ -860,7 +1423,12 @@ assert_resume_phase1_contract_remote() {
 
   state_line="$(fetch_phase1_state_line_remote)"
 
-  [[ -n "${state_line}" ]] || die "Resume contract failed: phase 1 state is unavailable on the server. Run a fresh deploy instead of --ts-ip."
+  if [[ -z "${state_line}" ]]; then
+    recover_interrupted_phase1_dokploy_remote \
+      || die "Resume contract failed: phase 1 state is unavailable and strict interrupted-Dokploy proof failed. Run a fresh deploy instead of --ts-ip."
+    state_line="$(fetch_phase1_state_line_remote)"
+  fi
+  [[ -n "${state_line}" ]] || die "Resume contract failed: interrupted phase 1 recovery did not produce readable state."
 
   IFS=$'\t' read -r state_domain state_tunnel_mode <<< "${state_line}"
   # Domain may be empty for Dokploy (optional public app domain).
@@ -943,27 +1511,114 @@ verify_post_reboot_services_remote() {
   fi
 }
 
-phase2_gates() {
-  step "2/5" "Gate checks (SSH transition to admin@tailscale)"
+docker_audit_runtime_state_remote() {
+  local script_tmp state
+  script_tmp="$(mktemp)" || die "Failed to create Docker audit reconciliation script."
+  docker_audit_runtime_reconcile_script > "${script_tmp}"
+  if state="$(ssh_admin_sudo 'bash -s' < "${script_tmp}")"; then
+    rm -f "${script_tmp}"
+  else
+    rm -f "${script_tmp}"
+    die "Docker audit runtime reconciliation failed on the server."
+  fi
+  state="$(tr -d '[:space:]' <<< "${state}")"
+  case "${state}" in
+    ready|reboot-required|not-applicable) printf '%s\n' "${state}" ;;
+    *) die "Docker audit runtime reconciliation returned an unexpected state." ;;
+  esac
+}
 
-  # Gate A: SSH as admin via Tailscale IP using key auth
-  log "Gate A: Testing SSH admin@${TS_IP} via key auth..."
+reboot_for_docker_audit_remote() {
+  local gate_label="$1" state_line state autolock reboot_drop_attempt drop_seen="false"
+  if [[ "${ALLOW_CONTROLLED_REBOOT:-false}" != true ]]; then
+    [[ "${PAAS:-coolify}" == dokploy ]] && ssh_admin_sudo '[[ -f /usr/local/sbin/paas-recovery-policy && ! -L /usr/local/sbin/paas-recovery-policy && "$(stat -c "%a:%U:%G" /usr/local/sbin/paas-recovery-policy)" == "700:root:root" ]] && python3 /usr/local/sbin/paas-recovery-policy' >/dev/null 2>&1 \
+      || die "${gate_label}: host reboot requires explicit approval or a protected approved unattended recovery policy."
+  fi
+
+  DOKPLOY_SWARM_UNLOCK_KEY_RUNTIME=""
+  if [[ "${PAAS:-coolify}" == "dokploy" ]]; then
+    ensure_dokploy_swarm_unlocked_remote
+    state_line="$(dokploy_swarm_state_remote)"
+    IFS=$'\t' read -r state autolock <<< "${state_line}"
+    if [[ "${state}" == "active" && "${autolock}" == "true" ]]; then
+      if ssh_admin_sudo "test -f ${DOKPLOY_SWARM_UNLOCK_HANDOFF_FILE}" >/dev/null 2>&1; then
+        capture_dokploy_swarm_unlock_handoff_remote
+      else
+        load_dokploy_swarm_unlock_key
+      fi
+    elif [[ "${state}" != "active" && "${state}" != "inactive" && -n "${state}" ]]; then
+      die "${gate_label}: Dokploy Swarm state '${state}' is unsafe for the audit-policy reboot."
+    fi
+  fi
+
+  warn "${gate_label}: immutable Docker audit watches require one controlled reboot; rebooting now."
+  ssh_admin_sudo 'nohup bash -c "sleep 1; systemctl reboot" >/dev/null 2>&1 &' || true
+
+  for (( reboot_drop_attempt=1; reboot_drop_attempt<=12; reboot_drop_attempt++ )); do
+    if ! ssh_admin 'echo ok' >/dev/null 2>&1; then
+      drop_seen="true"
+      break
+    fi
+    sleep 5
+  done
+  [[ "${drop_seen}" == "true" ]] \
+    || die "${gate_label}: reboot was requested but the pinned Tailscale SSH path never dropped."
+  wait_for_admin_ssh_or_die "${gate_label} reboot wait" 36 10 \
+    || die "${gate_label}: server did not return over pinned Tailscale SSH after reboot."
+
+  if [[ -n "${DOKPLOY_SWARM_UNLOCK_KEY_RUNTIME}" ]]; then
+    unlock_dokploy_swarm_remote
+  fi
+  DOKPLOY_SWARM_UNLOCK_KEY_RUNTIME=""
+  verify_post_reboot_services_remote "${gate_label}"
+  [[ "$(docker_audit_runtime_state_remote)" == "ready" ]] \
+    || die "${gate_label}: Docker audit watches were not loaded after reboot."
+  pass "${gate_label}: Docker audit watches loaded after controlled reboot"
+}
+
+reconcile_docker_audit_runtime_remote() {
+  local gate_label="${1:-Docker audit reconciliation}" state
+  state="$(docker_audit_runtime_state_remote)"
+  case "${state}" in
+    ready)
+      pass "${gate_label}: Docker runtime audit watches are loaded"
+      ;;
+    not-applicable)
+      return 0
+      ;;
+    reboot-required)
+      reboot_for_docker_audit_remote "${gate_label}"
+      ;;
+  esac
+}
+
+phase2_gates() {
+  local gate_ssh_user="${ADMIN_USER}"
+  [[ "${PAAS}" == "dokploy" ]] && gate_ssh_user="root"
+  step "2/5" "Gate checks (SSH transition to ${gate_ssh_user}@tailscale)"
+
+  # Gate A: SSH through the PaaS-specific Tailscale principal using key auth.
+  log "Gate A: Testing SSH ${gate_ssh_user}@${TS_IP} via key auth..."
+  if ! known_host_entry_present "${TS_IP}" "${ADMIN_KNOWN_HOSTS}"; then
+    pin_known_host_alias "${SERVER_IP}" "${TS_IP}" "${DEPLOY_KNOWN_HOSTS}" "${ADMIN_KNOWN_HOSTS}" \
+      || die "No pinned SSH host key for ${TS_IP}; refusing the Tailscale SSH transition."
+  fi
   # (Gate A runs first so we know SSH works before syncing scripts)
   if wait_for_admin_ssh_or_die "Gate A (Tailscale peering may need time)" 6 10; then
     sync_operator_known_host_entries "${ADMIN_KNOWN_HOSTS}" "${TS_IP}"
-    pass "Gate A: SSH ${ADMIN_USER}@${TS_IP} works"
+    pass "Gate A: SSH ${gate_ssh_user}@${TS_IP} works"
   else
-    fail "Gate A: Cannot SSH to ${ADMIN_USER}@${TS_IP} after retries"
+    fail "Gate A: Cannot SSH to ${gate_ssh_user}@${TS_IP} after retries"
     die "Gate A failed. Tailscale peering may not be established. Check 'tailscale status' on both machines."
   fi
 
-  # Gate B: Verify admin identity
+  # Gate B: Verify the expected Tailscale SSH identity.
   local whoami_result
   whoami_result="$(ssh_admin 'whoami' 2>/dev/null | tr -d '[:space:]')"
-  if [[ "${whoami_result}" == "${ADMIN_USER}" ]]; then
-    pass "Gate B: whoami=${ADMIN_USER}"
+  if [[ "${whoami_result}" == "${gate_ssh_user}" ]]; then
+    pass "Gate B: whoami=${gate_ssh_user}"
   else
-    fail "Gate B: Expected ${ADMIN_USER}, got '${whoami_result}'"
+    fail "Gate B: Expected ${gate_ssh_user}, got '${whoami_result}'"
     die "Gate B failed."
   fi
 
@@ -971,9 +1626,30 @@ phase2_gates() {
 
   # If package upgrades during hardening require a reboot, perform it here before Gate C.
   if ssh_admin_sudo 'test -f /run/reboot-required' >/dev/null 2>&1; then
-    local reboot_pkgs reboot_drop_attempt
+    local reboot_pkgs reboot_drop_attempt reboot_swarm_state_line reboot_swarm_state reboot_swarm_autolock
     reboot_pkgs="$(ssh_admin_sudo "tr '\n' ',' < /run/reboot-required.pkgs 2>/dev/null | sed 's/,$//'" 2>/dev/null || true)"
     warn "Gate B.5: Reboot required before validation (${reboot_pkgs:-unknown packages}). Rebooting now."
+
+    # A resumed Dokploy host may already have Swarm autolock enabled. Never
+    # reboot it before the external key is available locally, and never leave
+    # the post-reboot manager locked while continuing validation.
+    DOKPLOY_SWARM_UNLOCK_KEY_RUNTIME=""
+    if [[ "${PAAS:-coolify}" == "dokploy" ]] \
+      && ssh_admin_sudo 'docker version >/dev/null 2>&1'; then
+      ensure_dokploy_swarm_unlocked_remote
+      reboot_swarm_state_line="$(dokploy_swarm_state_remote)"
+      IFS=$'\t' read -r reboot_swarm_state reboot_swarm_autolock <<< "${reboot_swarm_state_line}"
+      if [[ "${reboot_swarm_state}" == "active" && "${reboot_swarm_autolock}" == "true" ]]; then
+        if ssh_admin_sudo "test -f ${DOKPLOY_SWARM_UNLOCK_HANDOFF_FILE}" >/dev/null 2>&1; then
+          capture_dokploy_swarm_unlock_handoff_remote
+        else
+          load_dokploy_swarm_unlock_key
+        fi
+      elif [[ "${reboot_swarm_state}" != "active" \
+        && "${reboot_swarm_state}" != "inactive" && -n "${reboot_swarm_state}" ]]; then
+        die "Gate B.5 failed: Dokploy Swarm state '${reboot_swarm_state}' is unsafe for reboot."
+      fi
+    fi
 
     ssh_admin_sudo 'nohup bash -c "sleep 1; systemctl reboot" >/dev/null 2>&1 &' || true
 
@@ -988,6 +1664,10 @@ phase2_gates() {
     if wait_for_admin_ssh_or_die "Gate B.5 reboot wait" 36 10; then
       if ssh_admin_sudo 'test ! -f /run/reboot-required' >/dev/null 2>&1; then
         pass "Gate B.5: Reboot completed and reboot-required cleared"
+        if [[ -n "${DOKPLOY_SWARM_UNLOCK_KEY_RUNTIME}" ]]; then
+          unlock_dokploy_swarm_remote
+        fi
+        DOKPLOY_SWARM_UNLOCK_KEY_RUNTIME=""
         verify_post_reboot_services_remote "Gate B.5"
       else
         die "Gate B.5 failed: server came back but /run/reboot-required still present."
@@ -1016,6 +1696,7 @@ phase2_gates() {
     reconcile_docker_daemon_remote
     ssh_admin_sudo 'systemctl enable --now docker-user-hardening.service 2>/dev/null || true'
     ssh_admin_sudo 'systemctl start docker-ssh-cidr-sync.service 2>/dev/null || true'
+    reconcile_docker_audit_runtime_remote "Gate C pre-check"
   fi
   wait_for_gate_c_timesync_remote 12 5 || true
 
@@ -1064,7 +1745,7 @@ paas_phase4_dispatch() {
 paas_phase5_dispatch() {
   case "${PAAS}" in
     dflow)   dflow_phase5_verify_shared "${1:-}" ;;
-    dokploy) dokploy_phase5_verify_shared "${1:-}" ;;
+    dokploy) dokploy_phase5_verify_shared "$@" ;;
     coolify) coolify_phase5_verify_shared "$@" ;;
     *)       die "Unsupported PAAS: ${PAAS}" ;;
   esac
@@ -1109,15 +1790,21 @@ phase3_docker_dokploy() {
   phase3_install_dokploy() { dokploy_install_dokploy_script | ssh_admin_sudo 'bash -s'; }
   phase3_reconcile_docker_daemon() { reconcile_docker_daemon_remote; }
   phase3_restart_docker_user() { ssh_admin_sudo 'systemctl restart docker-user-hardening.service'; }
-  phase3_sync_docker_ssh_cidrs() { ssh_admin_sudo 'systemctl start docker-ssh-cidr-sync.service'; }
   phase3_finalize_dokploy_runtime() {
-    local script_tmp
+    local script_tmp rc swarm_unlock_key
     script_tmp="$(mktemp)"
     dokploy_finalize_runtime_script > "${script_tmp}"
-    ssh_admin_sudo 'bash -s' < "${script_tmp}"
-    local rc=$?
+    if ssh_admin_sudo 'bash -s' < "${script_tmp}"; then
+      rc=0
+    else
+      rc=$?
+    fi
     rm -f "${script_tmp}"
-    return "${rc}"
+    (( rc == 0 )) || return "${rc}"
+
+    swarm_unlock_key="$(ssh_admin_sudo 'cat /run/secure-ubuntu-paas-dokploy-swarm-unlock-key 2>/dev/null || true')"
+    store_dokploy_swarm_unlock_key "${swarm_unlock_key}"
+    ssh_admin_sudo 'rm -f -- /run/secure-ubuntu-paas-dokploy-swarm-unlock-key'
   }
 
   paas_phase3_dispatch \
@@ -1129,7 +1816,7 @@ phase3_docker_dokploy() {
     phase3_install_dokploy \
     phase3_reconcile_docker_daemon \
     phase3_restart_docker_user \
-    phase3_sync_docker_ssh_cidrs \
+    "" \
     phase3_finalize_dokploy_runtime
 }
 
@@ -1165,15 +1852,26 @@ phase4_binding_dns() {
   }
   phase4_install_cloudflared() { coolify_install_cloudflared_script | ssh_admin_sudo 'bash -s'; }
   phase4_configure_cloudflared() {
-    local tunnel_id_q tunnel_secret_q cf_account_id_q domain_q app_domain_q cf_zone_name_q
-    tunnel_id_q="$(printf '%q' "${TUNNEL_ID}")"
-    tunnel_secret_q="$(printf '%q' "${TUNNEL_SECRET}")"
+    local secret_dir secret_file_q secret_dir_q domain_q app_domain_q cf_account_id_q cf_zone_name_q rc
+    secret_dir="$(remote_secret_dir_create)" || die "Failed to create protected remote tunnel-secret directory."
+    if ! remote_secret_write_file "${secret_dir}/tunnel_secret" "${TUNNEL_SECRET}"; then
+      remote_secret_cleanup_dir "${secret_dir}"
+      die "Failed to transfer the Cloudflare tunnel secret over protected stdin."
+    fi
+    secret_file_q="$(printf '%q' "${secret_dir}/tunnel_secret")"
+    secret_dir_q="$(printf '%q' "${secret_dir}")"
     cf_account_id_q="$(printf '%q' "${CF_ACCOUNT_ID}")"
     domain_q="$(printf '%q' "${DOMAIN}")"
     app_domain_q="$(printf '%q' "${APP_DOMAIN}")"
     cf_zone_name_q="$(printf '%q' "${CF_ZONE_NAME}")"
-    coolify_configure_cloudflared_script \
-      | ssh_admin_sudo "TUNNEL_ID=${tunnel_id_q} TUNNEL_SECRET=${tunnel_secret_q} CF_ACCOUNT_ID=${cf_account_id_q} DOMAIN=${domain_q} APP_DOMAIN=${app_domain_q} CF_ZONE_NAME=${cf_zone_name_q} bash -s"
+    if coolify_configure_cloudflared_script \
+      | ssh_admin_sudo "TUNNEL_ID=${TUNNEL_ID@Q} TUNNEL_SECRET_FILE=${secret_file_q} TUNNEL_SECRET_DIR=${secret_dir_q} CF_ACCOUNT_ID=${cf_account_id_q} DOMAIN=${domain_q} APP_DOMAIN=${app_domain_q} CF_ZONE_NAME=${cf_zone_name_q} bash -s"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    remote_secret_cleanup_dir "${secret_dir}"
+    return "${rc}"
   }
   phase4_stop_cloudflared() {
     ssh_admin_sudo 'systemctl disable --now cloudflared 2>/dev/null || systemctl stop cloudflared 2>/dev/null || true'
@@ -1202,17 +1900,27 @@ EOF
       | ssh_admin_sudo "DOMAIN=${domain_q} PRIVATE_TLS_RESOLVER=${resolver_q} bash -s"
   }
   phase4_configure_private_tls() {
-    local cf_dns_token_q cf_zone_name_q resolver_q private_tls_ca_q zerossl_eab_kid_q zerossl_eab_hmac_q
-    cf_dns_token_q="$(printf '%q' "${CF_API_TOKEN}")"
+    local secret_dir cf_zone_name_q resolver_q private_tls_ca_q domain_q secret_dir_q rc
+    secret_dir="$(remote_secret_dir_create)" || die "Failed to create protected remote TLS-secret directory."
+    if ! remote_secret_write_file "${secret_dir}/cf_dns_api_token" "${CF_API_TOKEN}" \
+      || ! remote_secret_write_file "${secret_dir}/zerossl_eab_kid" "${ZEROSSL_EAB_KID}" \
+      || ! remote_secret_write_file "${secret_dir}/zerossl_eab_hmac" "${ZEROSSL_EAB_HMAC}"; then
+      remote_secret_cleanup_dir "${secret_dir}"
+      die "Failed to transfer private TLS secrets over protected stdin."
+    fi
+    secret_dir_q="$(printf '%q' "${secret_dir}")"
     cf_zone_name_q="$(printf '%q' "${CF_ZONE_NAME}")"
-    local domain_q
     domain_q="$(printf '%q' "${DOMAIN}")"
     resolver_q="$(printf '%q' "$(private_tls_resolver_name)")"
     private_tls_ca_q="$(printf '%q' "${PRIVATE_TLS_CA}")"
-    zerossl_eab_kid_q="$(printf '%q' "${ZEROSSL_EAB_KID}")"
-    zerossl_eab_hmac_q="$(printf '%q' "${ZEROSSL_EAB_HMAC}")"
-    coolify_configure_private_tls_dns_script \
-      | ssh_admin_sudo "CF_DNS_API_TOKEN=${cf_dns_token_q} CF_ZONE_NAME=${cf_zone_name_q} DOMAIN=${domain_q} PRIVATE_TLS_RESOLVER=${resolver_q} PRIVATE_TLS_CA=${private_tls_ca_q} ZEROSSL_EAB_KID=${zerossl_eab_kid_q} ZEROSSL_EAB_HMAC=${zerossl_eab_hmac_q} bash -s"
+    if coolify_configure_private_tls_dns_script \
+      | ssh_admin_sudo "PRIVATE_TLS_SECRET_DIR=${secret_dir_q} CF_ZONE_NAME=${cf_zone_name_q} DOMAIN=${domain_q} PRIVATE_TLS_RESOLVER=${resolver_q} PRIVATE_TLS_CA=${private_tls_ca_q} bash -s"; then
+      rc=0
+    else
+      rc=$?
+    fi
+    remote_secret_cleanup_dir "${secret_dir}"
+    return "${rc}"
   }
   phase4_remove_private_routes() {
     coolify_remove_private_dashboard_routes_script | ssh_admin_sudo 'bash -s'
@@ -1277,20 +1985,30 @@ phase4_dokploy_access_policy() {
 
 phase5_fetch_validate_json() { ssh_admin_sudo '/root/base/validate.sh --json'; }
 phase5_noop_operator_confirm() { :; }
+phase5_dokploy_operator_confirm() {
+  local message="${1:-Complete Dokploy first-admin registration and TOTP 2FA, then continue}"
+  if is_true "${AUTO_YES}"; then
+    die "${message}. The dashboard is restricted to ${DOKPLOY_ENROLLMENT_SOURCE_IP}; complete enrollment and rerun the same deploy command."
+  fi
+  printf '\n  \033[1;33m⏸  %s\033[0m\n' "${message}"
+  printf '  Press Enter when ready...'
+  read -r
+}
 
 phase5_verify() {
   # Contract anchors kept for docs/consistency checks:
   # Gate E: Checking dashboard accessibility...
   # Running final base/validate.sh...
-  paas_phase5_dispatch phase5_fetch_validate_json external phase5_noop_operator_confirm
+  paas_phase5_dispatch phase5_fetch_validate_json external \
+    phase5_dokploy_operator_confirm phase4_configure_dokploy_dashboard_ufw
 }
 
 # ── Main ────────────────────────────────────────────────────────────────────
 
 main() {
   run_report_init "${SCRIPT_NAME}"
-  init_ssh_options
   parse_args "$@"
+  init_ssh_options
   ROOT_SSH_HOST="${SERVER_IP}"
   collect_inputs
   validate_inputs
@@ -1301,7 +2019,11 @@ main() {
   log "Deployment configuration:"
   log "  PaaS:      ${PAAS}"
   log "  Server:    ${SERVER_IP}"
-  log "  Admin:     ${ADMIN_USER}"
+  if [[ "${PAAS}" == "dokploy" ]]; then
+    log "  SSH:       root over Tailscale only"
+  else
+    log "  Admin:     ${ADMIN_USER}"
+  fi
   log "  Pubkey:    ${PUBKEY_FILE}"
   log "  Swap:      ${SWAP_SIZE}"
   log "  Timezone:  ${SERVER_TIMEZONE}"
@@ -1343,6 +2065,7 @@ main() {
       ;;
     dokploy)
       phase3_docker_dokploy
+      reconcile_docker_audit_runtime_remote "Post-Dokploy audit reconciliation"
       phase4_dokploy_access_policy
       ;;
     coolify)

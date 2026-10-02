@@ -10,16 +10,15 @@ setup() {
 
 # ── Tailscale input validation ──────────────────────────────────────────────────
 
-@test "validate_inputs: warns when INSTALL_TAILSCALE set without auth key" {
+@test "validate_inputs: rejects Tailscale install without protected auth key" {
   ADMIN_USER="testadmin"
   ADMIN_PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTesting test@example.com"
   INSTALL_TAILSCALE="true"
   TAILSCALE_AUTH_KEY=""
 
-  # Mock command -v tailscale to return failure (not installed)
   run validate_inputs
-  # Should succeed but warn
-  assert_success
+  assert_failure
+  assert_output --partial "requires a protected TAILSCALE_AUTH_KEY_FILE"
 }
 
 @test "validate_inputs: accepts INSTALL_TAILSCALE with auth key" {
@@ -90,6 +89,31 @@ setup() {
   assert_output --partial "DRY-RUN"
   refute_output --partial "${TAILSCALE_AUTH_KEY}"
   [ -z "${DETECTED_TAILSCALE_IP}" ]
+}
+
+@test "install_tailscale: re-enrolls an existing client instead of trusting inherited state" {
+  local mock_dir calls_file old_path
+  mock_dir="$(mktemp -d)"
+  calls_file="$(mktemp)"
+  old_path="${PATH}"
+  cat > "${mock_dir}/tailscale" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "${mock_dir}/tailscale"
+  PATH="${mock_dir}:${PATH}"
+  mktemp() { /usr/bin/mktemp "${BATS_TEST_TMPDIR}/tailscale-auth.XXXXXX"; }
+  run() { printf '%s\n' "$*" >> "${calls_file}"; return 0; }
+  INSTALL_TAILSCALE="true"
+  TAILSCALE_AUTH_KEY="tskey-auth-fakekey123"
+  DRY_RUN="false"
+
+  install_tailscale
+
+  grep -q '^tailscale up --auth-key=file:.* --ssh=false$' "${calls_file}"
+  PATH="${old_path}"
+  /bin/rm -rf "${mock_dir}"
+  /bin/rm -f "${calls_file}"
 }
 
 # ── Tailscale interface verification ────────────────────────────────────────────

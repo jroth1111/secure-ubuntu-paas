@@ -1,0 +1,18 @@
+ARG BASE_IMAGE=postgres:16
+ARG GO_IMAGE=golang:bookworm
+FROM ${GO_IMAGE} AS gosu-build
+ARG GOSU_VERSION=1.19
+RUN git clone --depth 1 --branch ${GOSU_VERSION} https://github.com/tianon/gosu.git /gosu
+WORKDIR /gosu
+ENV CGO_ENABLED=0
+ENV GOMAXPROCS=2
+RUN go build -trimpath -ldflags '-d -w' -o /gosu-new . && /gosu-new --version && /gosu-new nobody id
+FROM ${BASE_IMAGE} AS hardened
+ARG BASE_IMAGE
+LABEL org.opencontainers.image.base.name=${BASE_IMAGE}
+LABEL local.paas.security-layer="20261002-v1"
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get upgrade -y && apt-get clean && rm -rf /var/lib/apt/lists/*
+COPY --from=gosu-build --chmod=0755 /gosu-new /usr/local/bin/gosu
+RUN gosu nobody id && gosu --version
+RUN postgres --version | grep -E '^postgres \(PostgreSQL\) 16\.'

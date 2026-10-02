@@ -1,3 +1,29 @@
+ufw_find_stale_coolify_management_rule() {
+  local ufw_numbered=""
+  ufw_numbered="$(ufw status numbered 2>/dev/null || true)"
+  awk -v ts_iface="${TAILSCALE_IFACE}" '
+    function is_management_port(line) {
+      return line ~ /(^|[[:space:]])(8000|6001|6002)(\/tcp)?([[:space:]]|$)/
+    }
+    /ALLOW IN/ && is_management_port($0) && index($0, "on " ts_iface) == 0 {
+      print
+      exit
+    }
+  ' <<< "${ufw_numbered}"
+}
+
+remove_stale_coolify_management_rules() {
+  local stale_rule stale_num
+  while true; do
+    stale_rule="$(ufw_find_stale_coolify_management_rule)"
+    [[ -n "${stale_rule}" ]] || break
+    stale_num="$(sed -n 's/^\[[[:space:]]*\([0-9][0-9]*\)[[:space:]]*\].*/\1/p' <<< "${stale_rule}")"
+    [[ -n "${stale_num}" ]] \
+      || die "Unable to parse stale Coolify management UFW rule number: ${stale_rule}"
+    run ufw --force delete "${stale_num}"
+  done
+}
+
 configure_ufw() {
   local cidr
 
@@ -11,12 +37,31 @@ configure_ufw() {
     ufw_numbered="$(ufw status numbered 2>/dev/null || true)"
     while IFS= read -r line; do
       [[ "${line}" == *"coolify-hardening-"* ]] || continue
-      rule_num="$(sed -n 's/^\[\([0-9]\+\)\].*/\1/p' <<< "${line}")"
+      rule_num="$(sed -n 's/^\[[[:space:]]*\([0-9][0-9]*\)[[:space:]]*\].*/\1/p' <<< "${line}")"
       [[ -n "${rule_num}" ]] && managed_nums+=("${rule_num}")
     done <<< "${ufw_numbered}"
     for (( idx=${#managed_nums[@]}-1; idx>=0; idx-- )); do
       run ufw --force delete "${managed_nums[$idx]}"
     done
+    # Remove stale broad/WAN Coolify dashboard, realtime, and terminal allows
+    # even when an older release created them without our managed comment.
+    remove_stale_coolify_management_rules
+    if is_true "${TUNNEL_MODE}"; then
+      # Tunnel mode has no public 80/443 listener policy. Remove legacy
+      # unscoped, WAN-scoped, and source-scoped web allows; only an explicit
+      # Tailscale interface rule may remain.
+      while true; do
+        local stale_web_rule stale_web_num
+        stale_web_rule="$(ufw status numbered 2>/dev/null | awk -v ts_iface="${TAILSCALE_IFACE}" '
+          /ALLOW IN/ && ($0 ~ /80\/tcp/ || $0 ~ /443\/tcp/) && index($0, "on " ts_iface) == 0 { print; exit }
+        ')"
+        [[ -n "${stale_web_rule}" ]] || break
+        stale_web_num="$(sed -n 's/^\[[[:space:]]*\([0-9][0-9]*\)[[:space:]]*\].*/\1/p' <<< "${stale_web_rule}")"
+        [[ -n "${stale_web_num}" ]] \
+          || die "Unable to parse tunnel-mode UFW web rule number: ${stale_web_rule}"
+        run ufw --force delete "${stale_web_num}"
+      done
+    fi
   fi
 
   run ufw default deny incoming

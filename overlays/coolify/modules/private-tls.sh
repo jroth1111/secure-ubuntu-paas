@@ -11,7 +11,6 @@ coolify_configure_private_dashboard_routes_script() {
   cat <<'EOF'
 set -Eeuo pipefail
 : "${DOMAIN:?DOMAIN is required}"
-: "${PRIVATE_TLS_RESOLVER:=privatedns}"
 
 dynamic_dir="/data/coolify/proxy/dynamic"
 route_file="${dynamic_dir}/coolify-private-dashboard.yaml"
@@ -52,8 +51,7 @@ http:
       service: coolify-private-dashboard
       middlewares:
         - coolify-private-gzip
-      tls:
-        certResolver: ${PRIVATE_TLS_RESOLVER}
+      tls: {}
     coolify-private-realtime-http:
       entryPoints:
         - http
@@ -66,8 +64,7 @@ http:
         - https
       rule: "Host(\`ws.${DOMAIN}\`)"
       service: coolify-private-realtime
-      tls:
-        certResolver: ${PRIVATE_TLS_RESOLVER}
+      tls: {}
     coolify-private-terminal-http:
       entryPoints:
         - http
@@ -82,8 +79,7 @@ http:
       rule: "Host(\`ws.${DOMAIN}\`) && PathPrefix(\`/terminal/ws\`)"
       service: coolify-private-terminal
       priority: 100
-      tls:
-        certResolver: ${PRIVATE_TLS_RESOLVER}
+      tls: {}
   services:
     coolify-private-dashboard:
       loadBalancer:
@@ -103,23 +99,37 @@ echo "Private dashboard routes written: ${route_file}"
 EOF
 }
 
-# coolify_configure_private_tls_dns_script — Emit host-side script to ensure
-# Traefik can issue trusted certificates for private dashboard/realtime routes
-# via ACME DNS-01 using Cloudflare.
+# coolify_configure_private_tls_dns_script — Emit a host-side certificate
+# renewal workflow for private dashboard/realtime routes. The Cloudflare DNS
+# credential stays in a root-only host file; Traefik receives only the renewed
+# certificate and key through a read-only mount.
 coolify_configure_private_tls_dns_script() {
   cat <<'EOF'
 set -Eeuo pipefail
-: "${CF_DNS_API_TOKEN:?CF_DNS_API_TOKEN is required}"
+: "${PRIVATE_TLS_SECRET_DIR:?PRIVATE_TLS_SECRET_DIR is required}"
 : "${CF_ZONE_NAME:?CF_ZONE_NAME is required}"
 : "${DOMAIN:?DOMAIN is required}"
-: "${PRIVATE_TLS_RESOLVER:=privatedns}"
 : "${PRIVATE_TLS_CA:=letsencrypt}"
 : "${ZEROSSL_CA_SERVER:=https://acme.zerossl.com/v2/DV90}"
+
+cf_dns_secret_file="${PRIVATE_TLS_SECRET_DIR}/cf_dns_api_token"
+zerossl_kid_secret_file="${PRIVATE_TLS_SECRET_DIR}/zerossl_eab_kid"
+zerossl_hmac_secret_file="${PRIVATE_TLS_SECRET_DIR}/zerossl_eab_hmac"
+[[ -f "${cf_dns_secret_file}" && ! -L "${cf_dns_secret_file}" ]] \
+  || { echo "Cloudflare DNS secret file is missing or is a symlink" >&2; exit 1; }
+CF_DNS_API_TOKEN="$(<"${cf_dns_secret_file}")"
+: "${CF_DNS_API_TOKEN:?CF_DNS_API_TOKEN is required}"
 
 case "${PRIVATE_TLS_CA}" in
   letsencrypt)
     ;;
   zerossl)
+    [[ -f "${zerossl_kid_secret_file}" && ! -L "${zerossl_kid_secret_file}" ]] \
+      || { echo "ZeroSSL EAB kid secret file is missing or is a symlink" >&2; exit 1; }
+    [[ -f "${zerossl_hmac_secret_file}" && ! -L "${zerossl_hmac_secret_file}" ]] \
+      || { echo "ZeroSSL EAB hmac secret file is missing or is a symlink" >&2; exit 1; }
+    ZEROSSL_EAB_KID="$(<"${zerossl_kid_secret_file}")"
+    ZEROSSL_EAB_HMAC="$(<"${zerossl_hmac_secret_file}")"
     : "${ZEROSSL_EAB_KID:?ZEROSSL_EAB_KID is required when PRIVATE_TLS_CA=zerossl}"
     : "${ZEROSSL_EAB_HMAC:?ZEROSSL_EAB_HMAC is required when PRIVATE_TLS_CA=zerossl}"
     ;;
@@ -138,6 +148,20 @@ coolify_dynamic_file="${dynamic_dir}/coolify.yaml"
 private_route_file="${dynamic_dir}/coolify-private-dashboard.yaml"
 private_route_backup_file="${dynamic_dir}/.coolify-private-dashboard.backup"
 private_route_absent_marker="${dynamic_dir}/.coolify-private-dashboard.absent"
+private_tls_dir="/etc/coolify/private-tls"
+certbot_config_dir="${private_tls_dir}/letsencrypt"
+certbot_work_dir="${private_tls_dir}/work"
+certbot_logs_dir="${private_tls_dir}/logs"
+cert_name="coolify-private-tls"
+certbot_live_dir="${certbot_config_dir}/live/${cert_name}"
+certificate_file="${certbot_live_dir}/fullchain.pem"
+private_key_file="${certbot_live_dir}/privkey.pem"
+traefik_certificate_dir="/etc/traefik/private-tls/live/${cert_name}"
+tls_dynamic_file="${dynamic_dir}/coolify-private-tls.yaml"
+cloudflare_credentials_file="${private_tls_dir}/cloudflare.ini"
+renew_hook_file="${certbot_config_dir}/renewal-hooks/deploy/coolify-private-tls-reload.sh"
+renew_service_file="/etc/systemd/system/coolify-private-tls-renew.service"
+renew_timer_file="/etc/systemd/system/coolify-private-tls-renew.timer"
 
 [[ -f "${compose_file}" ]] || { echo "Missing ${compose_file}" >&2; exit 1; }
 install -d -m 0700 "${proxy_dir}"
@@ -158,48 +182,134 @@ cleanup_private_tls_dns_script() {
   else
     rollback_private_route_file || true
   fi
+  rm -f -- "${cf_dns_secret_file}" "${zerossl_kid_secret_file}" "${zerossl_hmac_secret_file}" 2>/dev/null || true
+  rmdir -- "${PRIVATE_TLS_SECRET_DIR}" 2>/dev/null || true
   return "${rc}"
 }
 
 trap cleanup_private_tls_dns_script EXIT
 
-cat > "${env_file}" <<ENV
-CLOUDFLARE_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
-CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
-ENV
-chmod 0600 "${env_file}"
+if [[ -L "${env_file}" || ( -e "${env_file}" && ! -f "${env_file}" ) ]]; then
+  echo "${env_file} is a symlink or unexpected file" >&2
+  exit 1
+fi
+
+install -d -m 0700 -o root -g root \
+  "${private_tls_dir}" "${certbot_config_dir}" "${certbot_work_dir}" "${certbot_logs_dir}" \
+  "${certbot_config_dir}/renewal-hooks/deploy"
+( umask 077; printf 'dns_cloudflare_api_token = %s\n' "${CF_DNS_API_TOKEN}" > "${cloudflare_credentials_file}" )
+chown root:root "${cloudflare_credentials_file}"
+chmod 0600 "${cloudflare_credentials_file}"
+
+if ! command -v certbot >/dev/null 2>&1 || ! python3 -c 'import certbot_dns_cloudflare' >/dev/null 2>&1; then
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq certbot python3-certbot-dns-cloudflare
+fi
+
+cat > "${renew_hook_file}" <<HOOK
+#!/usr/bin/env bash
+set -Eeuo pipefail
+compose_file="${compose_file}"
+if docker compose -f "\${compose_file}" config >/dev/null 2>&1; then
+  docker compose -f "\${compose_file}" up -d --no-deps traefik >/dev/null
+else
+  echo "Invalid Traefik compose while reloading renewed private TLS certificate" >&2
+  exit 1
+fi
+HOOK
+chown root:root "${renew_hook_file}"
+chmod 0700 "${renew_hook_file}"
+
+cat > "${renew_service_file}" <<UNIT
+[Unit]
+Description=Renew Coolify private TLS certificates
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/certbot renew --non-interactive --config-dir ${certbot_config_dir} --work-dir ${certbot_work_dir} --logs-dir ${certbot_logs_dir} --deploy-hook ${renew_hook_file}
+UNIT
+chown root:root "${renew_service_file}"
+chmod 0644 "${renew_service_file}"
+
+cat > "${renew_timer_file}" <<UNIT
+[Unit]
+Description=Daily Coolify private TLS renewal
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+chown root:root "${renew_timer_file}"
+chmod 0644 "${renew_timer_file}"
+
+certbot_args=(
+  certonly
+  --non-interactive
+  --agree-tos
+  --keep-until-expiring
+  --expand
+  --email "coolify-admin@${CF_ZONE_NAME}"
+  --cert-name "${cert_name}"
+  --dns-cloudflare
+  --dns-cloudflare-credentials "${cloudflare_credentials_file}"
+  --dns-cloudflare-propagation-seconds 30
+  --config-dir "${certbot_config_dir}"
+  --work-dir "${certbot_work_dir}"
+  --logs-dir "${certbot_logs_dir}"
+  --deploy-hook "${renew_hook_file}"
+  -d "${DOMAIN}"
+  -d "ws.${DOMAIN}"
+)
+if [[ "${PRIVATE_TLS_CA}" == "zerossl" ]]; then
+  ZEROSSL_EAB_KID="$(<"${zerossl_kid_secret_file}")"
+  ZEROSSL_EAB_HMAC="$(<"${zerossl_hmac_secret_file}")"
+  certbot_args+=(--server "${ZEROSSL_CA_SERVER}" --eab-kid "${ZEROSSL_EAB_KID}" --eab-hmac-key "${ZEROSSL_EAB_HMAC}")
+fi
+certbot "${certbot_args[@]}"
+[[ -s "${certificate_file}" && -s "${private_key_file}" ]] \
+  || { echo "Certbot did not produce the private TLS certificate and key" >&2; exit 1; }
+chmod 0640 "${private_key_file}"
+
+cat > "${tls_dynamic_file}" <<CFG
+# This file is managed by secure-ubuntu-paas; certificates are renewed by the host.
+tls:
+  certificates:
+    - certFile: ${traefik_certificate_dir}/fullchain.pem
+      keyFile: ${traefik_certificate_dir}/privkey.pem
+CFG
+chown root:root "${tls_dynamic_file}"
+chmod 0640 "${tls_dynamic_file}"
+
+systemctl daemon-reload
+systemctl enable --now coolify-private-tls-renew.timer
 
 reconcile_private_tls_compose() {
-  python3 - "${compose_file}" "${PRIVATE_TLS_RESOLVER}" "${CF_ZONE_NAME}" "${PRIVATE_TLS_CA}" "${ZEROSSL_CA_SERVER}" "${ZEROSSL_EAB_KID:-}" "${ZEROSSL_EAB_HMAC:-}" <<'PY'
+  python3 - "${compose_file}" "${private_tls_dir}" <<'PY'
 from pathlib import Path
 import re
 import sys
 
 path = Path(sys.argv[1])
-resolver = sys.argv[2]
-zone = sys.argv[3]
-private_tls_ca = sys.argv[4]
-zerossl_ca_server = sys.argv[5]
-zerossl_eab_kid = sys.argv[6]
-zerossl_eab_hmac = sys.argv[7]
-env_path = "/data/coolify/proxy/.env"
-required_flags = [
-    f"--certificatesresolvers.{resolver}.acme.dnschallenge=true",
-    f"--certificatesresolvers.{resolver}.acme.dnschallenge.provider=cloudflare",
-    f"--certificatesresolvers.{resolver}.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53",
-    f"--certificatesresolvers.{resolver}.acme.email=coolify-admin@{zone}",
-    f"--certificatesresolvers.{resolver}.acme.storage=/traefik/acme.json",
-]
-if private_tls_ca == "letsencrypt":
-    pass
-elif private_tls_ca == "zerossl":
-    required_flags.extend([
-        f"--certificatesresolvers.{resolver}.acme.caserver={zerossl_ca_server}",
-        f"--certificatesresolvers.{resolver}.acme.eab.kid={zerossl_eab_kid}",
-        f"--certificatesresolvers.{resolver}.acme.eab.hmacencoded={zerossl_eab_hmac}",
-    ])
-else:
-    raise SystemExit(f"Unsupported PRIVATE_TLS_CA: {private_tls_ca}")
+private_tls_dir = Path(sys.argv[2])
+env_path = Path("/data/coolify/proxy/.env")
+if env_path.exists():
+    existing_env = env_path.read_text().splitlines()
+    existing_env = [
+        line for line in existing_env
+        if not re.match(r"^(?:CLOUDFLARE_DNS_API_TOKEN|CF_DNS_API_TOKEN)=", line)
+        and not line.startswith("TRAEFIK_CERTIFICATESRESOLVERS_PRIVATEDNS_ACME_EAB_")
+    ]
+    if existing_env:
+        env_path.write_text("\n".join(existing_env) + "\n")
+    else:
+        env_path.unlink()
 
 text = path.read_text()
 lines = text.splitlines(keepends=True)
@@ -214,7 +324,7 @@ while service_end < len(lines) and not re.match(r"^  [A-Za-z0-9_-]+:\s*$", lines
 
 service_lines = lines[service_start + 1 : service_end]
 scrubbed_service_lines = []
-resolver_flag_pattern = re.compile(rf"^ {{6}}- '?--certificatesresolvers\.{re.escape(resolver)}\..*'?\s*$")
+resolver_flag_pattern = re.compile(r"^ {6}- '?--certificatesresolvers\.privatedns\..*'?\s*$")
 for line in service_lines:
     if re.match(r"^ {6}- (?:CLOUDFLARE_DNS_API_TOKEN|CF_DNS_API_TOKEN)=.*$", line):
         continue
@@ -241,43 +351,40 @@ def section_end(block_lines, start_idx):
     return idx
 
 env_idx = find_section(service_lines, "env_file")
-if env_idx is None:
-    insert_idx = 0
-    for idx, line in enumerate(service_lines):
-        if re.match(r"^    (image|container_name|restart):", line):
-            insert_idx = idx + 1
-            break
-    service_lines[insert_idx:insert_idx] = ["    env_file:\n", f"      - {env_path}\n"]
-    env_idx = find_section(service_lines, "env_file")
-else:
+if env_idx is not None:
     env_end = section_end(service_lines, env_idx)
-    env_items = service_lines[env_idx + 1 : env_end]
-    if f"      - {env_path}\n" not in env_items:
-        env_items.append(f"      - {env_path}\n")
+    env_items = [
+        line for line in service_lines[env_idx + 1 : env_end]
+        if line.strip().removeprefix("-").strip() != str(env_path)
+    ]
+    if env_items:
         service_lines = service_lines[: env_idx + 1] + env_items + service_lines[env_end:]
+    else:
+        service_lines = service_lines[:env_idx] + service_lines[env_end:]
 
 command_idx = find_section(service_lines, "command")
-if command_idx is None:
-    env_idx = find_section(service_lines, "env_file")
-    if env_idx is None:
-        raise SystemExit("Unable to locate insertion point for Traefik command block")
-    insert_idx = section_end(service_lines, env_idx)
-    service_lines[insert_idx:insert_idx] = ["    command:\n"]
-    command_idx = insert_idx
+if command_idx is not None:
+    command_end = section_end(service_lines, command_idx)
+    command_items = [
+        line for line in service_lines[command_idx + 1 : command_end]
+        if not resolver_flag_pattern.match(line)
+    ]
+    service_lines = service_lines[: command_idx + 1] + command_items + service_lines[command_end:]
 
-command_end = section_end(service_lines, command_idx)
-command_items = service_lines[command_idx + 1 : command_end]
-existing_command_flags = set()
-for line in command_items:
-    match = re.match(r"^ {6}- '?([^'\n]+)'?\s*$", line)
-    if match:
-        existing_command_flags.add(match.group(1))
+mount_line = f"      - {private_tls_dir}:/etc/traefik/private-tls:ro\n"
+volumes_idx = find_section(service_lines, "volumes")
+if volumes_idx is None:
+    insert_idx = find_section(service_lines, "command")
+    if insert_idx is None:
+        insert_idx = len(service_lines)
+    service_lines[insert_idx:insert_idx] = ["    volumes:\n", mount_line]
+else:
+    volumes_end = section_end(service_lines, volumes_idx)
+    volume_items = service_lines[volumes_idx + 1 : volumes_end]
+    if mount_line not in volume_items:
+        volume_items.append(mount_line)
+        service_lines = service_lines[: volumes_idx + 1] + volume_items + service_lines[volumes_end:]
 
-for flag in required_flags:
-    if flag not in existing_command_flags:
-        command_items.append(f"      - '{flag}'\n")
-
-service_lines = service_lines[: command_idx + 1] + command_items + service_lines[command_end:]
 lines = lines[: service_start + 1] + service_lines + lines[service_end:]
 path.write_text("".join(lines))
 PY
@@ -307,7 +414,7 @@ import sys
 
 path = Path(sys.argv[1])
 text = path.read_text()
-for router_name in ("coolify-https", "coolify-realtime-wss", "coolify-terminal-wss"):
+for router_name in ("coolify-http", "coolify-https", "coolify-realtime-ws", "coolify-realtime-wss", "coolify-terminal-ws", "coolify-terminal-wss"):
     pattern = rf"(?ms)^    {router_name}:\n(?:      .*\n|        .*\n)*"
     text = re.sub(pattern, "", text)
 path.write_text(text)
@@ -316,7 +423,7 @@ PY
 
 public_router_state_is_clean() {
   ! grep -Eq '^[[:space:]]*certResolver:[[:space:]]*letsencrypt[[:space:]]*$' "${default_redirect_file}" 2>/dev/null \
-    && ! grep -Eq '^[[:space:]]*coolify-(https|realtime-wss|terminal-wss):[[:space:]]*$|^[[:space:]]*certresolver:[[:space:]]*letsencrypt[[:space:]]*$' "${coolify_dynamic_file}" 2>/dev/null
+    && ! grep -Eq '^[[:space:]]*coolify-(http|https|realtime-ws|realtime-wss|terminal-ws|terminal-wss):[[:space:]]*$|^[[:space:]]*certresolver:[[:space:]]*letsencrypt[[:space:]]*$' "${coolify_dynamic_file}" 2>/dev/null
 }
 
 enforce_private_router_scrub() {
@@ -433,6 +540,6 @@ if ! public_router_state_is_clean; then
   exit 1
 fi
 
-echo "Private TLS DNS challenge configured for resolver '${PRIVATE_TLS_RESOLVER}'."
+echo "Private TLS certificate renewal configured by the host; the Traefik service receives no Cloudflare DNS credential."
 EOF
 }

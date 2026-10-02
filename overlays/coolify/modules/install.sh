@@ -34,17 +34,23 @@ coolify_install_coolify_script() {
   cat <<'EOF'
 set -Eeuo pipefail
 installer_url="https://cdn.coollabs.io/coolify/install.sh"
+# Reviewed installer content hash.  Update this deliberately when Coolify
+# rotates the installer, after reviewing the new script and changing this pin.
+installer_sha256="58132d98fe956d1a16df378fd22250153b6fbc08a84e044d80da3324450a0ca3"
 tmp="$(mktemp /tmp/coolify-install.XXXXXX.sh)"
 cleanup() { rm -f "${tmp}"; }
 trap cleanup EXIT
 
 curl -fsSL "${installer_url}" -o "${tmp}"
 [[ -s "${tmp}" ]] || { echo "Downloaded Coolify installer is empty" >&2; exit 1; }
+printf '%s  %s\n' "${installer_sha256}" "${tmp}" | sha256sum -c - \
+  || { echo "Downloaded Coolify installer hash mismatch" >&2; exit 1; }
 head -1 "${tmp}" | grep -Eq '^#!.*/(ba)?sh$' || { echo "Unexpected Coolify installer header" >&2; exit 1; }
 chmod 700 "${tmp}"
 if command -v timeout >/dev/null 2>&1; then
-  if ! timeout --signal=TERM --kill-after=60 1800 bash "${tmp}"; then
-    rc=$?
+  timeout --signal=TERM --kill-after=60 1800 bash "${tmp}" || rc=$?
+  rc="${rc:-0}"
+  if [[ "${rc}" -ne 0 ]]; then
     if [[ "${rc}" -eq 124 || "${rc}" -eq 137 ]]; then
       echo "Coolify installer timed out after 1800s (likely blocked image pull)." >&2
     fi

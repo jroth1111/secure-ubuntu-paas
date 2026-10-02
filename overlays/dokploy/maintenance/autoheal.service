@@ -1,0 +1,11 @@
+[Unit]
+Description=Rate-limited recovery of the managed PaaS runtime
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/paas-autoheal
+TimeoutStartSec=5min
+UMask=0077
+Nice=10
+MemoryMax=128M

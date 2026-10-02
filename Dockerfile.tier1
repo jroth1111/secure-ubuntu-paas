@@ -1,23 +1,32 @@
 # Tier 1 Test Image: Lightweight environment for dry-run tests
 # No systemd, no services - just bash and BATS for fast iteration
 
-FROM ubuntu:24.04
+FROM ubuntu:24.04@sha256:561618e2c15bf2397621dd04f96926663a3b5616c189cf7e38db7e82f5c538ea
 
 ENV DEBIAN_FRONTEND=noninteractive
-ARG BATS_CORE_VERSION=v1.13.0
-ARG BATS_ASSERT_VERSION=v2.2.4
-ARG BATS_SUPPORT_VERSION=v0.3.0
+ARG BATS_CORE_COMMIT=3bca150ec86275d6d9d5a4fd7d48ab8b6c6f3d87
+ARG BATS_ASSERT_COMMIT=f1e9280eaae8f86cbe278a687e6ba755bc802c1a
+ARG BATS_SUPPORT_COMMIT=24a72e14349690bcbf7c151b9d2d1cdd32d36eb1
 
 # Minimal dependencies for dry-run tests only
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      iproute2 sudo bash git ca-certificates curl jq python3 python3-yaml ripgrep shellcheck \
+      iproute2 sudo bash git ca-certificates curl jq python3 python3-yaml ripgrep shellcheck openssh-client openssl gdisk kmod util-linux systemd \
     && rm -rf /var/lib/apt/lists/*
 
-# Install BATS from source (pinned for reproducibility)
-RUN git clone --depth 1 --branch ${BATS_CORE_VERSION} https://github.com/bats-core/bats-core.git /opt/bats-core && \
+# Install BATS from immutable commits and verify each checkout.
+RUN git clone --no-checkout --filter=blob:none --depth 1 https://github.com/bats-core/bats-core.git /opt/bats-core && \
+    git -C /opt/bats-core fetch --depth 1 origin ${BATS_CORE_COMMIT} && \
+    git -C /opt/bats-core checkout --detach ${BATS_CORE_COMMIT} && \
+    test "$(git -C /opt/bats-core rev-parse HEAD)" = "${BATS_CORE_COMMIT}" && \
     /opt/bats-core/install.sh /usr/local && \
-    git clone --depth 1 --branch ${BATS_ASSERT_VERSION} https://github.com/bats-core/bats-assert.git /opt/bats-assert && \
-    git clone --depth 1 --branch ${BATS_SUPPORT_VERSION} https://github.com/bats-core/bats-support.git /opt/bats-support
+    git clone --no-checkout --filter=blob:none --depth 1 https://github.com/bats-core/bats-assert.git /opt/bats-assert && \
+    git -C /opt/bats-assert fetch --depth 1 origin ${BATS_ASSERT_COMMIT} && \
+    git -C /opt/bats-assert checkout --detach ${BATS_ASSERT_COMMIT} && \
+    test "$(git -C /opt/bats-assert rev-parse HEAD)" = "${BATS_ASSERT_COMMIT}" && \
+    git clone --no-checkout --filter=blob:none --depth 1 https://github.com/bats-core/bats-support.git /opt/bats-support && \
+    git -C /opt/bats-support fetch --depth 1 origin ${BATS_SUPPORT_COMMIT} && \
+    git -C /opt/bats-support checkout --detach ${BATS_SUPPORT_COMMIT} && \
+    test "$(git -C /opt/bats-support rev-parse HEAD)" = "${BATS_SUPPORT_COMMIT}"
 
 # Create necessary directories that the script expects (even in dry-run)
 RUN mkdir -p /etc/ssh/sshd_config.d /run/sshd /etc/audit/rules.d

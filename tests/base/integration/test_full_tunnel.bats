@@ -1,6 +1,6 @@
 #!/usr/bin/env bats
 # Tier 2: Full integration tests (tunnel mode)
-# Requires: --privileged Docker container with systemd as PID 1.
+# Requires: capability-scoped Docker container with systemd as PID 1.
 # Verifies --tunnel-mode inverse behavior: no WAN 80/443 rules.
 
 load '../../helpers/helpers'
@@ -92,7 +92,7 @@ ip6tables_usable() {
 
 @test "tunnel: DOCKER-USER chain has no wan-web ACCEPT rule" {
   iptables_usable || skip "iptables backend unavailable in this kernel"
-  run iptables -t filter -S DOCKER-USER
+  run iptables -t filter -S SECURE-DOCKER-USER
   assert_success
   ! grep -q "coolify-hardening-wan-web" <<< "${output}"
 }
@@ -100,7 +100,7 @@ ip6tables_usable() {
 @test "tunnel: DOCKER-USER IPv6 chain has no wan-web6 ACCEPT rule" {
   ip6tables_usable || skip "ip6tables backend unavailable in this kernel"
 
-  run ip6tables -t filter -S DOCKER-USER
+    run ip6tables -t filter -S SECURE-DOCKER-USER6
   assert_success
   ! grep -q "coolify-hardening-wan-web6" <<< "${output}"
 }

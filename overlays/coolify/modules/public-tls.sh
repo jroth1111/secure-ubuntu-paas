@@ -6,7 +6,8 @@
   || { printf 'Source this file, do not execute it.\n' >&2; exit 1; }
 
 # coolify_restore_public_dashboard_tls_script — Emit host-side script to remove
-# tunnel-private proxy state and restore public dashboard HTTPS routing.
+# tunnel-private proxy state and restore public app TLS without publishing the
+# Coolify management routers.
 coolify_restore_public_dashboard_tls_script() {
   cat <<'EOF'
 set -Eeuo pipefail
@@ -167,11 +168,11 @@ if not re.search(r"(?m)^http:\s*$", text):
         text += "\n"
     text += "http:\n"
 
-for router_name in ("coolify-https", "coolify-realtime-wss", "coolify-terminal-wss"):
+for router_name in ("coolify-http", "coolify-https", "coolify-realtime-ws", "coolify-realtime-wss", "coolify-terminal-ws", "coolify-terminal-wss"):
     pattern = rf"(?ms)^    {router_name}:\n(?:      .*\n|        .*\n)*"
     text = re.sub(pattern, "", text)
 
-for service_name in ("coolify-public-dashboard", "coolify-public-realtime", "coolify-public-terminal"):
+for service_name in ("coolify-public-dashboard", "coolify-public-realtime", "coolify-public-terminal", "coolify-public-realtime-ws", "coolify-public-terminal-ws"):
     pattern = rf"(?ms)^    {service_name}:\n(?:      .*\n|        .*\n|          .*\n)*"
     text = re.sub(pattern, "", text)
 
@@ -195,49 +196,9 @@ def append_section_block(section: str, block: str) -> None:
     body += block
     text = text[:match.start()] + match.group(1) + body + text[match.end():]
 
-ensure_http_section("routers")
-ensure_http_section("services")
-
-router_block = f"""    coolify-https:
-      entryPoints:
-        - https
-      rule: "Host(`{domain}`)"
-      service: coolify-public-dashboard
-      tls:
-        certResolver: letsencrypt
-    coolify-realtime-wss:
-      entryPoints:
-        - https
-      rule: "Host(`{domain}`) && PathPrefix(`/app/`)"
-      service: coolify-public-realtime
-      tls:
-        certResolver: letsencrypt
-    coolify-terminal-wss:
-      entryPoints:
-        - https
-      rule: "Host(`{domain}`) && PathPrefix(`/terminal/ws`)"
-      service: coolify-public-terminal
-      priority: 100
-      tls:
-        certResolver: letsencrypt
-"""
-
-service_block = """    coolify-public-dashboard:
-      loadBalancer:
-        servers:
-          - url: http://coolify:8080
-    coolify-public-realtime:
-      loadBalancer:
-        servers:
-          - url: http://coolify-realtime:6001
-    coolify-public-terminal:
-      loadBalancer:
-        servers:
-          - url: http://coolify-realtime:6002
-"""
-
-append_section_block("routers", router_block)
-append_section_block("services", service_block)
+# Do not recreate the Coolify management routers here.  Standard mode exposes
+# public application ingress only; the dashboard, realtime, and terminal stay
+# on their Tailscale-bound management ports.
 path.write_text(text)
 PY
 }
@@ -254,6 +215,6 @@ else
   exit 1
 fi
 
-echo "Public dashboard TLS restored for ${DOMAIN}"
+echo "Public app TLS restored; Coolify management routes remain private"
 EOF
 }

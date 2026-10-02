@@ -41,7 +41,7 @@ collect_dflow_setup_inputs() {
   [[ -n "${SERVER_IP}" ]]   || prompt_value  SERVER_IP "Server public IP" "" "${IPV4_RE}"
   [[ -n "${ADMIN_USER}" ]]  || prompt_value  ADMIN_USER "Admin username" "dflowadmin" "${LINUX_USER_RE}"
   [[ -n "${PUBKEY_FILE}" ]] || prompt_value  PUBKEY_FILE "SSH public key file" "${HOME}/.ssh/id_ed25519.pub"
-  [[ -n "${TAILSCALE_AUTH_KEY}" ]] || prompt_value TAILSCALE_AUTH_KEY "Tailscale auth key (tskey-auth-...)" ""
+  [[ -n "${TAILSCALE_AUTH_KEY}" ]] || prompt_secret TAILSCALE_AUTH_KEY "Tailscale auth key (tskey-auth-...)"
   [[ -n "${SWAP_SIZE}" ]]   || SWAP_SIZE="2G"
   if [[ -z "${SERVER_TIMEZONE:-}" ]]; then
     if is_true "${AUTO_YES:-false}"; then

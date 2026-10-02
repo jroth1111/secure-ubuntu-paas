@@ -1,9 +1,10 @@
 rsyslog_collect_log_targets() {
   local cfg
   local -a cfgs=()
+  local config_root="${RSYSLOG_CONFIG_ROOT:-/etc}"
 
-  [[ -f /etc/rsyslog.conf ]] && cfgs+=("/etc/rsyslog.conf")
-  for cfg in /etc/rsyslog.d/*.conf; do
+  [[ -f "${config_root}/rsyslog.conf" ]] && cfgs+=("${config_root}/rsyslog.conf")
+  for cfg in "${config_root}"/rsyslog.d/*.conf; do
     [[ -f "${cfg}" ]] || continue
     cfgs+=("${cfg}")
   done
@@ -13,30 +14,26 @@ rsyslog_collect_log_targets() {
   awk '
     /^[[:space:]]*#/ { next }
     {
-      for (i = 1; i <= NF; i++) {
-        tok = $i
-        if (tok ~ /^-?\/var\/log\//) {
-          sub(/^-/, "", tok)
-          sub(/[;,]+$/, "", tok)
-          print tok
-        }
+      line = $0
+      while (match(line, /-?\/var\/log\/[A-Za-z0-9_.\/-]+/)) {
+        target = substr(line, RSTART, RLENGTH)
+        sub(/^-/, "", target)
+        print target
+        line = substr(line, RSTART + RLENGTH)
       }
     }
   ' "${cfgs[@]}" | sort -u
 }
 
 rsyslog_check() {
-  local mode owner group group_digit
+  local mode owner group
   local target q_target target_owner target_group target_mode
   local target_count=0
-  local expected_dir_group="syslog"
+  local expected_dir_group="root"
   local expected_target_owner="syslog"
   local expected_target_group="adm"
   local rsyslog_service_loaded="false"
 
-  if ! getent group syslog >/dev/null 2>&1; then
-    expected_dir_group="root"
-  fi
   if ! getent passwd syslog >/dev/null 2>&1; then
     expected_target_owner="root"
   fi
@@ -62,19 +59,11 @@ rsyslog_check() {
       "expected root:${expected_dir_group}, got ${owner:-unknown}:${group:-unknown}"
   fi
 
-  if [[ "${mode}" =~ ^[0-7]{3,4}$ ]]; then
-    if [[ "${expected_dir_group}" == "syslog" ]]; then
-      group_digit="${mode: -2:1}"
-      if (( (10#${group_digit} & 2) != 0 )); then
-        record "PASS" "rsyslog: /var/log group-write enabled"
-      else
-        record "FAIL" "rsyslog: /var/log group-write" \
-          "mode ${mode} lacks group write; rsyslog cannot create missing targets"
-      fi
-    else
-      record "INFO" "rsyslog: /var/log group-write" \
-        "not required when syslog group is unavailable"
-    fi
+  if [[ "${mode}" == "755" ]]; then
+    record "PASS" "rsyslog: /var/log mode"
+  elif [[ "${mode}" =~ ^[0-7]{3,4}$ ]]; then
+    record "FAIL" "rsyslog: /var/log mode" \
+      "expected 755 with no service-group write access, got ${mode}"
   else
     record "FAIL" "rsyslog: /var/log mode" "unreadable (${mode:-unknown})"
   fi
@@ -82,7 +71,10 @@ rsyslog_check() {
   while IFS= read -r target; do
     [[ -n "${target}" ]] || continue
     ((++target_count))
-    if [[ -f "${target}" ]]; then
+    if [[ -L "${target}" || -L "$(dirname "${target}")" ]]; then
+      record "FAIL" "rsyslog: target exists (${target})" \
+        "target or immediate parent is a symlink; refusing path traversal"
+    elif [[ -f "${target}" ]]; then
       record "PASS" "rsyslog: target exists (${target})"
       target_owner="$(stat -c '%U' "${target}" 2>/dev/null || true)"
       target_group="$(stat -c '%G' "${target}" 2>/dev/null || true)"

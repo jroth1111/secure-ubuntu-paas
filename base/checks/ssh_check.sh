@@ -6,7 +6,9 @@ ssh_check() {
   declare -A ssh_expects=(
     [permitrootlogin]="no"
     [passwordauthentication]="no"
+    [kbdinteractiveauthentication]="no"
     [pubkeyauthentication]="yes"
+    [authenticationmethods]="publickey"
     [permitemptypasswords]="no"
     [compression]="no"
   )
@@ -34,15 +36,23 @@ ssh_check() {
   fi
 
   if [[ -n "${ADMIN_USER}" ]]; then
-    if grep -qE "^allowusers .*\\b${ADMIN_USER}\\b" <<< "${effective}"; then
+    if [[ "${PAAS}" == "dokploy" ]] \
+      && grep -qE '^allowusers .*\broot\b' <<< "${effective}" \
+      && ! grep -qE "^allowusers .*\\b${ADMIN_USER}\\b" <<< "${effective}"; then
+      record "PASS" "ssh: Dokploy AllowUsers is root-only"
+    elif [[ "${PAAS}" == "dokploy" ]]; then
+      record "FAIL" "ssh: Dokploy AllowUsers is root-only" \
+        "expected root and no ${ADMIN_USER} in the effective AllowUsers policy"
+    elif grep -qE "^allowusers .*\\b${ADMIN_USER}\\b" <<< "${effective}"; then
       record "PASS" "ssh: AllowUsers includes ${ADMIN_USER}"
     else
       record "FAIL" "ssh: AllowUsers" "${ADMIN_USER} not listed"
     fi
   fi
 
-  # Match Address carve-out: Coolify needs root key-only login from
-  # localhost/Docker bridge CIDRs; every other PaaS must NOT have it.
+  # Match Address carve-outs: Coolify needs root key-only login from
+  # localhost/Docker bridge CIDRs; Dokploy permits the emergency root key
+  # only from the Tailscale source range; dFlow has neither path.
   local match_local
   match_local="$(sshd -T -C addr=127.0.0.1,user=root,host=localhost,laddr=127.0.0.1 2>/dev/null)" || true
   if [[ "${PAAS}" != "coolify" ]]; then
@@ -68,6 +78,56 @@ ssh_check() {
     fi
   fi
 
+  if [[ "${PAAS}" == "dokploy" ]]; then
+    local tailscale_ip match_tailscale match_root_val
+    tailscale_ip="$(tailscale ip -4 2>/dev/null || true)"
+    match_tailscale=""
+    if [[ -n "${tailscale_ip}" ]]; then
+      match_tailscale="$(sshd -T -C "addr=${tailscale_ip},user=root,host=localhost,laddr=${tailscale_ip}" 2>/dev/null)" || true
+    fi
+    match_root_val="$(grep -m1 '^permitrootlogin ' <<< "${match_tailscale}" | awk '{print $2}')"
+    if [[ -n "${tailscale_ip}" ]] \
+      && grep -qE '^permitrootlogin (prohibit-password|without-password)$' <<< "${match_tailscale}" \
+      && grep -qE '^allowusers .*\broot\b' <<< "${match_tailscale}" \
+      && ! grep -qE "^allowusers .*\\b${ADMIN_USER}\\b" <<< "${match_tailscale}" \
+      && grep -q '^passwordauthentication no$' <<< "${match_tailscale}" \
+      && grep -q '^kbdinteractiveauthentication no$' <<< "${match_tailscale}" \
+      && grep -q '^authenticationmethods publickey$' <<< "${match_tailscale}"; then
+      record "PASS" "ssh: Dokploy root key access is Tailscale-only"
+    else
+      record "FAIL" "ssh: Dokploy root key access is Tailscale-only" \
+        "expected root-only AllowUsers with prohibit-password and publickey-only authentication, got permitrootlogin=${match_root_val:-<empty>}"
+    fi
+  fi
+
+  # When socket activation is installed, verify that its listeners use the
+  # same configured SSH port as sshd and remain bound only to Tailscale and
+  # localhost. This prevents a custom SSH_PORT from silently restoring a
+  # public 22/tcp listener through ssh.socket.
+  local socket_dropin="${SSH_SOCKET_DROPIN:-/etc/systemd/system/ssh.socket.d/10-bind-tailscale.conf}"
+  if [[ -f "${socket_dropin}" ]]; then
+    local socket_ok="true" socket_expected socket_tailscale_ip="${TAILSCALE_IP:-}"
+    if [[ -z "${socket_tailscale_ip}" ]] && command -v tailscale >/dev/null 2>&1; then
+      socket_tailscale_ip="$(tailscale ip -4 2>/dev/null || true)"
+    fi
+    for socket_expected in \
+      "${socket_tailscale_ip}:${SSH_PORT}" \
+      "127.0.0.1:${SSH_PORT}" \
+      "[::1]:${SSH_PORT}"; do
+      if ! grep -Fqx "ListenStream=${socket_expected}" "${socket_dropin}"; then
+        socket_ok="false"
+      fi
+    done
+    if grep -Eq '^ListenStream=0\.0\.0\.0:|^ListenStream=\[::\]:' "${socket_dropin}"; then
+      socket_ok="false"
+    fi
+    if [[ "${socket_ok}" == "true" ]]; then
+      record "PASS" "ssh: socket listener port and binding" "${socket_dropin} matches ${SSH_PORT}/tcp and Tailscale/localhost bindings"
+    else
+      record "FAIL" "ssh: socket listener port and binding" "${socket_dropin} does not match SSH_PORT=${SSH_PORT} or contains a public listener"
+    fi
+  fi
+
   {
     # Root password should be locked
     local root_pw_status
@@ -78,14 +138,27 @@ ssh_check() {
       record "FAIL" "ssh: root password locked" "expected L (locked), got ${root_pw_status}"
     fi
 
-    # Root authorized_keys should be empty (provisioning keys cleared)
+    # Dokploy deliberately retains only the supplied admin key for emergency
+    # root access over Tailscale. Other PaaS modes clear provider keys.
     local root_auth="/root/.ssh/authorized_keys"
     if [[ -f "${root_auth}" ]]; then
-      if [[ ! -s "${root_auth}" ]] || grep -qE "^[[:space:]]*$" "${root_auth}" && ! grep -qE "[^[:space:]]" "${root_auth}"; then
+      local root_auth_mode
+      root_auth_mode="$(stat -c '%a' "${root_auth}" 2>/dev/null || true)"
+      if [[ "${PAAS}" == "dokploy" ]]; then
+        if [[ -s "${root_auth}" && "${root_auth_mode}" == "600" ]]; then
+          record "PASS" "ssh: Dokploy root authorized_keys restricted to Tailscale policy"
+        else
+          record "FAIL" "ssh: Dokploy root authorized_keys restricted to Tailscale policy" \
+            "expected a non-empty mode-600 root key file, got mode=${root_auth_mode:-<empty>}"
+        fi
+      elif [[ ! -s "${root_auth}" ]] || grep -qE "^[[:space:]]*$" "${root_auth}" && ! grep -qE "[^[:space:]]" "${root_auth}"; then
         record "PASS" "ssh: root authorized_keys empty"
       else
         record "FAIL" "ssh: root authorized_keys empty" "file contains keys — provisioning artifacts not cleaned"
       fi
+    elif [[ "${PAAS}" == "dokploy" ]]; then
+      record "FAIL" "ssh: Dokploy root authorized_keys restricted to Tailscale policy" \
+        "${root_auth} missing"
     fi
 
     # DSA host key should not exist (deprecated)

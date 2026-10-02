@@ -269,7 +269,17 @@ stream_command_output() {
   shift
   [[ -n "${capture_file}" ]] || die "stream_command_output: capture file is required"
   (( $# > 0 )) || die "stream_command_output: command is required"
-  "$@" 2>&1 | tee "${capture_file}"
+  local -a pipeline_status=()
+  # Keep the pipeline in an if-condition so set -e does not terminate the
+  # caller before deploy.sh can inspect SSH exit 255 and retry/pivot safely.
+  if ( set +e; "$@" ) 2>&1 | tee "${capture_file}"; then
+    pipeline_status=("${PIPESTATUS[@]}")
+  else
+    pipeline_status=("${PIPESTATUS[@]}")
+  fi
+  (( pipeline_status[0] == 0 )) || return "${pipeline_status[0]}"
+  (( pipeline_status[1] == 0 )) || return "${pipeline_status[1]}"
+  return 0
 }
 step() {
   printf '\n\033[1;36m[%s] %s\033[0m\n' "$1" "$2"
@@ -358,16 +368,20 @@ prompt_choice() {
 
 read_secret_file() {
   local path="$1" label="$2"
-  [[ -f "${path}" ]] || die "${label} file not found: ${path}"
-  local file_perms
-  file_perms="$(stat -c '%a' "${path}" 2>/dev/null || stat -f '%Lp' "${path}" 2>/dev/null || echo "unknown")"
-  if [[ "${file_perms}" != "unknown" && "${file_perms}" != "600" && "${file_perms}" != "400" ]]; then
-    warn "${label} file ${path} has permissions ${file_perms}; recommend 0600 or stricter."
-  fi
+  [[ -f "${path}" && ! -L "${path}" ]] \
+    || die "${label} file must be a regular non-symlink file: ${path}"
+  local file_perms file_owner current_uid
+  file_perms="$(stat -c '%a' "${path}" 2>/dev/null || stat -f '%Lp' "${path}" 2>/dev/null || true)"
+  [[ "${file_perms}" == "600" || "${file_perms}" == "400" ]] \
+    || die "${label} file must have mode 0600 or 0400: ${path}"
+  file_owner="$(stat -c '%u' "${path}" 2>/dev/null || stat -f '%u' "${path}" 2>/dev/null || true)"
+  current_uid="$(id -u)"
+  [[ "${file_owner}" == "0" || "${file_owner}" == "${current_uid}" ]] \
+    || die "${label} file must be owned by root or the current operator: ${path}"
+  awk 'NR == 0 { bad=1 } index($0, "\r") { bad=1 } NR > 1 { bad=1 } END { exit bad }' "${path}" \
+    || die "${label} file must contain exactly one line without carriage returns: ${path}"
   local secret
-  secret="$(cat "${path}")"
-  secret="${secret%$'\n'}"
-  secret="${secret%$'\r'}"
+  secret="$(<"${path}")"
   [[ -n "${secret}" ]] || die "${label} file is empty: ${path}"
   printf '%s' "${secret}"
 }

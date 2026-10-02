@@ -64,6 +64,21 @@ setup() {
   [ ! -f "/etc/sudoers.d/${ADMIN_USER}" ]
 }
 
+@test "ensure_admin_access: Dokploy keeps admin non-privileged" {
+  ADMIN_USER="dokployadmin_dry_${BATS_TEST_NUMBER}_$$"
+  PAAS="dokploy"
+  DRY_RUN="true"
+  ADMIN_PUBKEY="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTesting test@example.com"
+
+  run ensure_admin_access
+  assert_success
+  assert_output --partial "useradd -m -s /usr/sbin/nologin ${ADMIN_USER}" || return 1
+  assert_output --partial "root operations use Tailscale-only root SSH" || return 1
+  assert_output --partial "would disable SSH login for ${ADMIN_USER} and remove its authorized_keys" || return 1
+  assert_output --partial "sole root authorized key for Tailscale-only Dokploy access" || return 1
+  [ ! -f "/etc/sudoers.d/${ADMIN_USER}" ]
+}
+
 # ── SSH key handling ────────────────────────────────────────────────────────────
 
 @test "ensure_admin_access: creates .ssh directory with correct permissions" {
@@ -86,6 +101,38 @@ setup() {
   assert_success
   assert_output --partial "authorized_keys"
   [ ! -f "/home/${ADMIN_USER}/.ssh/authorized_keys" ]
+}
+
+@test "install_admin_authorized_keys_no_follow: stages in destination filesystem" {
+  local tmphome current_user
+  tmphome="$(mktemp -d)"
+  current_user="$(command id -un)"
+  chmod 0700 "${tmphome}"
+
+  run install_admin_authorized_keys_no_follow \
+    "${tmphome}" "${current_user}" \
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTesting test@example.com"
+  if [[ "$(id -u)" -eq 0 ]]; then
+    assert_success
+    grep -q 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTesting test@example.com' \
+      "${tmphome}/.ssh/authorized_keys"
+  else
+    assert_failure
+    assert_output --partial "temporary file is not root-owned"
+  fi
+
+  rm -rf "${tmphome}"
+}
+
+@test "sudo_effective_grant_state: parses denied root queries before exit status" {
+  sudo() {
+    echo "User dokployadmin is not allowed to run sudo on host."
+    return 0
+  }
+
+  run sudo_effective_grant_state dokployadmin
+  assert_failure
+  [ "${status}" -eq 1 ]
 }
 
 # ── Input validation for admin user ─────────────────────────────────────────────

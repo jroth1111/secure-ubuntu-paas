@@ -64,7 +64,26 @@ ssh_session_safety_gate() {
 
   local src_ip
   src_ip="${SSH_CONNECTION%% *}"
-  if [[ "${src_ip}" != 100.* && "${src_ip}" != fd7a:* ]] && ! is_true "${FORCE}"; then
+  if ! is_tailscale_source_ip "${src_ip}" && ! is_true "${FORCE}"; then
     die "Current SSH source (${src_ip}) is not Tailscale-like; refusing to continue without --force."
   fi
+}
+
+is_tailscale_source_ip() {
+  local ip="${1:-}"
+  local o2 o3 o4
+
+  # Tailscale IPv4 is the CGNAT 100.64.0.0/10 range, not every address whose
+  # first octet happens to be 100.
+  if [[ "${ip}" == 100.* ]]; then
+    IFS='.' read -r _ o2 o3 o4 <<< "${ip}"
+    [[ "${o2:-}" =~ ^[0-9]+$ && "${o3:-}" =~ ^[0-9]+$ && "${o4:-}" =~ ^[0-9]+$ ]] || return 1
+    (( 10#${o2} >= 64 && 10#${o2} <= 127 )) || return 1
+    (( 10#${o3} <= 255 && 10#${o4} <= 255 )) || return 1
+    return 0
+  fi
+
+  # Tailscale's IPv6 ULA uses this stable /48 prefix. Normalize case before
+  # comparing so an equivalent uppercase presentation is accepted.
+  [[ "${ip,,}" == fd7a:115c:a1e0:* ]]
 }

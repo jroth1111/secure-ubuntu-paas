@@ -36,7 +36,7 @@ Required:
   --good-api-token-file <path>
 
 Optional:
-  --good-tunnel-token-file <path>  Tunnel token file (defaults to API token file)
+  --good-tunnel-token-file <path>  Dedicated tunnel token file (required for tunnel cases)
   --bad-api-token-file <path>      Bad API token file (defaults to generated invalid token)
   --bad-tunnel-token-file <path>   Bad tunnel token file (defaults to generated invalid token)
   --server-ip <ip>                 Synthetic server IP for preflight args (default: 203.0.113.10)
@@ -161,11 +161,9 @@ main() {
   require_file "${GOOD_API_TOKEN_FILE}" "good API token file"
   require_file "${PUBKEY_FILE}" "public key file"
 
-  if [[ -z "${GOOD_TUNNEL_TOKEN_FILE}" ]]; then
-    GOOD_TUNNEL_TOKEN_FILE="${GOOD_API_TOKEN_FILE}"
-  else
-    require_file "${GOOD_TUNNEL_TOKEN_FILE}" "good tunnel token file"
-  fi
+  [[ -n "${GOOD_TUNNEL_TOKEN_FILE}" ]] \
+    || die "--good-tunnel-token-file is required for tunnel-mode cases"
+  require_file "${GOOD_TUNNEL_TOKEN_FILE}" "good tunnel token file"
 
   local tmp_dir
   tmp_dir="$(mktemp -d)"
@@ -222,7 +220,7 @@ main() {
   # deploy.sh scenarios
   run_case deploy D1_tunnel_split_both pass "tunnel mode, explicit api+tunnel files" -- \
     "${deploy_base[@]}" --mode tunnel --cf-api-token-file "${GOOD_API_TOKEN_FILE}" --cf-tunnel-api-token-file "${GOOD_TUNNEL_TOKEN_FILE}"
-  run_case deploy D2_tunnel_api_fallback pass "tunnel mode, api file only (fallback tunnel token)" -- \
+  run_case deploy D2_tunnel_missing_tunnel fail "tunnel mode, API file without dedicated tunnel token" -- \
     "${deploy_base[@]}" --mode tunnel --cf-api-token-file "${GOOD_API_TOKEN_FILE}"
   run_case deploy D3_standard_bad_tunnel_ignored pass "standard mode ignores tunnel token" -- \
     "${deploy_base[@]}" --mode standard --cf-api-token-file "${GOOD_API_TOKEN_FILE}" --cf-tunnel-api-token-file "${BAD_TUNNEL_TOKEN_FILE}"
@@ -238,7 +236,7 @@ main() {
   # setup.sh scenarios
   run_case setup S1_tunnel_split_both pass "tunnel mode, explicit api+tunnel files" -- \
     "${setup_base[@]}" --mode tunnel --cf-api-token-file "${GOOD_API_TOKEN_FILE}" --cf-tunnel-api-token-file "${GOOD_TUNNEL_TOKEN_FILE}"
-  run_case setup S2_tunnel_api_fallback pass "tunnel mode, api file only (fallback tunnel token)" -- \
+  run_case setup S2_tunnel_missing_tunnel fail "tunnel mode, API file without dedicated tunnel token" -- \
     "${setup_base[@]}" --mode tunnel --cf-api-token-file "${GOOD_API_TOKEN_FILE}"
   run_case setup S3_standard_bad_tunnel_ignored pass "standard mode ignores tunnel token" -- \
     "${setup_base[@]}" --mode standard --cf-api-token-file "${GOOD_API_TOKEN_FILE}" --cf-tunnel-api-token-file "${BAD_TUNNEL_TOKEN_FILE}"

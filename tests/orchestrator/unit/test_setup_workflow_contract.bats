@@ -213,6 +213,23 @@ EOF
   assert_output --partial "Gate B failed."
 }
 
+@test "setup: Dokploy gate B rejects a login-capable metadata account" {
+  run bash -c '
+    source "'"${SETUP_SCRIPT}"'"
+    PAAS="dokploy"
+    TS_IP="100.64.0.25"
+    ADMIN_USER="dokployadmin"
+    pause_for_operator() { :; }
+    getent() { echo "dokployadmin:x:1001:1001::/tmp/dokployadmin:/usr/sbin/nologin"; }
+    passwd() { echo "dokployadmin P 2026-08-05 0 99999 7 -1"; }
+
+    phase2_gates
+  '
+  assert_failure
+  assert_output --partial "Dokploy metadata user dokployadmin is not fully disabled"
+  assert_output --partial "Expected nologin shell, locked password, and no authorized keys"
+}
+
 @test "setup: gate C runs base/validate.sh json" {
   run bash -c '
     source "'"${SETUP_SCRIPT}"'"
@@ -364,9 +381,9 @@ EOF
     cf_upsert_a_record() { calls+="$1|$2|$3"$'\''\n'\''; }
 
     phase4_binding_dns
-    grep -q "^coolify.vps.example.com|203.0.113.10|true$" <<< "${calls}"
+    ! grep -q "^coolify.vps.example.com|203.0.113.10|true$" <<< "${calls}"
     grep -q "^\\*.vps.example.com|203.0.113.10|true$" <<< "${calls}"
-    grep -q "^\\*.example.com|203.0.113.10|true$" <<< "${calls}"
+    ! grep -q "^\\*.example.com|203.0.113.10|true$" <<< "${calls}"
   '
   assert_success
 }
@@ -411,7 +428,7 @@ EOF
     }
     coolify_configure_cloudflared_script() { cat <<'\''EOF'\'' 
 [[ "${TUNNEL_ID}" == "tunnel-123" ]]
-[[ "${TUNNEL_SECRET}" == "secret-123" ]]
+[[ "$(<"${TUNNEL_SECRET_FILE}")" == "secret-123" ]]
 [[ "${CF_ACCOUNT_ID}" == "account-123" ]]
 [[ "${DOMAIN}" == "coolify.vps.example.com" ]]
 [[ "${APP_DOMAIN}" == "vps.example.com" ]]
@@ -424,12 +441,12 @@ EOF
 EOF
     }
     coolify_configure_private_tls_dns_script() { cat <<'\''EOF'\'' 
-[[ "${CF_DNS_API_TOKEN}" == "dns-token" ]]
+[[ "$(<"${PRIVATE_TLS_SECRET_DIR}/cf_dns_api_token")" == "dns-token" ]]
 [[ "${CF_ZONE_NAME}" == "example.com" ]]
 [[ "${PRIVATE_TLS_RESOLVER}" == "privatedns" ]]
 [[ "${PRIVATE_TLS_CA}" == "zerossl" ]]
-[[ "${ZEROSSL_EAB_KID}" == "kid-123" ]]
-[[ "${ZEROSSL_EAB_HMAC}" == "hmac-123" ]]
+[[ "$(<"${PRIVATE_TLS_SECRET_DIR}/zerossl_eab_kid")" == "kid-123" ]]
+[[ "$(<"${PRIVATE_TLS_SECRET_DIR}/zerossl_eab_hmac")" == "hmac-123" ]]
 EOF
     }
     coolify_mark_bind_dashboard_state_script() { echo true; }

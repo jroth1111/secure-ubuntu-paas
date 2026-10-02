@@ -13,6 +13,8 @@ ensure_packages() {
     apt-listchanges
     openssh-server
     iptables
+    python3
+    sudo
   )
 
   for pkg in "${packages[@]}"; do
@@ -58,6 +60,30 @@ install_fail2ban_without_autostart() {
     policy_restore="true"
   fi
 
+  restore_policy_rc_d() {
+    if [[ "${policy_restore}" == "true" ]]; then
+      [[ -f "${policy_backup}" ]] || return 1
+      # The backup is created beside policy-rc.d, so this rename is atomic and
+      # preserves the exact prior file metadata captured by cp -a.
+      mv -f -- "${policy_backup}" "${policy_rc_d}"
+      policy_backup=""
+    else
+      rm -f -- "${policy_rc_d}"
+    fi
+  }
+
+  cleanup_policy_rc_d() {
+    local rc=$?
+    trap - EXIT INT TERM
+    restore_policy_rc_d || rc=1
+    exit "${rc}"
+  }
+
+  # policy-rc.d is host-global package state. Install signal-safe cleanup before
+  # changing it so cancellation, session loss, and ERR/EXIT paths cannot strand
+  # the exit-101 suppressor.
+  trap cleanup_policy_rc_d EXIT INT TERM
+
   write_file "${policy_rc_d}" "0755" "root" "root" <<'EOF'
 #!/usr/bin/env bash
 exit 101
@@ -68,12 +94,8 @@ EOF
     install_rc=$?
   fi
 
-  if [[ "${policy_restore}" == "true" ]]; then
-    cp -a "${policy_backup}" "${policy_rc_d}"
-    rm -f "${policy_backup}"
-  else
-    rm -f "${policy_rc_d}"
-  fi
+  trap - EXIT INT TERM
+  restore_policy_rc_d
 
   (( install_rc == 0 )) || return "${install_rc}"
 }
@@ -101,7 +123,7 @@ ensure_power_group() {
 
 require_commands() {
   local commands=()
-  commands+=(ip awk grep sed jq sgdisk)
+  commands+=(ip awk grep sed jq sgdisk python3)
 
   if ! is_true "${DRY_RUN}"; then
     commands+=(sshd ufw iptables journalctl systemctl augenrules auditctl fail2ban-client)

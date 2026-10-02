@@ -7,22 +7,23 @@ This guide walks through the complete journey from a fresh Ubuntu 24.04 VPS to a
 For a fully automated deployment, use `deploy.sh` (from your laptop) or `setup.sh` (from the server). These scripts automate hardening, gate checks, Cloudflare Tunnel creation, and DNS configuration:
 
 ```bash
-# Tunnel mode (default — recommended), combined token model
-/opt/homebrew/bin/bash deploy.sh --server-ip <ip> --root-pass-file /secure/path/root.pass --tailscale-auth-key <key> \
-  --server-timezone <IANA> --domain <fqdn> --cf-api-token-file /secure/path/cf_api.token --yes
-
-# Tunnel mode (split-token model: DNS token + tunnel token)
-/opt/homebrew/bin/bash deploy.sh --server-ip <ip> --root-pass-file /secure/path/root.pass --tailscale-auth-key <key> \
+# Tunnel mode (default — recommended), split-token model (required)
+/opt/homebrew/bin/bash deploy.sh --server-ip <ip> --root-pass-file /secure/path/root.pass --tailscale-auth-key-file /secure/path/tailscale.auth \
   --server-timezone <IANA> --domain <fqdn> --cf-api-token-file /secure/path/cf_dns.token \
   --cf-tunnel-api-token-file /secure/path/cf_tunnel.token --yes
 
-# Standard mode (open public 80/443), DNS token only
-/opt/homebrew/bin/bash deploy.sh --server-ip <ip> --root-pass-file /secure/path/root.pass --tailscale-auth-key <key> \
+# Tunnel mode (split-token model: DNS token + tunnel token)
+/opt/homebrew/bin/bash deploy.sh --server-ip <ip> --root-pass-file /secure/path/root.pass --tailscale-auth-key-file /secure/path/tailscale.auth \
+  --server-timezone <IANA> --domain <fqdn> --cf-api-token-file /secure/path/cf_dns.token \
+  --cf-tunnel-api-token-file /secure/path/cf_tunnel.token --yes
+
+# Standard mode (public app ingress on 80/443; management remains Tailscale-only), DNS token only
+/opt/homebrew/bin/bash deploy.sh --server-ip <ip> --root-pass-file /secure/path/root.pass --tailscale-auth-key-file /secure/path/tailscale.auth \
   --server-timezone <IANA> --domain <fqdn> --cf-api-token-file /secure/path/cf_api.token --mode standard --yes
 ```
 
 Token input options:
-- `CF_API_TOKEN` and optional `CF_TUNNEL_API_TOKEN` environment variables
+- `CF_API_TOKEN` and dedicated `CF_TUNNEL_API_TOKEN` environment variables
 - `--cf-api-token-file` and optional `--cf-tunnel-api-token-file`
 
 Timezone input:
@@ -34,9 +35,9 @@ Use this to decide inputs before running commands.
 
 | Workflow | Required inputs | Optional inputs with defaults | Not required |
 |----------|-----------------|-------------------------------|--------------|
-| `deploy.sh` fresh run | `--server-ip`, `--domain`, root password (prompt or `--root-pass-file`), `--tailscale-auth-key`, Cloudflare API token (`CF_API_TOKEN` or `--cf-api-token-file`), server timezone choice (`--server-timezone`; mandatory with `--yes`) | `--admin-user` (`coolifyadmin`), `--pubkey-file` (`~/.ssh/id_ed25519.pub`), `--mode` (`tunnel`), `--app-domain-mode` (`apex`), `--swap-size` (`2G`), `--tailscale-direct-wan` (off), `--cf-zone`, `--cf-zone-id`, `--cf-account-id`, optional split tunnel token (`--cf-tunnel-api-token-file`) | `--ts-ip` |
-| `deploy.sh --ts-ip <ip>` resume | `--server-ip`, `--domain`, `--ts-ip`, Cloudflare API token (`CF_API_TOKEN` or `--cf-api-token-file`), server timezone choice (`--server-timezone`; mandatory with `--yes`) | Same optional defaults as fresh run | root password / `--root-pass-file`, `--tailscale-auth-key` |
-| `setup.sh` server-local run | `--server-ip`, `--admin-user`, `--pubkey-file`, `--domain`, Cloudflare API token (`CF_API_TOKEN` or `--cf-api-token-file`), `--tailscale-auth-key` unless `--preflight-only`, server timezone choice (`--server-timezone`; mandatory with `--yes`) | `--mode` (`tunnel`), `--app-domain-mode` (`apex`), `--swap-size` (`2G`), `--tailscale-direct-wan` (off), `--cf-zone`, `--cf-zone-id`, `--cf-account-id`, optional split tunnel token (`--cf-tunnel-api-token-file`) | root password / `--root-pass-file`, `--ts-ip` |
+| `deploy.sh` fresh run | `--server-ip`, `--domain`, root password (prompt or `--root-pass-file`), `--tailscale-auth-key-file`, Cloudflare DNS token (`CF_API_TOKEN` or `--cf-api-token-file`), dedicated tunnel token in tunnel mode (`CF_TUNNEL_API_TOKEN` or `--cf-tunnel-api-token-file`), server timezone choice (`--server-timezone`; mandatory with `--yes`) | `--admin-user` (`coolifyadmin`), `--pubkey-file` (`~/.ssh/id_ed25519.pub`), `--mode` (`tunnel`), `--app-domain-mode` (`apex`), `--swap-size` (`2G`), `--tailscale-direct-wan` (off), `--cf-zone`, `--cf-zone-id`, `--cf-account-id` | `--ts-ip` |
+| `deploy.sh --ts-ip <ip>` resume | `--server-ip`, `--domain`, `--ts-ip`, Cloudflare DNS token (`CF_API_TOKEN` or `--cf-api-token-file`), dedicated tunnel token in tunnel mode (`CF_TUNNEL_API_TOKEN` or `--cf-tunnel-api-token-file`), server timezone choice (`--server-timezone`; mandatory with `--yes`) | Same optional defaults as fresh run | root password / `--root-pass-file`, `--tailscale-auth-key` |
+| `setup.sh` server-local run | `--server-ip`, `--admin-user`, `--pubkey-file`, `--domain`, Cloudflare DNS token (`CF_API_TOKEN` or `--cf-api-token-file`), dedicated tunnel token in tunnel mode (`CF_TUNNEL_API_TOKEN` or `--cf-tunnel-api-token-file`), `--tailscale-auth-key-file` unless `--preflight-only`, server timezone choice (`--server-timezone`; mandatory with `--yes`) | `--mode` (`tunnel`), `--app-domain-mode` (`apex`), `--swap-size` (`2G`), `--tailscale-direct-wan` (off), `--cf-zone`, `--cf-zone-id`, `--cf-account-id` | root password / `--root-pass-file`, `--ts-ip` |
 
 Recommended defaults (if undecided):
 - `--mode tunnel`
@@ -51,23 +52,23 @@ Minimal commands by workflow:
 ```bash
 # deploy.sh fresh run
 /opt/homebrew/bin/bash deploy.sh --server-ip <ip> --domain <fqdn> --root-pass-file <path> \
-  --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> \
-  --cf-api-token-file <path> --yes
+  --tailscale-auth-key-file <path> --server-timezone <IANA> \
+  --cf-api-token-file <dns-token-path> --cf-tunnel-api-token-file <tunnel-token-path> --yes
 
 # deploy.sh resume from phase 2
 /opt/homebrew/bin/bash deploy.sh --server-ip <ip> --domain <fqdn> --ts-ip <100.x.x.x> \
-  --server-timezone <IANA> --cf-api-token-file <path> --yes
+  --server-timezone <IANA> --cf-api-token-file <dns-token-path> --cf-tunnel-api-token-file <tunnel-token-path> --yes
 
 # setup.sh server-local
 sudo /opt/homebrew/bin/bash setup.sh --server-ip <ip> --admin-user <name> --pubkey-file <path> \
-  --domain <fqdn> --tailscale-auth-key <tskey-auth-...> --server-timezone <IANA> \
-  --cf-api-token-file <path> --yes
+  --domain <fqdn> --tailscale-auth-key-file <path> --server-timezone <IANA> \
+  --cf-api-token-file <dns-token-path> --cf-tunnel-api-token-file <tunnel-token-path> --yes
 ```
 
 Decision tree:
-- Exposure model: `tunnel` (private-only dashboard/realtime, no inbound 80/443) or `standard` (public 80/443).
+- Exposure model: `tunnel` (private-only dashboard/realtime, no inbound 80/443) or `standard` (public app ingress on 80/443; management remains Tailscale-only).
 - App hostnames: `apex` (`appname.<zone>`) or `vps` (`appname.<domain>`).
-- Token model: combined token (single API token) or split tokens (DNS token + tunnel token).
+- Token model: split tokens only in tunnel mode (DNS token + dedicated tunnel token); standard mode needs only the DNS token. The broader DNS token is never sent to the public Traefik process.
 
 Rules that prevent confusion:
 - With `--yes`, set `--server-timezone <IANA>` (or `SERVER_TIMEZONE`) explicitly.
@@ -117,7 +118,7 @@ If any gate fails: stop, fix the issue, and re-run the same gate.
 
 Automated scripts (`deploy.sh`/`setup.sh`) use this gate mapping:
 
-- `deploy.sh` Gate A/B/C/D/E correspond to admin SSH over Tailscale, identity check, hardening validation, DOCKER-USER service+rules, and dashboard exposure boundary checks.
+- `deploy.sh` Gate A/B/C/D/E correspond to the PaaS-specific SSH principal over Tailscale (root-only for Dokploy, admin for other overlays), identity check, hardening validation, DOCKER-USER service+rules, and dashboard exposure boundary checks.
 - `setup.sh` Gate A remains operator-confirmed (prompted). In phase 5, Tailscale/private-route checks are script-enforced, while public-path blocking checks are operator-confirmed from a laptop prompt.
 - Manual phase labels in this runbook remain authoritative for the manual procedure; automated scripts enforce equivalent control intent with script-specific checkpoints.
 
@@ -145,7 +146,7 @@ cat ~/.ssh/id_ed25519.pub
 
 1. Sign up at [tailscale.com](https://tailscale.com)
 2. Install Tailscale on your local machine
-3. Note your Tailscale auth key or plan to use interactive login on the server
+3. Create a protected Tailscale auth-key file; installs re-enroll existing clients and do not trust interactive or inherited enrollment
 
 ---
 
@@ -161,9 +162,21 @@ cat ~/.ssh/id_ed25519.pub
 ### 1.2 Initial SSH Access
 
 ```bash
-# Use the provider's SSH key or root password for initial access
+# Use the provider's SSH key or root password for initial access. For a fresh
+# deploy.sh run, preferably obtain the provider-verified SSH host key out of
+# band and add it to ~/.ssh/known_hosts (or pass --server-host-key-file). The
+# workflow refuses first-contact password bootstrap without a matching pin.
 ssh root@<server-public-ip>
 ```
+
+If provider-console verification is unavailable, an operator-approved TOFU
+fallback may be used. Wait for a stable endpoint, capture the complete host-key
+set three times with short intervals, require byte-identical non-empty results,
+show every SHA-256 fingerprint, and obtain explicit approval before placing the
+approved keys in a mode-0600 per-run file passed to
+`--server-host-key-file`. A VPS rebuild invalidates every prior pin. A single
+`ssh-keyscan`, or `ssh-keygen` executed through the same unverified SSH session,
+is not independent verification and must not be represented as such.
 
 ### 1.3 Install Tailscale
 
@@ -180,8 +193,9 @@ curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list
 sudo apt-get update
 sudo apt-get install -y tailscale
 
-# Authenticate (interactive — opens a URL to authorize)
-sudo tailscale up
+# Authenticate with a protected auth-key file; do not trust inherited or
+# interactive enrollment during a hardened install.
+sudo tailscale up --auth-key=file:/secure/path/tailscale.auth --ssh=false
 
 # Verify
 tailscale status
@@ -331,14 +345,58 @@ sudo systemctl status docker-user-hardening.service
 sudo iptables -t filter -S DOCKER-USER | grep coolify-hardening
 ```
 
-For standard mode, expect a `coolify-hardening-wan-web` rule.
-For tunnel mode, ensure `coolify-hardening-wan-web` is absent while `coolify-hardening-wan-drop` is present.
+For standard mode, expect a `coolify-hardening-wan-web` rule followed by
+`coolify-hardening-wan-drop`, then explicit `docker0`, `docker_gwbridge`, and
+Docker-owned bridge returns discovered from Docker's bridge-network inventory.
+For tunnel mode, ensure `coolify-hardening-wan-web` is absent while
+`coolify-hardening-wan-drop` remains before all bridge returns. Unknown
+interfaces must hit the terminal unmatched drop before the unconditional
+return, and `docker-user-hardening-refresh.timer` must be enabled and active
+so later Docker networks are reconciled.
+
+On Dokploy hosts, also confirm the post-PaaS audit refresh loaded
+`container-runtime` and `docker-config` rules, and confirm Swarm manager
+autolock is enabled without a same-host unlock unit/key. The deploy.sh laptop
+workflow stores the one-time unlock handoff in the operator Keychain; a later
+Docker restart requires a deliberate manual unlock. The managed audit event
+rate is applied with `auditctl -r 1000`, the final audit rule is `-e 2`, and
+the rate is persisted by the hardening validation timer through
+`/etc/systemd/system/auditd.service.d/`:
+
+```bash
+sudo auditctl -l | grep -E 'container-runtime|docker-config'
+sudo auditctl -s | grep -E '^(enabled|rate_limit|lost|loginuid_immutable)'
+sudo systemctl cat auditd.service
+sudo docker info | grep -i 'Autolock Managers'
+sudo docker info | grep -i 'Autolock Managers'
+security find-generic-password -s "secure-ubuntu-paas/dokploy/swarm-unlock/<server-ip>" >/dev/null
+```
+
+The Dokploy and Traefik services mount the Docker socket and are therefore
+host-root-equivalent. Gate F requires both Swarm service image references to
+contain an immutable `@sha256:` digest. A single-node Swarm may still show the
+provider WAN address in `ManagerStatus.Addr` if it was initialized that way;
+the managed firewall must continue to block WAN `2377/tcp`, `7946/tcp+udp`,
+and `4789/udp`. Do not open those ports to make a future join work. Use the
+Tailscale address in an approved multi-node procedure; changing an existing
+manager's advertised address requires a separate Swarm maintenance/re-
+initialization decision.
 
 ### 3.3 Install Coolify
 
 ```bash
-curl -fsSL https://cdn.coollabs.io/coolify/install.sh | sudo bash
+installer_url="https://cdn.coollabs.io/coolify/install.sh"
+installer_sha256="58132d98fe956d1a16df378fd22250153b6fbc08a84e044d80da3324450a0ca3"
+tmp="$(mktemp /tmp/coolify-install.XXXXXX.sh)"
+trap 'rm -f "${tmp}"' EXIT
+curl -fsSL "${installer_url}" -o "${tmp}"
+printf '%s  %s\n' "${installer_sha256}" "${tmp}" | sha256sum -c -
+chmod 700 "${tmp}"
+sudo bash "${tmp}"
 ```
+
+The automated `deploy.sh` workflow uses the same pinned hash. Do not pipe a
+mutable CDN response directly into a privileged shell.
 
 Coolify will be available at `http://<tailscale-ip>:8000` by default.
 
@@ -395,17 +453,17 @@ Gate E passes when dashboard and websocket are reachable over Tailscale and bloc
   - Writes managed private proxy routes for dashboard/realtime hostnames at `/data/coolify/proxy/dynamic/coolify-private-dashboard.yaml`
   - Creates/updates proxied wildcard CNAMEs for app routing:
     - `*.app-domain`
-    - `*.zone` when `app-domain` differs from zone root
+    - when `app-domain-mode=apex`, `app-domain` is the zone root; vps mode stays inside the selected server subdomain
   - Wildcards point to `<tunnel-id>.cfargotunnel.com`
-- **Standard mode**: `deploy.sh`/`setup.sh` automatically creates an A record for your domain **and** a wildcard A record (`*.example.com`) pointing to the server's public IP (Cloudflare-proxied).
+- **Standard mode**: `deploy.sh`/`setup.sh` automatically creates an A record for your domain and a wildcard A record for the selected `app-domain` scope pointing to the server's public IP (Cloudflare-proxied). vps mode never replaces the unrelated zone-apex wildcard.
 
 ### 4.4 Post-Deploy: Enable Automatic SSL + Subdomains
 
 After deployment, complete these three steps to enable fully automatic subdomain + SSL for every app:
 
-1. **Cloudflare dashboard → SSL/TLS → Overview**: Set encryption mode to **Full**. Do not use Flexible (sends plaintext to origin).
+1. **Cloudflare dashboard → SSL/TLS → Overview**: Set encryption mode to **Full (strict)**. Do not use Flexible or non-strict Full; the origin certificate must be valid and hostname-matching.
 
-2. **Coolify UI → Servers → your server → Wildcard Domain**: Set to your zone root (e.g., `example.com`). This tells Coolify to auto-assign subdomains like `myapp.example.com` to every new resource you deploy. Since the scripts already created wildcard DNS records and tunnel ingress rules, each subdomain gets SSL (via Cloudflare Universal SSL) and routing (via Traefik Host-header matching) automatically — zero per-app DNS or cert configuration.
+2. **Coolify UI → Servers → your server → Wildcard Domain**: Set it to the selected app scope (the zone root in apex mode, or the VPS domain in vps mode). This keeps automatic app hostnames inside the namespace the deployment owns.
 
 3. **Resource domains in Coolify**: Use `http://` protocol — not `https://`. Cloudflare terminates TLS at the edge and sends HTTP through the tunnel. Using `https://` causes `TOO_MANY_REDIRECTS`.
 
@@ -415,12 +473,12 @@ After these steps, the end-to-end flow for every new app is: deploy in Coolify �
 
 ### 4.5 TLS Architecture
 
-Both deployment modes use Cloudflare's edge for public app TLS via Universal SSL (`*.example.com`). For private dashboard/realtime hostnames in tunnel mode, scripts configure trusted origin certs via DNS-01:
+Both deployment modes use Cloudflare's edge for public app TLS via Universal SSL for the selected app scope. For private dashboard/realtime hostnames in tunnel mode, a host-side renewal service configures trusted origin certificates via DNS-01:
 
 - **Tunnel mode (apps via wildcard)**: Cloudflare terminates TLS at the edge. Public tunnel ingress is wildcard-app only (`*.app-domain` to `localhost:80`).
-- **Tunnel mode (private dashboard/realtime hostnames)**: cloudflared blocks public ingress (`http_status:404`), exact host DNS (`DOMAIN`, `ws.DOMAIN`) is pinned to server `TS_IP` as DNS-only, and Traefik issues trusted certs for those exact hosts using ACME DNS-01 (Cloudflare token).
+- **Tunnel mode (private dashboard/realtime hostnames)**: cloudflared blocks public ingress (`http_status:404`), exact host DNS (`DOMAIN`, `ws.DOMAIN`) is pinned to server `TS_IP` as DNS-only, and a root-only host Certbot service issues/renews trusted certificates for those exact hosts. Traefik receives only a read-only certificate mount; the reusable Cloudflare DNS token is never placed in its environment or command line.
 - Bootstrap normalizes `/etc/hosts` so `DOMAIN` and `ws.DOMAIN` are never pinned to loopback. The private dashboard path must stay DNS-driven to the Tailscale IP, not overridden locally.
-- **Standard mode** (proxied + Full SSL): Cloudflare terminates edge TLS and connects to the origin via HTTPS; Full mode accepts any cert.
+- **Standard mode** (proxied + Full (strict) SSL): Cloudflare terminates edge TLS and connects to the origin via HTTPS, validating the origin certificate and hostname.
 
 For custom Full (Strict) scenarios beyond script-managed private hostnames, you can still configure additional Traefik DNS-01 certificates in Coolify UI (Servers > Proxy). See [Coolify wildcard cert docs](https://coolify.io/docs/knowledge-base/proxy/traefik/wildcard-certs).
 

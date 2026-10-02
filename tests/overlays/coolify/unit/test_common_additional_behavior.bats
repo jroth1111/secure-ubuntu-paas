@@ -168,6 +168,41 @@ setup() {
   assert_success
 }
 
+@test "read_secret_file: rejects multiline, symlinked, and weakly protected secret files" {
+  run bash -c '
+    source "'"${COMMON_LIB}"'"
+    bad_file="$(mktemp)"
+    printf "token\nADMIN_USER=attacker\n" > "${bad_file}"
+    chmod 600 "${bad_file}"
+    read_secret_file "${bad_file}" "Tailscale auth key"
+  '
+  assert_failure
+  assert_output --partial "exactly one line"
+
+  run bash -c '
+    source "'"${COMMON_LIB}"'"
+    target="$(mktemp)"
+    link="$(mktemp)"
+    printf "token\n" > "${target}"
+    chmod 600 "${target}"
+    rm -f "${link}"
+    ln -s "${target}" "${link}"
+    read_secret_file "${link}" "Tailscale auth key"
+  '
+  assert_failure
+  assert_output --partial "regular non-symlink"
+
+  run bash -c '
+    source "'"${COMMON_LIB}"'"
+    weak_file="$(mktemp)"
+    printf "token\n" > "${weak_file}"
+    chmod 644 "${weak_file}"
+    read_secret_file "${weak_file}" "Tailscale auth key"
+  '
+  assert_failure
+  assert_output --partial "mode 0600 or 0400"
+}
+
 @test "cf_expect_success: passes for success=true and fails for success=false" {
   run cf_expect_success "action" '{"success":true}'
   assert_success
@@ -205,6 +240,8 @@ setup() {
   run coolify_install_coolify_script
   assert_success
   assert_output --partial "cdn.coollabs.io/coolify/install.sh"
+  assert_output --partial "installer_sha256=\"58132d98fe956d1a16df378fd22250153b6fbc08a84e044d80da3324450a0ca3\""
+  assert_output --partial "sha256sum -c -"
   assert_output --partial "bash \"${tmp}\""
 }
 
@@ -253,7 +290,8 @@ setup() {
   assert_output --partial "http://coolify-realtime:6002"
   refute_output --partial "domains:"
   refute_output --partial "sans:"
-  [[ "$(grep -Fc 'certResolver: ${PRIVATE_TLS_RESOLVER}' <<< "${output}")" -eq 3 ]]
+  [[ "$(grep -Fc 'tls: {}' <<< "${output}")" -eq 3 ]]
+  refute_output --partial 'certResolver: ${PRIVATE_TLS_RESOLVER}'
 }
 
 @test "coolify_remove_private_dashboard_routes_script: emits managed route cleanup logic" {
@@ -270,6 +308,8 @@ setup() {
   assert_output --partial "hostname: ws.${DOMAIN}"
   assert_output --partial "service: http_status:404"
   assert_output --partial "service: http://localhost:80"
+  refute_output --partial 'extra_apex_ingress'
+  refute_output --partial 'hostname: "*.${CF_ZONE_NAME}"'
   [[ "${output}" != *"/terminal/ws"* ]]
   assert_output --partial "systemctl enable --now cloudflared"
 }
@@ -328,6 +368,7 @@ setup() {
   DEPLOY_MODE="tunnel"
   DOMAIN="vps.example.com"
   CF_API_TOKEN="token"
+  PRIVATE_TLS_CA="letsencrypt"
   SWAP_SIZE="2G"
   SERVER_TIMEZONE="UTC"
   APP_DOMAIN_MODE="apex"
@@ -345,11 +386,13 @@ setup() {
   [ "${CF_ACCOUNT_ID}" = "acct-123" ]
 }
 
-@test "finalize_cloudflare_tokens: reuses DNS token when tunnel token is omitted" {
+@test "finalize_cloudflare_tokens: rejects combined token in tunnel mode" {
   CF_API_TOKEN="dns-token"
   CF_TUNNEL_API_TOKEN=""
-  finalize_cloudflare_tokens
-  [ "${CF_TUNNEL_API_TOKEN}" = "dns-token" ]
+  DEPLOY_MODE="tunnel"
+  run finalize_cloudflare_tokens
+  assert_failure
+  assert_output --partial "dedicated Cloudflare tunnel API token"
 }
 
 @test "finalize_cloudflare_tokens: keeps explicit split tunnel token" {
@@ -858,9 +901,9 @@ PY
     [[ "${stop_calls}" -eq 1 ]]
     [[ "${remove_private_routes_calls}" -eq 1 ]]
     [[ "${restore_public_tls_calls}" -eq 1 ]]
-    grep -q "^coolify.vps.example.com|203.0.113.10|true$" <<< "${a_records}"
+    ! grep -q "^coolify.vps.example.com|203.0.113.10|true$" <<< "${a_records}"
     grep -q "^\\*.vps.example.com|203.0.113.10|true$" <<< "${a_records}"
-    grep -q "^\\*.example.com|203.0.113.10|true$" <<< "${a_records}"
+    ! grep -q "^\\*.example.com|203.0.113.10|true$" <<< "${a_records}"
   '
   assert_success
 }
@@ -941,7 +984,7 @@ PY
     grep -q "^coolify.vps.example.com|100.64.0.25|false$" <<< "${a_records}"
     grep -q "^ws.coolify.vps.example.com|100.64.0.25|false$" <<< "${a_records}"
     grep -q "^\\*.vps.example.com|tunnel-1234.cfargotunnel.com$" <<< "${cname_records}"
-    grep -q "^\\*.example.com|tunnel-1234.cfargotunnel.com$" <<< "${cname_records}"
+    ! grep -q "^\\*.example.com|tunnel-1234.cfargotunnel.com$" <<< "${cname_records}"
   '
   assert_success
 }
@@ -991,6 +1034,36 @@ PY
   '
   assert_failure
   assert_output --partial "Gate E failed: dashboard not reachable via Tailscale."
+}
+
+@test "coolify_phase5_verify_shared: rejects public management 4xx responses as reachable" {
+  run bash -c '
+    source "'"${COMMON_LIB}"'"
+    DEPLOY_MODE="standard"
+    TS_IP="100.64.0.10"
+    SERVER_IP="203.0.113.10"
+    DOMAIN="vps.example.com"
+    sleep() { :; }
+    curl() {
+      local url="${@: -1}"
+      case "${url}" in
+        "http://${TS_IP}:8000") echo "200" ;;
+        "http://${SERVER_IP}:8000") echo "000" ;;
+        "https://${DOMAIN}") echo "403" ;;
+        *) echo "000" ;;
+      esac
+    }
+    coolify_phase5_fetch_pusher_app_key() { echo "pusher-key"; }
+    coolify_phase5_probe_websocket_code() {
+      [[ "$1" == "ws://${TS_IP}:6001/"* ]] && echo "101" || echo "000"
+    }
+    fetch_validate_json() { echo "{\"fail\":0,\"checks\":[]}"; }
+    print_deployment_summary() { :; }
+
+    coolify_phase5_verify_shared fetch_validate_json external :
+  '
+  assert_failure
+  assert_output --partial "public management hostname is reachable"
 }
 
 @test "coolify_phase5_verify_shared: tunnel mode fails when private WSS handshake is not 101" {
@@ -1222,7 +1295,7 @@ EOF
   assert_output --partial "verified=000, insecure=200"
 }
 
-@test "coolify_configure_private_tls_dns_script: emits private TLS DNS-01 reconciliation" {
+@test "coolify_configure_private_tls_dns_script: renews certificates on the host without giving Traefik the DNS token" {
   run coolify_configure_private_tls_dns_script
   assert_success
   assert_output --partial "CF_DNS_API_TOKEN is required"
@@ -1232,25 +1305,25 @@ EOF
   assert_output --partial 'ZEROSSL_EAB_KID is required when PRIVATE_TLS_CA=zerossl'
   assert_output --partial 'Unsupported PRIVATE_TLS_CA: ${PRIVATE_TLS_CA}'
   assert_output --partial "/data/coolify/proxy/.env"
+  assert_output --partial 'private_tls_dir="/etc/coolify/private-tls"'
+  assert_output --partial 'dns_cloudflare_api_token = %s'
+  assert_output --partial '--dns-cloudflare-credentials "${cloudflare_credentials_file}"'
+  assert_output --partial 'coolify-private-tls-renew.timer'
+  assert_output --partial 'certFile: ${traefik_certificate_dir}/fullchain.pem'
+  assert_output --partial 'private_tls_dir = Path(sys.argv[2])'
+  assert_output --partial 'mount_line = f"      - {private_tls_dir}:/etc/traefik/private-tls:ro\\n"'
   assert_output --partial '/data/coolify/proxy/dynamic/.coolify-private-dashboard.backup'
   assert_output --partial '/data/coolify/proxy/dynamic/.coolify-private-dashboard.absent'
-  assert_output --partial "certificatesResolvers.${PRIVATE_TLS_RESOLVER}.acme.dnsChallenge.provider=cloudflare"
   assert_output --partial "reconcile_private_tls_compose() {"
   assert_output --partial 'service_start = next((idx for idx, line in enumerate(lines) if re.match(r"^  traefik:\s*$", line)), None)'
-  assert_output --partial 'resolver_flag_pattern = re.compile(rf"^ {{6}}- '\''?--certificatesresolvers\.{re.escape(resolver)}\..*'\''?\s*$")'
-  assert_output --partial 'existing_command_flags = set()'
+  assert_output --partial 'resolver_flag_pattern = re.compile(r"^ {6}- '\''?--certificatesresolvers\.privatedns\..*'\''?\s*$")'
   assert_output --partial 'rollback_private_route_file() {'
-  assert_output --partial 'private_tls_ca = sys.argv[4]'
-  assert_output --partial 'zerossl_ca_server = sys.argv[5]'
-  assert_output --partial 'f"--certificatesresolvers.{resolver}.acme.caserver={zerossl_ca_server}"'
-  assert_output --partial 'f"--certificatesresolvers.{resolver}.acme.eab.kid={zerossl_eab_kid}"'
-  assert_output --partial 'f"--certificatesresolvers.{resolver}.acme.eab.hmacencoded={zerossl_eab_hmac}"'
   assert_output --partial "Traefik service block not found in docker-compose.yml"
   assert_output --partial 'default_redirect_file="${dynamic_dir}/default_redirect_503.yaml"'
   assert_output --partial 'coolify_dynamic_file="${dynamic_dir}/coolify.yaml"'
   assert_output --partial 'scrub_default_redirect_public_resolver() {'
   assert_output --partial 'scrub_coolify_public_https_routers() {'
-  assert_output --partial 'for router_name in ("coolify-https", "coolify-realtime-wss", "coolify-terminal-wss"):'
+  assert_output --partial 'for router_name in ("coolify-http", "coolify-https", "coolify-realtime-ws", "coolify-realtime-wss", "coolify-terminal-ws", "coolify-terminal-wss"):'
   assert_output --partial 'text = text.replace("      tls:\n        certResolver: letsencrypt\n", "")'
   assert_output --partial 'for _ in $(seq 1 30); do'
   assert_output --partial 'Public Coolify HTTPS routers remained in ${coolify_dynamic_file}'
@@ -1262,8 +1335,10 @@ EOF
   assert_output --partial 'Waiting for trusted private TLS on ${ws_host}: verified=${ws_code:-000}, insecure=${ws_code_insecure:-000}'
   assert_output --partial 'Timed out waiting for trusted private TLS on ${host}; verified=${dashboard_code:-000}, insecure=${dashboard_code_insecure:-000}'
   assert_output --partial 'Timed out waiting for trusted private TLS on ${ws_host}; verified=${ws_code:-000}, insecure=${ws_code_insecure:-000}'
-  assert_output --partial "--api.insecure=false"
   assert_output --partial 'docker compose -f "${compose_file}" up -d >/dev/null'
+  refute_output --partial 'CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}'
+  refute_output --partial 'CLOUDFLARE_DNS_API_TOKEN=${CF_DNS_API_TOKEN}'
+  refute_output --partial 'certResolver: ${PRIVATE_TLS_RESOLVER}'
 }
 
 @test "coolify_restore_public_dashboard_tls_script: emits public TLS restoration script" {
@@ -1274,9 +1349,7 @@ EOF
   assert_output --partial 'reconcile_public_tls_compose() {'
   assert_output --partial '--certificatesresolvers.letsencrypt.acme.httpchallenge=true'
   assert_output --partial '--certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=http'
-  assert_output --partial 'coolify-public-dashboard'
-  assert_output --partial 'coolify-realtime-wss'
-  assert_output --partial 'coolify-terminal-wss'
+  assert_output --partial 'Public app TLS restored; management routes remain private'
   assert_output --partial 'rm -f "${private_route_file}" "${private_route_backup_file}" "${private_route_absent_marker}" "${env_file}"'
   assert_output --partial 'Public dashboard TLS restored for ${DOMAIN}'
 }

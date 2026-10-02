@@ -1,0 +1,18 @@
+[Unit]
+Description=Encrypted Dokploy database, configuration, registry and service recovery snapshot
+After=docker.service
+Requires=docker.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/controlplane-backup
+TimeoutStartSec=10min
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+MemoryMax=256M
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/server-hardening/controlplane-backups /run/lock

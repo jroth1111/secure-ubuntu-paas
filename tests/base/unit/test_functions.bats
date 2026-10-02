@@ -540,13 +540,14 @@ EOF
 
   chmod +x "${stub_dir}/systemctl" "${stub_dir}/unattended-upgrade"
 
-  run env PATH="${stub_dir}:${PATH}" TEST_AUTO="${auto_file}" TEST_LOCAL="${local_file}" bash -c '
+  run env PATH="${stub_dir}:${PATH}" TEST_AUTO="${auto_file}" TEST_LOCAL="${local_file}" TEST_LOG_DIR="${stub_dir}" bash -c '
     source "'"${SCRIPT}"'"
     DRY_RUN="false"
     ENABLE_AUTO_REBOOT="false"
     AUTO_REBOOT_TIME="04:45"
     APT_AUTO_FILE="${TEST_AUTO}"
     APT_LOCAL_FILE="${TEST_LOCAL}"
+    UNATTENDED_DRYRUN_LOG_DIR="${TEST_LOG_DIR}"
     configure_unattended_upgrades
   '
   assert_success
@@ -557,11 +558,13 @@ EOF
 
   run cat "${local_file}"
   assert_success
-  assert_output --partial 'origin=Ubuntu,codename=${distro_codename}-security,label=Ubuntu'
+  assert_output --partial 'origin=Ubuntu,archive=${distro_codename}-security,label=Ubuntu'
   assert_output --partial 'Unattended-Upgrade::Automatic-Reboot "false";'
   assert_output --partial 'Unattended-Upgrade::Automatic-Reboot-Time "04:45";'
-  refute_output --partial 'origin=Ubuntu,codename=${distro_codename}-updates,label=Ubuntu'
+  refute_output --partial 'origin=Ubuntu,archive=${distro_codename}-updates,label=Ubuntu'
   refute_output --partial 'origin=Docker,label=Docker CE,archive=${distro_codename},component=stable'
+  [ ! -e "${stub_dir}/unattended-upgrade-dryrun.log" ]
+  [ -z "$(find "${stub_dir}" -maxdepth 1 -name 'unattended-upgrade-dryrun.*.log' -print -quit)" ]
 
   run cat "${call_log}"
   assert_success
@@ -834,6 +837,42 @@ allowusers testadmin"
   assert_failure
 }
 
+@test "assert_sshd_match_tailscale: Dokploy root key-only match passes" {
+  ADMIN_USER="testadmin"
+  local effective
+  effective="permitrootlogin prohibit-password
+allowusers root
+passwordauthentication no
+kbdinteractiveauthentication no
+authenticationmethods publickey"
+  run assert_sshd_match_tailscale "${effective}"
+  assert_success
+}
+
+@test "assert_sshd_match_tailscale: Dokploy metadata user is rejected" {
+  ADMIN_USER="testadmin"
+  local effective
+  effective="permitrootlogin prohibit-password
+allowusers testadmin root
+passwordauthentication no
+kbdinteractiveauthentication no
+authenticationmethods publickey"
+  run assert_sshd_match_tailscale "${effective}"
+  assert_failure
+}
+
+@test "assert_sshd_match_tailscale: password authentication enabled fails" {
+  ADMIN_USER="testadmin"
+  local effective
+  effective="permitrootlogin prohibit-password
+allowusers root
+passwordauthentication yes
+kbdinteractiveauthentication no
+authenticationmethods publickey"
+  run assert_sshd_match_tailscale "${effective}"
+  assert_failure
+}
+
 # ── ssh_session_safety_gate() ────────────────────────────────────────────────
 
 @test "ssh_session_safety_gate: no SSH_CONNECTION passes" {
@@ -848,6 +887,28 @@ allowusers testadmin"
   FORCE="false"
   run ssh_session_safety_gate
   assert_success
+}
+
+@test "ssh_session_safety_gate: rejects IPv4 outside the Tailscale CGNAT range" {
+  SSH_CONNECTION="100.1.2.3 12345 100.1.2.4 22"
+  FORCE="false"
+  run ssh_session_safety_gate
+  assert_failure
+  assert_output --partial "not Tailscale-like"
+}
+
+@test "is_tailscale_source_ip: accepts only exact Tailscale ranges" {
+  run is_tailscale_source_ip "100.72.228.23"
+  assert_success
+
+  run is_tailscale_source_ip "100.1.2.3"
+  assert_failure
+
+  run is_tailscale_source_ip "fd7a:115c:a1e0::1"
+  assert_success
+
+  run is_tailscale_source_ip "fd7a:ffff::1"
+  assert_failure
 }
 
 @test "ssh_session_safety_gate: non-Tailscale IP blocked" {
@@ -890,6 +951,25 @@ allowusers testadmin"
   assert_output --partial "-S execve -F auid>=1000 -F auid!=unset -k user_commands"
 }
 
+@test "build_audit_rules: enforces immutable audit loginuids" {
+  run build_audit_rules
+  assert_success
+  assert_output --partial "--loginuid-immutable"
+}
+
+@test "build_audit_rules: audits direct root operator sessions on both architectures" {
+  run build_audit_rules
+  assert_success
+  assert_output --partial '-F arch=b64 -S execve -F auid=0 -k root_commands'
+  assert_output --partial '-F arch=b32 -S execve -F auid=0 -k root_commands'
+}
+
+@test "build_audit_rules: locks audit rule configuration as the final rule" {
+  run build_audit_rules
+  assert_success
+  [ "${lines[${#lines[@]}-1]}" = '-e 2' ]
+}
+
 # ── run() (via script_run after source_script) ────────────────────────────────
 
 @test "run: in dry-run mode logs without executing" {
@@ -897,7 +977,7 @@ allowusers testadmin"
   run script_run echo "should not appear"
   assert_success
   assert_output --partial "DRY-RUN"
-  refute_output --partial "should not appear"
+  refute_output --regexp '^should not appear$'
 }
 
 @test "run: in non-dry-run mode executes command" {
@@ -1251,6 +1331,13 @@ allowusers testadmin"
 
 @test "ssh_session_safety_gate: non-Tailscale IPv6 blocked" {
   SSH_CONNECTION="2001:db8::1 12345 2001:db8::2 22"
+  FORCE="false"
+  run ssh_session_safety_gate
+  assert_failure
+}
+
+@test "ssh_session_safety_gate: rejects IPv6 with an incorrect Tailscale prefix" {
+  SSH_CONNECTION="fd7a:ffff::1 12345 fd7a:ffff::2 22"
   FORCE="false"
   run ssh_session_safety_gate
   assert_failure

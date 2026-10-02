@@ -245,25 +245,17 @@ coolify_phase4_binding_dns_shared() {
     "${remove_private_routes_fn}" || die "Failed to remove private-only dashboard routes."
     pass "Private dashboard routes removed for standard mode"
 
-    log "Restoring public dashboard HTTPS routes and Traefik resolver..."
+    log "Restoring public application TLS while keeping management routes private..."
     "${restore_public_tls_fn}" || die "Failed to restore public dashboard HTTPS routes for standard mode."
-    pass "Public dashboard HTTPS routes restored for standard mode"
+    pass "Public application TLS restored; management routes remain private"
 
-    # Standard mode: A records pointing to server public IP (proxied)
-    log "Configuring DNS: A record ${DOMAIN} → ${SERVER_IP} (proxied)..."
-    cf_upsert_a_record "${DOMAIN}" "${SERVER_IP}" "true"
-    pass "DNS A record configured: ${DOMAIN} → ${SERVER_IP}"
-
-    # Wildcard A records — always create both scopes so manually set domains at either level work
+    # Reconcile only the selected application scope. In vps mode this is the
+    # subordinate DOMAIN namespace; touching the zone-apex wildcard would
+    # redirect unrelated hosts owned by other services.
     local wildcard_name="*.${APP_DOMAIN}"
     log "Configuring DNS: wildcard A record ${wildcard_name} → ${SERVER_IP} (proxied)..."
     cf_upsert_a_record "${wildcard_name}" "${SERVER_IP}" "true"
     pass "DNS wildcard A record configured: ${wildcard_name} → ${SERVER_IP}"
-    if [[ "${APP_DOMAIN}" != "${CF_ZONE_NAME}" ]]; then
-      local apex_wildcard="*.${CF_ZONE_NAME}"
-      cf_upsert_a_record "${apex_wildcard}" "${SERVER_IP}" "true"
-      pass "DNS wildcard A record configured: ${apex_wildcard} → ${SERVER_IP}"
-    fi
     return 0
   fi
 
@@ -279,9 +271,7 @@ coolify_phase4_binding_dns_shared() {
 
   run_with_heartbeat "cloudflared tunnel configure" "${configure_cloudflared_fn}" \
     || die "Failed to write cloudflared credentials/config or start service"
-  local wc_summary="*.${APP_DOMAIN}"
-  [[ "${APP_DOMAIN}" != "${CF_ZONE_NAME}" ]] && wc_summary+=" and *.${CF_ZONE_NAME}"
-  pass "Tunnel credentials and config written (wildcards: ${wc_summary})"
+  pass "Tunnel credentials and config written (wildcard: *.${APP_DOMAIN})"
   pass "cloudflared service running"
 
   # Private-only dashboard/realtime routes via Tailscale-only host records.
@@ -304,10 +294,6 @@ coolify_phase4_binding_dns_shared() {
   local tunnel_target="${TUNNEL_ID}.cfargotunnel.com"
   cf_upsert_cname "*.${APP_DOMAIN}" "${tunnel_target}"
   pass "DNS wildcard CNAME configured: *.${APP_DOMAIN} → ${tunnel_target}"
-  if [[ "${APP_DOMAIN}" != "${CF_ZONE_NAME}" ]]; then
-    cf_upsert_cname "*.${CF_ZONE_NAME}" "${tunnel_target}"
-    pass "DNS wildcard CNAME configured: *.${CF_ZONE_NAME} → ${tunnel_target}"
-  fi
 }
 
 # collect_common_inputs — Prompt for inputs shared by both deploy.sh and setup.sh.
@@ -318,7 +304,7 @@ collect_common_inputs() {
   [[ -n "${SERVER_IP}" ]]   || prompt_value  SERVER_IP "Server public IP" "" "${IPV4_RE}"
   [[ -n "${ADMIN_USER}" ]]  || prompt_value  ADMIN_USER "Admin username" "coolifyadmin" "${LINUX_USER_RE}"
   [[ -n "${PUBKEY_FILE}" ]] || prompt_value  PUBKEY_FILE "SSH public key file" "${HOME}/.ssh/id_ed25519.pub"
-  [[ -n "${TAILSCALE_AUTH_KEY}" ]] || prompt_value TAILSCALE_AUTH_KEY "Tailscale auth key (tskey-auth-...)" ""
+  [[ -n "${TAILSCALE_AUTH_KEY}" ]] || prompt_secret TAILSCALE_AUTH_KEY "Tailscale auth key (tskey-auth-...)"
   [[ -n "${DEPLOY_MODE}" ]] || prompt_choice DEPLOY_MODE "Deployment mode" "tunnel" "tunnel" "standard"
   [[ -n "${DOMAIN}" ]]      || prompt_value  DOMAIN "Domain name (FQDN)" "" "${FQDN_RE}"
   if [[ -z "${CF_API_TOKEN:-}" ]]; then
@@ -374,7 +360,7 @@ print_private_tls_ca_notice() {
 
   if [[ "${PRIVATE_TLS_CA:-letsencrypt}" == "zerossl" ]]; then
     warn "Private TLS fallback selected: ZeroSSL"
-    warn "  This deployment will configure Traefik to use ZeroSSL instead of Let's Encrypt for ${DOMAIN} and ws.${DOMAIN}."
+    warn "  The host-side private-TLS renewal service will use ZeroSSL instead of Let's Encrypt for ${DOMAIN} and ws.${DOMAIN}."
     warn "  Required secrets: ZeroSSL EAB kid + ZeroSSL EAB hmac."
     warn "  DNS prerequisite: if CAA records exist, they must authorize sectigo.com."
     warn "  Operational tradeoff: this adds provider-specific ACME/EAB configuration and should only be used when Let's Encrypt is unsuitable or temporarily blocked."
@@ -445,14 +431,10 @@ print_deployment_summary() {
   if [[ "${DEPLOY_MODE}" == "standard" ]]; then
     summary_box_print_field "DNS" "A ${DOMAIN} -> ${SERVER_IP}"
     summary_box_print_field "Wildcard DNS" "A *.${APP_DOMAIN}"
-    [[ "${APP_DOMAIN}" != "${CF_ZONE_NAME}" ]] \
-      && summary_box_print_continuation "+ A *.${CF_ZONE_NAME}"
   else
     summary_box_print_field "DNS" "A ${DOMAIN} -> ${TS_IP} (DNS-only)"
     summary_box_print_continuation "+ A ws.${DOMAIN} -> ${TS_IP} (DNS-only)"
     summary_box_print_field "Wildcard DNS" "CNAME *.${APP_DOMAIN}"
-    [[ "${APP_DOMAIN}" != "${CF_ZONE_NAME}" ]] \
-      && summary_box_print_continuation "+ CNAME *.${CF_ZONE_NAME}"
     summary_box_print_field "Tunnel ID" "${TUNNEL_ID}"
     summary_box_print_field "Public Dashboard" "blocked (Tailscale-only)"
     summary_box_print_field "Public WebSocket" "blocked (Tailscale-only)"
@@ -470,8 +452,8 @@ print_deployment_summary() {
     log "  2. Private dashboard/websocket TLS is already configured for https://${DOMAIN} and wss://ws.${DOMAIN} using ${PRIVATE_TLS_CA:-letsencrypt}."
   else
     log "  2. Cloudflare SSL mode (one-time):"
-    log "       Cloudflare dashboard > your zone > SSL/TLS > Overview > set to 'Full'"
-    log "       (use Full Strict only if you manage strict-valid origin certs for all proxied hosts)"
+    log "       Cloudflare dashboard > your zone > SSL/TLS > Overview > set to 'Full (strict)'"
+    log "       The origin must present a valid certificate whose name matches the proxied hostname."
   fi
   log ""
   log "  3. Start the proxy: Coolify UI > Servers > localhost > Proxy > Start Proxy"

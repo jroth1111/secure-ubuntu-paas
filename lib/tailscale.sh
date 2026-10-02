@@ -61,50 +61,59 @@ tailscale_runssh_pref_value() {
 }
 
 install_tailscale() {
-  if command -v tailscale >/dev/null 2>&1; then
-    log "Tailscale already installed."
-    return 0
-  fi
-
   if is_true "${DRY_RUN:-false}"; then
-    log "DRY-RUN: would install Tailscale via official apt repository."
+    if command -v tailscale >/dev/null 2>&1; then
+      if [[ -n "${TAILSCALE_AUTH_KEY:-}" ]]; then
+        log "DRY-RUN: would re-enroll the existing Tailscale client with the supplied protected auth key."
+      else
+        log "DRY-RUN: would refuse an inherited Tailscale enrollment without a protected auth key."
+      fi
+    else
+      log "DRY-RUN: would install Tailscale via official apt repository."
+    fi
     return 0
   fi
 
-  log "Installing Tailscale via official apt repository..."
-  local codename keyring listfile
-  source /etc/os-release
-  codename="${VERSION_CODENAME:-}"
-  [[ -n "${codename}" ]] || die "Unable to determine Ubuntu codename for Tailscale repository."
-  keyring="/usr/share/keyrings/tailscale-archive-keyring.gpg"
-  listfile="/etc/apt/sources.list.d/tailscale.list"
+  if ! command -v tailscale >/dev/null 2>&1; then
+    log "Installing Tailscale via official apt repository..."
+    local codename keyring listfile
+    source /etc/os-release
+    codename="${VERSION_CODENAME:-}"
+    [[ -n "${codename}" ]] || die "Unable to determine Ubuntu codename for Tailscale repository."
+    keyring="/usr/share/keyrings/tailscale-archive-keyring.gpg"
+    listfile="/etc/apt/sources.list.d/tailscale.list"
 
-  run curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${codename}.noarmor.gpg" -o "${keyring}"
-  run curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${codename}.tailscale-keyring.list" -o "${listfile}"
-  run apt-get update
-  run env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tailscale
+    run curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${codename}.noarmor.gpg" -o "${keyring}"
+    run curl -fsSL "https://pkgs.tailscale.com/stable/ubuntu/${codename}.tailscale-keyring.list" -o "${listfile}"
+    run apt-get update
+    run env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends tailscale
+  else
+    log "Tailscale is already installed; enrollment must be asserted before it is trusted."
+  fi
 
   if [[ -n "${TAILSCALE_AUTH_KEY:-}" ]]; then
-    log "Authenticating Tailscale with provided auth key..."
-    run tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --ssh=false
+    log "Re-enrolling Tailscale with the supplied auth key (replacing any inherited node identity)..."
+    local auth_key_file
+    auth_key_file="$(mktemp /run/tailscale-auth-key.XXXXXX)" \
+      || die "Unable to create protected Tailscale auth-key file."
+    ( umask 077; printf '%s' "${TAILSCALE_AUTH_KEY}" > "${auth_key_file}" )
+    chmod 0600 "${auth_key_file}"
+    # tailscale supports file: paths for auth keys; only the protected path is
+    # exposed in argv, never the reusable credential itself.
+    local auth_rc=0
+    if run tailscale up --auth-key="file:${auth_key_file}" --ssh=false; then
+      auth_rc=0
+    else
+      auth_rc="$?"
+    fi
+    rm -f -- "${auth_key_file}"
+    (( auth_rc == 0 )) || return "${auth_rc}"
   else
-    log "Interactive Tailscale authentication required."
-    log "Run: tailscale up --ssh=false"
-    log "Waiting for Tailscale connection (timeout: 120s)..."
-
-    local timeout=120
-    local elapsed=0
-    while ! ip link show "${TAILSCALE_IFACE}" >/dev/null 2>&1; do
-      if (( elapsed >= timeout )); then
-        die "Timeout waiting for Tailscale interface. Run 'tailscale up --ssh=false' manually and retry."
-      fi
-      sleep 2
-      elapsed=$((elapsed + 2))
-      log "Waiting for ${TAILSCALE_IFACE}... (${elapsed}s/${timeout}s)"
-    done
+    die "Refusing to trust an inherited Tailscale enrollment without a protected auth key. Provide TAILSCALE_AUTH_KEY or TAILSCALE_AUTH_KEY_FILE and retry."
   fi
 
-  log "Tailscale installed and configured."
+  run tailscale set --auto-update=true
+  log "Tailscale installed and configured with automatic stable updates."
 }
 
 ensure_tailscaled_notify_access() {

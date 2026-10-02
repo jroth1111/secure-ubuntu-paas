@@ -4,3 +4,4 @@
 !source/**
 !security-overrides.json
 !apply-overrides.cjs
+!verify-floors.cjs

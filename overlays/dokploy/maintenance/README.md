@@ -74,6 +74,13 @@ Database major migrations and data restores remain explicit decisions. Archive
 size/headroom guards fail closed rather than fill the disk.
 Unfixed and major/prerelease-only vulnerability findings remain reportable.
 
+The builder updates both root/workspace package-manager pins and authoritative
+workspace overrides. It preserves other workspace settings. An image-level
+dependency-floor check refuses candidates that still contain stable package
+versions below the reviewed floors; preparing a newer Corepack release alone
+is not evidence that the project actually uses it. npm and pnpm refresh only
+within their approved stable majors. Upstream manager-major changes fail closed.
+
 With a checksum-verified `trivy` binary installed, the installer also enables a
 daily read-only CVE scan using the current advisory database. It scans the host
 and exact running PaaS/Hermes images, not secrets or unrelated workloads, and

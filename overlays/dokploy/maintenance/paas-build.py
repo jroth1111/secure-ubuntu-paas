@@ -60,8 +60,8 @@ def bound_keepers(image_id):
         candidates.append((created,name,candidate_id))
     for _,name,candidate_id in sorted(candidates)[:-3]:
         if candidate_id not in protected:call('docker','rm','-f','-v',name)
-files=['Dockerfile.dokploy-source','Dockerfile.postgres','security-overrides.json','apply-overrides.cjs','test-pair.py','.dockerignore']
-recipe_files=['Dockerfile.postgres'] if component=='postgres' else ['Dockerfile.dokploy-source','security-overrides.json','apply-overrides.cjs']
+files=['Dockerfile.dokploy-source','Dockerfile.postgres','security-overrides.json','apply-overrides.cjs','verify-floors.cjs','test-pair.py','.dockerignore']
+recipe_files=['Dockerfile.postgres'] if component=='postgres' else ['Dockerfile.dokploy-source','security-overrides.json','apply-overrides.cjs','verify-floors.cjs']
 digest=hashlib.sha256()
 for name in files:
     path=template/name;s=path.lstat()
@@ -106,6 +106,13 @@ if component=='dokploy':
     versions=[v for v in pnpm['versions'] if re.fullmatch(r'10\.\d+\.\d+',v)]
     if not versions:raise RuntimeError('No approved stable package-manager version')
     pnpm_version=max(versions,key=lambda v:tuple(map(int,v.split('.'))))
+    npm_major=output('docker','run','--rm','--network=none','--entrypoint','npm',runtime_image,'--version').split('.')[0]
+    if not re.fullmatch(r'\d+',npm_major):raise RuntimeError('Invalid npm major')
+    with urllib.request.urlopen('https://registry.npmjs.org/npm',timeout=30) as response:npm=json.load(response)
+    npm_versions=[v for v in npm['versions'] if re.fullmatch(re.escape(npm_major)+r'\.\d+\.\d+',v)]
+    if not npm_versions:raise RuntimeError('No approved stable npm version')
+    npm_version=max(npm_versions,key=lambda v:tuple(map(int,v.split('.'))))
+    arguments+=['--build-arg','NPM_VERSION='+npm_version]
     arguments+=['--build-arg','GO_IMAGE='+go_image,'--build-arg','PACK_VERSION='+pack_version,'--build-arg','RAILPACK_VERSION='+railpack_version,'--build-arg','PNPM_VERSION='+pnpm_version]
     dockerfile='Dockerfile.dokploy-source'
 else:

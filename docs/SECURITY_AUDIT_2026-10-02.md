@@ -1,5 +1,29 @@
 # Ubuntu / Dokploy / Hermes audit handoff
 
+## 2026-10-03 package-manager continuation
+
+Corrected an upstream project pin that was reactivating pnpm 10.22 despite a
+newer prepared Corepack release. Root and workspace package-manager pins now
+agree with the approved current stable pnpm 10 version. Workspace overrides are
+merged without dropping other settings. Same-major compatible floors were added
+for brace-expansion, minimatch, picomatch and tar. A package-metadata check runs
+inside the candidate image and rejects any installed stable version below the
+reviewed floors before production changes.
+
+The hardened updater completed its real build, isolated restore/API tests,
+encrypted backup and rollout. Live pnpm reports **10.34.6**. Latest Dokploy scan:
+**296 HIGH/CRITICAL occurrences, 21 critical, 133 with listed upstream fixes**
+(previously 337/22/174). PostgreSQL remained on its existing accepted image;
+no database restart was needed for this panel-only recipe change. Host and other
+component scan totals are unchanged. Live validator: **234 PASS, 0 FAIL, 9 INFO**.
+Hermes authenticated session/config, 14 assets and blocked public port passed.
+
+Two dependency-floor regression tests pass, including vulnerable-version
+rejection, acceptance of newer versions without downgrade, and preservation of
+workspace settings/project pins. Remaining findings are not considered fixed;
+same-version native compiler rebuilds and Go helper dependency compatibility
+remain follow-up work. No prerelease dependency was installed automatically.
+
 ## Continuation verification
 
 The immutable-snapshot Linux unit suite now passes **676/676, exit 0**. All 338

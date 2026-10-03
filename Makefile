@@ -104,12 +104,12 @@ test-unit-local: setup-bats
 
 # Tier 1: Unit tests in Docker (for CI consistency)
 test-unit-docker: docker-build-tier1
-	$(RUNNER_BATS_TIER1) \
+	$(RUNNER_DOCKER_CMD) \
 	  --image $(IMAGE_TIER1) \
 	  --lane unit \
-	  --target /workspace/tests/base/unit/ /workspace/tests/lib/unit/ /workspace/tests/overlays/coolify/unit/ /workspace/tests/overlays/dflow/unit/ /workspace/tests/overlays/docker-host/unit/ /workspace/tests/overlays/dokploy/unit/ /workspace/tests/orchestrator/unit/ \
 	  --workspace $(WORKSPACE) \
-	  --artifacts-dir $(ARTIFACTS_DIR)
+	  --artifacts-dir $(ARTIFACTS_DIR) \
+	  --cmd 'bats /workspace/tests/base/unit/ /workspace/tests/lib/unit/ /workspace/tests/overlays/coolify/unit/ /workspace/tests/overlays/dflow/unit/ /workspace/tests/overlays/docker-host/unit/ /workspace/tests/overlays/dokploy/unit/ /workspace/tests/orchestrator/unit/'
 
 # Backwards-compatible alias
 test-unit: test-unit-docker

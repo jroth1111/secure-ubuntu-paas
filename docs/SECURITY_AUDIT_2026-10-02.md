@@ -1,5 +1,15 @@
 # Ubuntu / Dokploy / Hermes audit handoff
 
+## 2026-10-03 primary-branch integration
+
+The audited fixes are integrated into `main`. The Makefile's Docker unit target
+now invokes the command runner with all seven unit-suite directories, instead
+of passing multiple directories to a single-target runner. A fresh single-attempt
+Linux run passed **692/692 tests**, with no `not ok` results; workflow/coverage
+contracts and Bash syntax/error-level shellcheck also passed. Earlier failed or
+interrupted runs are not acceptance evidence. This merge does not change the
+remaining vulnerability findings or authorize another live deployment.
+
 ## 2026-10-03 native compiler continuation
 
 Rebuilt esbuild from the exact installed stable upstream version with the
@@ -179,7 +189,7 @@ source; private receipts and encrypted backups are excluded from publication.
 The broad isolated Linux unit run exited **1: 670 tests, 76 failures**. It is
 not a release gate pass. Restoring real assertion semantics exposed fixture
 and coverage-contract problems; not every failure has been classified.
-Related accumulated code is published on a review branch, not merged to the
-default branch. CI/contract repair, remaining dependency findings, alerting
-and continuous off-server replication remain follow-up work. Do not run a
+The earlier review-branch publication boundary is superseded by the primary
+integration above. Remaining dependency findings, alerting and continuous
+off-server replication remain follow-up work. Do not run a
 fresh production provisioning pass just to replay these changes.

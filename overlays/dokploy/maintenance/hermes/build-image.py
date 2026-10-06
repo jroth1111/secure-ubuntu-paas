@@ -5,6 +5,15 @@ os.umask(0o077)
 lock=open('/run/lock/hermes-build-image.lock','w');fcntl.flock(lock,fcntl.LOCK_EX)
 root=pathlib.Path('/var/lib/server-hardening/hermes');source=pathlib.Path('/usr/local/lib/hermes-hardening/image')
 base=sys.argv[1]
+candidate_mode=len(sys.argv)==4 and sys.argv[2]=='--candidate-source'
+if len(sys.argv)!=2 and not candidate_mode:raise RuntimeError('Invalid builder arguments')
+if candidate_mode:
+    source=pathlib.Path(sys.argv[3])
+    if source.is_symlink() or not source.resolve().is_relative_to(root/'candidate-sources'):
+        raise RuntimeError('Candidate source outside protected staging directory')
+    metadata=source.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid!=0 or metadata.st_mode&0o077:
+        raise RuntimeError('Unsafe candidate source directory')
 if not re.fullmatch(r'nousresearch/hermes-agent:latest@sha256:[a-f0-9]{64}',base):raise RuntimeError('Invalid official base pin')
 if shutil.disk_usage('/var/lib/docker').free<8*1024**3:raise RuntimeError('Insufficient image-build headroom')
 names=['Dockerfile','patch-python.py','patch-node.cjs','patch-uv.py','smoke.py','manifest.py','test-image.py']
@@ -14,6 +23,11 @@ for name in names:
     if not p.is_file() or p.is_symlink() or s.st_uid!=0 or s.st_mode&0o022:raise RuntimeError('Unsafe build source')
     digest.update(name.encode());digest.update(p.read_bytes())
 recipe=digest.hexdigest();day=time.strftime('%Y-%m-%d',time.gmtime())
+if candidate_mode:
+    root=root/'candidates'/recipe
+    root.mkdir(mode=0o700,parents=True,exist_ok=True)
+    receipt=root/'build-state.json'
+    old=json.loads(receipt.read_text()) if receipt.exists() else {}
 receipt=root/'build-state.json'
 old=json.loads(receipt.read_text()) if receipt.exists() else {}
 def command(*args):return subprocess.check_output(args,text=True,stderr=subprocess.DEVNULL).strip()
@@ -46,7 +60,7 @@ target='local/hermes-hardened:sha-'+image_id.removeprefix('sha256:')
 subprocess.run(['docker','tag',tag,target],check=True)
 pin=keep_image(target,image_id)
 assert command('docker','image','inspect','--format','{{index .Config.Labels "org.opencontainers.image.base.name"}}',target)==base
-subprocess.run(['python3',str(source/'test-image.py'),target],stdout=subprocess.DEVNULL,check=True,timeout=240)
+subprocess.run(['python3',str(source/'test-image.py'),target],stdout=subprocess.DEVNULL,check=True,timeout=420)
 manifest=command('docker','run','--rm','--network=none','--entrypoint','/opt/hermes/.venv/bin/python',target,'/usr/local/lib/hermes-security-manifest.py')
 fingerprint=hashlib.sha256((base+recipe+manifest).encode()).hexdigest()
 if old.get('fingerprint')==fingerprint:
@@ -61,9 +75,12 @@ if old.get('fingerprint')==fingerprint:
     except subprocess.CalledProcessError:pass
 else:subprocess.run(['docker','image','rm',tag],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 result={'base':base,'recipe':recipe,'day':day,'image':target,'imageId':image_id,'pin':pin,'fingerprint':fingerprint,'isolatedTestsPassed':True,'checkedAt':int(time.time())}
+if candidate_mode:result['candidateOnly']=True
 fd,name=tempfile.mkstemp(prefix='.build-',dir=root)
 with os.fdopen(fd,'w') as output:json.dump(result,output);output.flush();os.fsync(output.fileno())
 os.replace(name,receipt)
+if candidate_mode:
+    print(json.dumps(result));sys.exit(0)
 # Bound only our disposable keepers; never prune Dokploy or application containers.
 pins=command('docker','ps','-a','--filter','label=local.hermes.update-pin=true','--format','{{.Names}}').splitlines()
 configuration=pathlib.Path('/etc/dokploy/hermes-updater/config.json');metadata=configuration.lstat()

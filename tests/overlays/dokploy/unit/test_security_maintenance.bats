@@ -7,6 +7,26 @@ setup() {
   ADMIN_PUBKEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITestKeyData operator@test'
 }
 
+@test "Hermes maintenance: rootless compose policy preserves data and refuses unsafe overrides" {
+  run python3 "${PROJECT_ROOT}/tests/overlays/dokploy/unit/test_hermes_runtime_policy.py"
+  assert_success
+}
+
+@test "Hermes maintenance: updater refuses root init and verifies rollback without claiming rootless success" {
+  run python3 "${PROJECT_ROOT}/tests/overlays/dokploy/unit/test_hermes_updater.py"
+  assert_success
+}
+
+@test "Dokploy maintenance: Go security floors refuse prereleases downgrades and import-major jumps" {
+  run python3 "${PROJECT_ROOT}/tests/overlays/dokploy/unit/test_go_security_floors.py"
+  assert_success
+}
+
+@test "Dokploy maintenance: native compiler discovery preserves stable API versions" {
+  run python3 "${PROJECT_ROOT}/tests/overlays/dokploy/unit/test_native_compilers.py"
+  assert_success
+}
+
 @test "Dokploy maintenance: generated finalizer and updater have valid Bash syntax" {
   local script updater
   script="${BATS_TEST_TMPDIR}/finalize.sh"

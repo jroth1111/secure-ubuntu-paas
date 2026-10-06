@@ -74,6 +74,34 @@ Database major migrations and data restores remain explicit decisions. Archive
 size/headroom guards fail closed rather than fill the disk.
 Unfixed and major/prerelease-only vulnerability findings remain reportable.
 
+Hermes derivatives now use UID/GID `10000:10000` for the entire s6 process
+tree, not only the dashboard. The scoped updater requires a read-only root
+filesystem, `cap_drop: [ALL]`, `no-new-privileges` and private temporary
+filesystems. `/run` must be executable for s6, owned by UID/GID 10000 and mode
+0700; `/tmp` and `/var/tmp` are bounded temporary storage. The existing
+`/opt/data` volume remains the only persistent mount and must already have
+Hermes-owned runtime state. UID remapping and extra mounts/capabilities require
+separate review. The updater preserves environment and volume definitions,
+and refuses a root-started replacement even if its application health is green.
+An exact pre-change rollback may restore the older root-init policy; that is
+reported as rollback, never as successful rootless remediation.
+
+Both builders support `--candidate-source <protected staging directory>` for
+isolated preparation. Candidate sources must be root-owned/private under the
+component's `candidate-sources` directory. Receipts and source checkouts stay
+separate from production update state; candidate builds do not edit production
+Compose/service definitions or prune production recovery pins. Production
+rollout remains an explicitly confirmed, encrypted-backup-protected step.
+
+Reviewed Go module security floors are applied as lower bounds with module
+graph resolution, without downgrading newer versions or silently changing an
+import's major version. Required newer sibling dependencies are permitted;
+unresolved import-major changes remain listed in each helper's security receipt.
+Upstream permission-denial tests run unprivileged. Native TypeScript is rebuilt
+from its exact stable API release and must match the original JavaScript and
+declaration output before replacement. npm's own compatible tooling modules
+are patched and checked as well as application modules.
+
 Native esbuild binaries are discovered from the installed application modules,
 rebuilt from their exact stable upstream tags with the current stable Go
 compiler, and replaced without changing the JavaScript/API version. Upstream

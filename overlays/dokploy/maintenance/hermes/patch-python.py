@@ -12,3 +12,12 @@ source=path.read_text()
 source=re.sub(r'(?i)([\"\']pyjwt\[crypto\])==[0-9.]+([\"\'])',lambda m:m[1]+'=='+chosen['PyJWT']+m[2],source)
 path.write_text(source)
 subprocess.run(['uv','pip','install','--python',sys.executable,*[name+'=='+fixed for name,fixed in chosen.items()]],check=True)
+# Keep private configuration owner-only after the upstream boot hook runs.
+# The enclosing /opt/data directory remains owned by the fixed runtime UID.
+startup=Path('/opt/hermes/docker/stage2-hook.sh')
+boot=startup.read_text()
+old='chmod 640 "$HERMES_HOME/config.yaml"'
+new='chmod 600 "$HERMES_HOME/config.yaml"'
+if old not in boot and new not in boot:
+    raise RuntimeError('Upstream configuration permission hook needs review')
+startup.write_text(boot.replace(old,new))

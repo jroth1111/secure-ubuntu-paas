@@ -36,7 +36,7 @@ done
 install -d -m 0700 /usr/local/lib/paas-hardening /var/lib/server-hardening/paas-images \
   /var/lib/server-hardening/controlplane-backups /etc/dokploy/paas-hardening \
   /var/lib/server-hardening/paas-images/docker-config
-for file in Dockerfile.dokploy-source Dockerfile.postgres security-overrides.json apply-overrides.cjs verify-floors.cjs rebuild-esbuild.py test-pair.py .dockerignore; do
+for file in Dockerfile.dokploy-source Dockerfile.postgres security-overrides.json go-security-floors.json patch-go-deps.py patch-node-tooling.cjs apply-overrides.cjs verify-floors.cjs rebuild-esbuild.py test-pair.py .dockerignore; do
   install -m 0600 "${source_dir}/${file}" "/usr/local/lib/paas-hardening/${file}"
 done
 for pair in 'paas-build.py paas-build-image' 'paas-auto-update.py paas-auto-update' \

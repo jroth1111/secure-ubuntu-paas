@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
 """Scoped, source-rebuilt security images; fail closed on any acceptance error."""
-import fcntl,hashlib,json,os,pathlib,re,secrets,shutil,subprocess,sys,tempfile,time,urllib.request
+import fcntl,hashlib,json,os,pathlib,re,secrets,shutil,stat,subprocess,sys,tempfile,time,urllib.request
 os.umask(0o077)
 component,base=sys.argv[1:3]
+candidate_mode=len(sys.argv)==5 and sys.argv[3]=='--candidate-source'
+if len(sys.argv)!=3 and not candidate_mode:raise RuntimeError('Invalid builder arguments')
 prefix={'dokploy':'dokploy/dokploy:latest@','postgres':'postgres:16@'}
 if component not in prefix or not re.fullmatch(re.escape(prefix[component])+r'sha256:[a-f0-9]{64}',base):raise RuntimeError('Invalid approved base')
 lock=open('/run/lock/paas-image-build.lock','w');fcntl.flock(lock,fcntl.LOCK_EX)
 root=pathlib.Path('/var/lib/server-hardening/paas-images');root.mkdir(mode=0o700,parents=True,exist_ok=True)
 template=pathlib.Path('/usr/local/lib/paas-hardening');statefile=root/(component+'.json')
+if candidate_mode:
+    template=pathlib.Path(sys.argv[4])
+    if template.is_symlink() or not template.resolve().is_relative_to(root/'candidate-sources'):
+        raise RuntimeError('Candidate source outside protected staging directory')
+    metadata=template.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid!=0 or metadata.st_mode&0o077:
+        raise RuntimeError('Unsafe candidate source directory')
 def output(*args):
     try:return subprocess.check_output(args,text=True,stderr=subprocess.DEVNULL).strip()
     except subprocess.CalledProcessError as error:
@@ -60,14 +69,18 @@ def bound_keepers(image_id):
         candidates.append((created,name,candidate_id))
     for _,name,candidate_id in sorted(candidates)[:-3]:
         if candidate_id not in protected:call('docker','rm','-f','-v',name)
-files=['Dockerfile.dokploy-source','Dockerfile.postgres','security-overrides.json','apply-overrides.cjs','verify-floors.cjs','rebuild-esbuild.py','test-pair.py','.dockerignore']
-recipe_files=['Dockerfile.postgres'] if component=='postgres' else ['Dockerfile.dokploy-source','security-overrides.json','apply-overrides.cjs','verify-floors.cjs','rebuild-esbuild.py']
+files=['Dockerfile.dokploy-source','Dockerfile.postgres','security-overrides.json','go-security-floors.json','patch-go-deps.py','patch-node-tooling.cjs','apply-overrides.cjs','verify-floors.cjs','rebuild-esbuild.py','test-pair.py','.dockerignore']
+recipe_files=['Dockerfile.postgres'] if component=='postgres' else ['Dockerfile.dokploy-source','security-overrides.json','go-security-floors.json','patch-go-deps.py','patch-node-tooling.cjs','apply-overrides.cjs','verify-floors.cjs','rebuild-esbuild.py','.dockerignore']
 digest=hashlib.sha256()
 for name in files:
     path=template/name;s=path.lstat()
     if path.is_symlink() or not path.is_file() or s.st_uid!=0 or s.st_mode&0o022:raise RuntimeError('Unsafe image recipe')
     if name in recipe_files:digest.update(name.encode());digest.update(path.read_bytes())
 recipe=digest.hexdigest();day=time.strftime('%Y-%m-%d',time.gmtime())
+if candidate_mode:
+    root=root/'candidates'/component/recipe
+    root.mkdir(mode=0o700,parents=True,exist_ok=True)
+    statefile=root/(component+'.json')
 old=json.loads(statefile.read_text()) if statefile.exists() else {}
 if old.get('base')==base and old.get('recipe')==recipe and old.get('day')==day:
     try:
@@ -133,7 +146,7 @@ if component=='postgres':
 else:
     panel=image;pg=output('docker','service','inspect','--format','{{.Spec.TaskTemplate.ContainerSpec.Image}}','dokploy-postgres')
 call('python3',str(template/'test-pair.py'),panel,pg,timeout=360)
-manifest=output('docker','run','--rm','--network=none','--entrypoint','sh',image,'-c','set -e; dpkg-query -W; if command -v node >/dev/null; then node --version; sha256sum /app/dist/server.mjs /usr/local/bin/pack /usr/local/bin/railpack /usr/local/lib/paas-source-lock.yaml /usr/local/lib/native-compilers.json; npm --version; corepack pnpm --version; fi; if command -v gosu >/dev/null; then gosu --version; sha256sum /usr/local/bin/gosu; fi')
+manifest=output('docker','run','--rm','--network=none','--entrypoint','sh',image,'-c','set -e; dpkg-query -W; if command -v node >/dev/null; then node --version; sha256sum /app/dist/server.mjs /usr/local/bin/pack /usr/local/bin/railpack /usr/local/lib/paas-source-lock.yaml /usr/local/lib/native-compilers.json /usr/local/lib/pack-security.json /usr/local/lib/railpack-security.json; npm --version; corepack pnpm --version; fi; if command -v gosu >/dev/null; then gosu --version; sha256sum /usr/local/bin/gosu; fi')
 fingerprint=hashlib.sha256((base+recipe+(source_commit or '')+manifest).encode()).hexdigest()
 if old.get('fingerprint')==fingerprint:
     try:
@@ -145,4 +158,7 @@ if old.get('fingerprint')==fingerprint:
     except subprocess.CalledProcessError:pass
 else:call('docker','image','rm',tag)
 result={'component':component,'base':base,'image':image,'imageId':image_id,'pin':pin,'day':day,'recipe':recipe,'sourceCommit':source_commit,'runtimeImage':runtime_image,'fingerprint':fingerprint,'isolatedTestsPassed':True,'testedAt':int(time.time())}
+if candidate_mode:result['candidateOnly']=True
+if candidate_mode:
+    save(result);print(json.dumps(result));sys.exit(0)
 save(result);bound_keepers(image_id);print(json.dumps(result))

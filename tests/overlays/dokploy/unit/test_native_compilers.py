@@ -31,6 +31,17 @@ class NativeDiscoveryTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     native.discover(root)
 
+    def test_discovers_native_typescript_and_refuses_nonstable_api_versions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root=pathlib.Path(folder)
+            binary=root/'typescript/lib/tsc'
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b'\x7fELFtest')
+            with mock.patch('subprocess.check_output',return_value='Version 7.0.2\n'):
+                self.assertEqual(native.discover_typescript(root),{'7.0.2':[binary]})
+            with mock.patch('subprocess.check_output',return_value='Version 7.0.3-dev\n'):
+                with self.assertRaises(RuntimeError):native.discover_typescript(root)
+
 
 if __name__ == '__main__':
     unittest.main()

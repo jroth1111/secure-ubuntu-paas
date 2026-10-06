@@ -1,5 +1,43 @@
 # Ubuntu / Dokploy / Hermes audit handoff
 
+## 2026-10-06 tested candidates — live rollout awaiting confirmation
+
+The Hermes candidate runs its entire s6 process tree as UID/GID 10000,
+with no effective capabilities, no-new-privileges, read-only application/root
+storage and bounded private runtime temporary filesystems. Isolated acceptance
+passed password login, unauthenticated config denial, authenticated config,
+profile creation, non-root CLI, dependency checks and persistent-volume restart.
+The production Hermes container has not yet been replaced by this work.
+
+The Dokploy candidate preserves the application/source release and PostgreSQL
+major 16, while applying reviewed compatible Go module floors, rebuilding the
+same-version native TypeScript compiler, patching npm tooling and refreshing
+signed OS packages. Upstream helper tests and compiler output parity passed,
+as did the isolated database restore and authenticated/unauthenticated API gates.
+The running Dokploy image has not yet been replaced by this work.
+
+Exact-image Trivy comparison on 2026-10-06 (HIGH/CRITICAL occurrences, not
+unique exploitable issues):
+
+| Target | Running baseline | Tested candidate | Critical baseline/candidate | Fix-listed baseline/candidate |
+| --- | ---: | ---: | ---: | ---: |
+| Dokploy | 279 | 188 | 19 / 6 | 136 / 45 |
+| Hermes | 323 | 323 | 3 / 3 | 0 / 0 |
+
+No scanner filters or severity suppressions were added. Remaining Hermes OS
+findings have no listed vendor-fixed package versions. Remaining Dokploy
+findings include major/prerelease-only application dependencies, bundled
+vendor CLI helpers, and helper imports needing additional compatibility work.
+Rootless containment does not make those vulnerabilities disappear.
+
+The full direct-Docker unit run passed **696/696, exit 0**; contracts, modified
+shell syntax/error-level shellcheck, Python compilation and Node parsing passed.
+The existing lane-runner exit propagation bug was not used as acceptance proof.
+Private candidate receipts/scans live under `/var/lib/server-hardening`, separate
+from production update state. A confirmed rollout must take encrypted backups,
+preserve data/configuration, verify real live image/runtime posture and record
+a fresh final validator and scan. Candidate success is not deployment success.
+
 ## 2026-10-03 primary-branch integration
 
 The audited fixes are integrated into `main`. The Makefile's Docker unit target

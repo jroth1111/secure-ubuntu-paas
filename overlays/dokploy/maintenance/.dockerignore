@@ -3,6 +3,9 @@
 !source
 !source/**
 !security-overrides.json
+!go-security-floors.json
+!patch-go-deps.py
+!patch-node-tooling.cjs
 !apply-overrides.cjs
 !verify-floors.cjs
 !rebuild-esbuild.py

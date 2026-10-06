@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Scoped Dokploy-managed Hermes updates with encrypted backup and rollback."""
-import json,re,time,urllib.request,urllib.parse,urllib.error,subprocess,pathlib,fcntl,sys,os,stat,tempfile,ipaddress
+import json,re,time,urllib.request,urllib.parse,urllib.error,subprocess,pathlib,fcntl,sys,os,stat,tempfile,ipaddress,yaml,copy
 os.umask(0o077)
 ROOT=pathlib.Path('/var/lib/server-hardening/hermes');ROOT.mkdir(mode=0o700,parents=True,exist_ok=True)
 lock=open('/run/lock/hermes-auto-update.lock','w');fcntl.flock(lock,fcntl.LOCK_EX)
@@ -34,21 +34,85 @@ def api(endpoint,data=None):
     if 'error' in body:raise RuntimeError('Dokploy rejected scoped operation')
     result=body.get('result',{}).get('data',{})
     return result.get('json',result)
-def healthy(expected):
+ROOTLESS_USER='10000:10000'
+ROOTLESS_TMPFS={
+    '/run':'rw,exec,nosuid,nodev,uid=10000,gid=10000,mode=0700,size=32m',
+    '/tmp':'rw,exec,nosuid,nodev,mode=1777,size=256m',
+    '/var/tmp':'rw,exec,nosuid,nodev,mode=1777,size=64m',
+}
+class UniqueKeyLoader(yaml.SafeLoader):
+    def construct_mapping(self,node,deep=False):
+        seen=set()
+        for key,_ in node.value:
+            name=self.construct_object(key,deep=deep)
+            if name in seen:raise RuntimeError('Duplicate Compose key')
+            seen.add(name)
+        return super().construct_mapping(node,deep=deep)
+
+def rootless_compose(text,image):
+    """Replace managed fields only; preserve environment, data and other services verbatim."""
+    if not text.endswith('\n'):text+='\n'
+    original=yaml.load(text,Loader=UniqueKeyLoader)
+    service=original.get('services',{}).get('hermes')
+    if not isinstance(service,dict):raise RuntimeError('Scoped Hermes service missing')
+    if service.get('cap_add'):raise RuntimeError('Unexpected added capabilities')
+    if service.get('pid')=='host' or service.get('ipc')=='host':raise RuntimeError('Unsafe host namespace')
+    if service.get('tmpfs'):
+        existing=service['tmpfs']
+        names=existing.keys() if isinstance(existing,dict) else [str(v).split(':',1)[0] for v in existing]
+        if not set(names)<=set(ROOTLESS_TMPFS):raise RuntimeError('Unmanaged temporary mount')
+    environment=service.get('environment',{})
+    if isinstance(environment,list):
+        environment=dict(str(v).split('=',1) if '=' in str(v) else (str(v),None) for v in environment)
+    if str(environment.get('S6_READ_ONLY_ROOT','1'))!='1':raise RuntimeError('Conflicting s6 runtime policy')
+    for key in ['HERMES_UID','HERMES_GID','PUID','PGID']:
+        if environment.get(key) not in (None,10000,'10000'):raise RuntimeError('Unexpected UID remapping')
+    node=yaml.compose(text,Loader=UniqueKeyLoader)
+    services=next(v for k,v in node.value if k.value=='services')
+    scoped=next(v for k,v in services.value if k.value=='hermes')
+    if scoped.flow_style:raise RuntimeError('Flow-style service needs explicit review')
+    managed={'image':image,'pull_policy':'never','user':ROOTLESS_USER,'read_only':True,
+        'cap_add':[],'cap_drop':['ALL'],'tmpfs':[key+':'+value for key,value in ROOTLESS_TMPFS.items()]}
+    lines=text.splitlines(keepends=True)
+    entries=scoped.value
+    indent=' '*entries[0][0].start_mark.column
+    edits=[]
+    remaining=dict(managed)
+    for index,(key,_) in enumerate(entries):
+        if key.value not in managed:continue
+        start=key.start_mark.line
+        end=entries[index+1][0].start_mark.line if index+1<len(entries) else scoped.end_mark.line
+        edits.append((start,end,indent+key.value+': '+json.dumps(managed[key.value])+'\n'))
+        remaining.pop(key.value)
+    if remaining:
+        edits.append((scoped.end_mark.line,scoped.end_mark.line,
+            ''.join(indent+key+': '+json.dumps(value)+'\n' for key,value in remaining.items())))
+    for start,end,value in sorted(edits,key=lambda item:(item[0],item[1]),reverse=True):lines[start:end]=[value]
+    updated=''.join(lines)
+    observed=yaml.load(updated,Loader=UniqueKeyLoader)
+    wanted=copy.deepcopy(original)
+    wanted['services']['hermes'].update(managed)
+    if observed!=wanted:raise RuntimeError('Unmanaged Compose configuration changed')
+    return updated
+
+def healthy(expected,require_rootless=True):
     ids=subprocess.check_output(['docker','ps','-q','--filter','label=com.docker.compose.project='+config['appName'],'--filter','label=com.docker.compose.service=hermes'],text=True).split()
     if len(ids)!=1:return False
-    template='{"image":{{json .Config.Image}},"imageId":{{json .Image}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}},"privileged":{{json .HostConfig.Privileged}},"ports":{{json .HostConfig.PortBindings}},"security":{{json .HostConfig.SecurityOpt}},"mounts":{{json .Mounts}}}'
+    template='{"image":{{json .Config.Image}},"imageId":{{json .Image}},"health":{{if .State.Health}}{{json .State.Health.Status}}{{else}}null{{end}},"privileged":{{json .HostConfig.Privileged}},"ports":{{json .HostConfig.PortBindings}},"security":{{json .HostConfig.SecurityOpt}},"mounts":{{json .Mounts}},"user":{{json .Config.User}},"readonly":{{json .HostConfig.ReadonlyRootfs}},"capadd":{{json .HostConfig.CapAdd}},"capdrop":{{json .HostConfig.CapDrop}},"tmpfs":{{json .HostConfig.Tmpfs}}}'
     try:snapshot=json.loads(subprocess.check_output(['docker','inspect','--format',template,ids[0]],text=True,stderr=subprocess.DEVNULL))
     except (subprocess.CalledProcessError,json.JSONDecodeError):return False
     safe_ports=snapshot.get('ports')=={'9119/tcp':[{'HostIp':config['tailscaleIp'],'HostPort':'9119'}]}
     mounts=snapshot.get('mounts',[])
     safe_mounts=len(mounts)==1 and mounts[0].get('Type')=='volume' and mounts[0].get('Destination')=='/opt/data' and mounts[0].get('Name')==config['dataVolume']
     correct_id=not expected.startswith('local/hermes-hardened:sha-') or snapshot.get('imageId')=='sha256:'+expected.split(':sha-')[1]
-    return snapshot.get('image')==expected and correct_id and snapshot.get('health')=='healthy' and snapshot.get('privileged') is False and safe_ports and safe_mounts and 'no-new-privileges:true' in (snapshot.get('security') or [])
-def wait_healthy(image,seconds=900):
+    rootless=(snapshot.get('user')==ROOTLESS_USER and snapshot.get('readonly') is True
+        and not snapshot.get('capadd') and snapshot.get('capdrop')==['ALL']
+        and snapshot.get('tmpfs')==ROOTLESS_TMPFS)
+    return snapshot.get('image')==expected and correct_id and snapshot.get('health')=='healthy' and snapshot.get('privileged') is False and safe_ports and safe_mounts and 'no-new-privileges:true' in (snapshot.get('security') or []) and (rootless or not require_rootless)
+def wait_healthy(image,seconds=900,require_rootless=True):
     deadline=time.monotonic()+seconds
     while time.monotonic()<deadline:
-        if healthy(image):return True
+        if healthy(image,require_rootless=require_rootless):return True
         status=api('compose.one',{'composeId':config['composeId']}).get('composeStatus')
         if status=='error':return False
         time.sleep(15)
@@ -81,13 +145,12 @@ try:
     if backup.returncode!=0:raise RuntimeError('Backup failed; update not started')
     state['backup']=json.loads(backup.stdout);save()
     (ROOT/'previous-compose.yaml').write_text(previous);(ROOT/'previous-compose.yaml').chmod(0o600)
-    updated=previous[:match.start(2)]+target+previous[match.end(2):]
-    updated=re.sub(r'(?m)^(\s*pull_policy:\s*)always\s*$',r'\1never',updated)
-    if previous_image!=target:api('compose.update',{'composeId':config['composeId'],'composeFile':updated});changed=True
+    updated=rootless_compose(previous,target)
+    if previous!=updated:api('compose.update',{'composeId':config['composeId'],'composeFile':updated});changed=True
     api('compose.deploy',{'composeId':config['composeId'],'title':'Automatic Hermes stable-image update','description':'Encrypted pre-update snapshot; private boundary and persistent volume preserved'})
     state['status']='deployment_requested';save()
     if not wait_healthy(target):raise RuntimeError('New image did not pass private authenticated health acceptance')
-    state['status']='updated';state['verified_at']=int(time.time());save();print('Hermes latest stable update independently accepted');sys.exit(0)
+    state['status']='updated';state['runtimeRootless']=True;state['verified_at']=int(time.time());save();print('Hermes latest stable update independently accepted');sys.exit(0)
 except Exception as error:
     state['status']='error';state['error_type']=type(error).__name__
     if isinstance(error,urllib.error.HTTPError):state['http_status']=error.code
@@ -95,7 +158,9 @@ except Exception as error:
         try:
             api('compose.update',{'composeId':config['composeId'],'composeFile':previous})
             api('compose.deploy',{'composeId':config['composeId'],'title':'Rollback failed Hermes image update','description':'Restore previous image/config; retain data and encrypted recovery snapshot'})
-            state['rollback_verified']=wait_healthy(previous_image,300)
+            # Restore only the exact captured pre-change configuration. Older approved
+            # images may use root init; a successful rollback is NOT a rootless success.
+            state['rollback_verified']=wait_healthy(previous_image,300,require_rootless=False)
             state['status']='rolled_back' if state['rollback_verified'] else 'rollback_failed'
         except Exception:state['status']='rollback_failed'
     save();print('Hermes update not accepted; protected receipt records recovery status',file=sys.stderr);sys.exit(1)

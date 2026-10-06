@@ -1,20 +1,53 @@
 # Ubuntu / Dokploy / Hermes audit handoff
 
-## 2026-10-06 tested candidates — live rollout awaiting confirmation
+## 2026-10-06 approved live rollout and independent readback
+
+The operator approved the maintenance refresh, encrypted-backup-protected
+Hermes/Dokploy rollouts and final vulnerability scan. Both updater units and
+the scanner completed with successful systemd results. Independent live
+inspection confirms Hermes image
+`sha256:eb1e937de3a1040e7d3f8c3dfbe3f83aac04fef5b480e90d3aa40a5abcddcfb4`:
+all observed init/supervisor/application processes have UID 10000, zero
+effective capabilities and no-new-privileges. The root filesystem is read-only;
+the sole persistent mount is the existing `/opt/data` volume, and port 9119 is
+bound only to the VPS Tailscale address. The data directory is 0700 and config,
+environment and authentication files are 0600. No Docker socket is present.
+
+Fresh password login, protected-config denial, authenticated config/profile/
+session APIs passed. A real inference control returned the requested response
+through Hermes using the existing Nous credentials and Ling Flash. The saved
+Space Bunny Alpha choice is unchanged, but its provider now returns HTTP 404;
+that model-availability issue is separate from this security rollout.
+
+Final live validator: **234 PASS, 0 FAIL, 9 INFO**. The earlier scheduled
+validation unit failure was cleared by a successful fresh execution (exit 0),
+not by resetting its failure flag. No failed systemd units remain. Public SSH,
+dashboard/Hermes/realtime/Netdata ports remain filtered; 80/443 remain app ingress.
+No host reboot or Docker-daemon restart was performed by this rollout.
+
+Final exact-running-image scan: Dokploy **188 HIGH/CRITICAL occurrences, 6
+critical, 45 fix-listed** (previously 279/19/136); Hermes **323/3/0**, PostgreSQL
+**62/1/0**, Traefik **0/0/0**, host **1740/50/7**. Remaining findings are still
+open; no scanner suppression or clean-image claim is made. Encrypted Hermes,
+complete control-plane and SQL backups were captured before replacement.
+The live Dokploy image is
+`sha256:a60a829ddec3bb53b61858b1652bcacc6ecb48051fef8f4944848c181cd900f9`.
+
+## 2026-10-06 tested candidate preparation (historical, before approval)
 
 The Hermes candidate runs its entire s6 process tree as UID/GID 10000,
 with no effective capabilities, no-new-privileges, read-only application/root
 storage and bounded private runtime temporary filesystems. Isolated acceptance
 passed password login, unauthenticated config denial, authenticated config,
 profile creation, non-root CLI, dependency checks and persistent-volume restart.
-The production Hermes container has not yet been replaced by this work.
+At this preparation stage the production Hermes container had not been replaced.
 
 The Dokploy candidate preserves the application/source release and PostgreSQL
 major 16, while applying reviewed compatible Go module floors, rebuilding the
 same-version native TypeScript compiler, patching npm tooling and refreshing
 signed OS packages. Upstream helper tests and compiler output parity passed,
 as did the isolated database restore and authenticated/unauthenticated API gates.
-The running Dokploy image has not yet been replaced by this work.
+At this preparation stage the running Dokploy image had not been replaced.
 
 Exact-image Trivy comparison on 2026-10-06 (HIGH/CRITICAL occurrences, not
 unique exploitable issues):
